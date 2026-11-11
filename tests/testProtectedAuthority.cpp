@@ -615,3 +615,83 @@ TEST_CASE("Protected exhausted close invalidates the last pending update without
     CHECK_FALSE(f.seat->current());
   }
 }
+
+TEST_CASE("F15 Pending poll excludes premature validator invocation", "[protected-authority][f15]") {
+  Fixture f;
+  auto gate = std::make_shared<TestGate>();
+  f.gates.push_back(gate);
+  std::atomic_uint entries{0};
+  auto transfer = f.transfer([&](const auto &) {
+    if (entries.fetch_add(1) == 1)
+      gate->wait(); // request first, actual supervisor poll second
+    return true;
+  });
+  REQUIRE(transfer.admission == TransferAdmission::Accepted);
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  CHECK(transfer.handle->status() == TransferStatus::Pending);
+  CHECK(f.handoff->admit_prepared(transfer.handle,
+                                  f.next.connection,
+                                  f.next.peer,
+                                  ConsumerKind::Audio,
+                                  {"local", 15, {}},
+                                  [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);
+  CHECK(entries.load() == 2);
+  f.clock->store(16001);
+  f.handoff->poll(); // occupied callback cannot block deadline/status/neutral
+  CHECK(transfer.handle->status() == TransferStatus::Quarantined);
+  CHECK_FALSE(f.runtime->status(f.next.connection, ConsumerKind::Audio));
+  gate->release();
+  CHECK_FALSE(f.seat->current());
+}
+
+TEST_CASE("F15 Granted media validators reserve once and recheck authority", "[protected-authority][f15]") {
+  for (bool revoke : {false, true}) {
+    Fixture f;
+    auto gate = std::make_shared<TestGate>();
+    f.gates.push_back(gate);
+    std::atomic_uint entries{0};
+    std::atomic_bool block{false};
+    auto transfer = f.transfer([&](const auto &) {
+      ++entries;
+      if (block.exchange(false))
+        gate->wait();
+      return true;
+    });
+    REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
+    const auto before = entries.load();
+    block = true;
+    Joiner join{f};
+    std::promise<ConsumerAdmission> result;
+    auto done = result.get_future();
+    join.threads.emplace_back([&] {
+      try {
+        result.set_value(f.handoff->admit_prepared(transfer.handle,
+                                                   f.next.connection,
+                                                   f.next.peer,
+                                                   ConsumerKind::Audio,
+                                                   {"local", 15, {}},
+                                                   [](auto &, const auto &) { return true; }));
+      } catch (...) {
+        result.set_exception(std::current_exception());
+      }
+    });
+    REQUIRE(eventually([&] { return gate->entered.load(); }));
+    CHECK(f.handoff->admit_prepared(transfer.handle,
+                                    f.next.connection,
+                                    f.next.peer,
+                                    ConsumerKind::Video,
+                                    {"local", 16, {}},
+                                    [](auto &, const auto &) { return true; }) == ConsumerAdmission::Capacity);
+    CHECK(entries.load() == before + 1);
+    CHECK_FALSE(f.runtime->status(f.next.connection, ConsumerKind::Video));
+    if (revoke)
+      REQUIRE(f.authority->close_exact(f.next.connection, f.next.peer));
+    else
+      CHECK(f.seat->current());
+    gate->release();
+    REQUIRE(done.wait_for(2s) == std::future_status::ready);
+    CHECK(done.get() == (revoke ? ConsumerAdmission::Revoked : ConsumerAdmission::Accepted));
+    if (revoke)
+      CHECK_FALSE(f.runtime->status(f.next.connection, ConsumerKind::Audio));
+  }
+}
