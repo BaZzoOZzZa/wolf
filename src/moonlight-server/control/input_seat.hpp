@@ -36,6 +36,11 @@ using GrantHandle = std::shared_ptr<const SeatGrant>;
 // Trusted internal caller only: must revalidate exact retained identities and
 // current auth/lifecycle/binding. Nonblocking, no reentry into the seat gate.
 using SeatValidation = std::function<bool(const SeatCandidate &)>;
+// Trusted all-or-nothing launch seam: throwing means no thread escaped.
+using SeatThreadFactory = inputtino::checked::detail::ThreadFactory;
+inline std::thread start_seat_thread(std::function<void()> work) {
+  return std::thread(std::move(work));
+}
 struct ProtectedInventory {
   bool fresh_pad_only = false;
   bool exclusive_routes = false;
@@ -136,7 +141,8 @@ public:
 
 private:
   friend class InputSeatDomain;
-  static std::shared_ptr<InputSeat> create(SeatCandidate, ProtectedInventory, SeatValidation, Factory, SeatPolicy = {});
+  static std::shared_ptr<InputSeat>
+      create(SeatCandidate, ProtectedInventory, SeatValidation, Factory, SeatPolicy, SeatThreadFactory);
 
 public:
   SeatAdmission submit(SeatCommand);
@@ -162,8 +168,12 @@ class InputSeatDomain {
   std::shared_ptr<InputSeat> seat_;
 
 public:
-  std::shared_ptr<InputSeat>
-      create(SeatCandidate, ProtectedInventory, SeatValidation, InputSeat::Factory, SeatPolicy = {});
+  std::shared_ptr<InputSeat> create(SeatCandidate,
+                                    ProtectedInventory,
+                                    SeatValidation,
+                                    InputSeat::Factory,
+                                    SeatPolicy = {},
+                                    SeatThreadFactory = start_seat_thread);
 };
 } // namespace control
 #endif

@@ -86,10 +86,14 @@ std::shared_ptr<FeedbackReservation> SeatFeedbackRouter::reserve_send() {
     return {};
   }
 }
-std::shared_ptr<InputSeat> InputSeat::create(
-    SeatCandidate owner, ProtectedInventory inventory, SeatValidation validation, Factory factory, SeatPolicy policy) {
-  if (!owner.valid() || !inventory.valid() || !validation || !factory || !policy.packets || policy.packets > 256 ||
-      policy.bytes < sizeof(SeatCommand) || policy.bytes > 65536)
+std::shared_ptr<InputSeat> InputSeat::create(SeatCandidate owner,
+                                             ProtectedInventory inventory,
+                                             SeatValidation validation,
+                                             Factory factory,
+                                             SeatPolicy policy,
+                                             SeatThreadFactory start) {
+  if (!owner.valid() || !inventory.valid() || !validation || !factory || !start || !policy.packets ||
+      policy.packets > 256 || policy.bytes < sizeof(SeatCommand) || policy.bytes > 65536)
     throw std::invalid_argument("Protected seat requires explicit fresh inventory and retained authority");
   auto seat = std::shared_ptr<InputSeat>(new InputSeat);
   seat->gate_ = std::make_shared<seat_detail::Gate>();
@@ -105,7 +109,9 @@ std::shared_ptr<InputSeat> InputSeat::create(
   g.device = seat->backend_->generation();
   if (!g.device.matches(g.device))
     throw std::invalid_argument("Missing device generation");
-  seat->worker_ = std::thread([gate = seat->gate_, backend = seat->backend_] { work(gate, backend); });
+  seat->worker_ = start([gate = seat->gate_, backend = seat->backend_] { work(gate, backend); });
+  if (!seat->worker_.joinable())
+    throw std::runtime_error("Seat launch returned no owned thread");
   return seat;
 }
 InputSeat::~InputSeat() {
@@ -229,14 +235,20 @@ std::shared_ptr<InputSeat> InputSeatDomain::create(SeatCandidate owner,
                                                    ProtectedInventory inventory,
                                                    SeatValidation validation,
                                                    InputSeat::Factory factory,
-                                                   SeatPolicy policy) {
+                                                   SeatPolicy policy,
+                                                   SeatThreadFactory start) {
   {
     std::lock_guard lock(mutex_);
     if (reserved_)
       return {};
     reserved_ = true;
   }
-  auto seat = InputSeat::create(std::move(owner), inventory, std::move(validation), std::move(factory), policy);
+  auto seat = InputSeat::create(std::move(owner),
+                                inventory,
+                                std::move(validation),
+                                std::move(factory),
+                                policy,
+                                std::move(start));
   {
     std::lock_guard lock(mutex_);
     seat_ = seat;

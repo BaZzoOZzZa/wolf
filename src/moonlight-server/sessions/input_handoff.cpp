@@ -16,9 +16,10 @@ std::optional<streaming::ConsumerDrainTicket> TransferHandle::saved_ticket() con
 }
 InputHandoff::InputHandoff(std::shared_ptr<control::InputSeat> seat,
                            std::shared_ptr<streaming::ConsumerRuntime> consumers,
-                           std::function<Clock::time_point()> now)
+                           std::function<Clock::time_point()> now,
+                           control::SeatThreadFactory start)
     : seat_(std::move(seat)), consumers_(std::move(consumers)), now_(std::move(now)) {
-  if (!seat_ || !consumers_ || !now_)
+  if (!seat_ || !consumers_ || !now_ || !start)
     throw std::invalid_argument("Handoff requires retained seat/runtime/clock");
   {
     std::lock_guard lock(seat_->gate_->mutex);
@@ -27,13 +28,15 @@ InputHandoff::InputHandoff(std::shared_ptr<control::InputSeat> seat,
     seat_->gate_->coordinator_reserved = true;
   }
   try {
-    supervisor_ = std::thread([this] {
+    supervisor_ = start([this] {
       while (!closing_.load()) {
         poll();
         std::unique_lock lock(seat_->gate_->mutex);
         seat_->gate_->wake.wait_for(lock, 5ms);
       }
     });
+    if (!supervisor_.joinable())
+      throw std::runtime_error("Coordinator launch returned no owned thread");
   } catch (...) {
     std::lock_guard lock(seat_->gate_->mutex);
     seat_->gate_->close(true);

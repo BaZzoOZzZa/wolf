@@ -109,7 +109,7 @@ struct Fixture {
   std::unique_ptr<InputHandoff> handoff;
   std::vector<std::shared_ptr<Gate>> gates;
   GrantHandle old;
-  explicit Fixture(SeatPolicy policy = {}) {
+  explicit Fixture(SeatPolicy policy = {}, bool coordinator = true) {
     current->add(initial.connection);
     current->add(target.connection);
     ConsumerPolicy consumer_policy;
@@ -131,9 +131,10 @@ struct Fixture {
         policy);
     REQUIRE(eventually([&] { return bool(seat->current()); }));
     old = seat->current();
-    handoff = std::make_unique<InputHandoff>(seat, runtime, [clock = time] {
-      return Clock::time_point{} + std::chrono::milliseconds(clock->load());
-    });
+    if (coordinator)
+      handoff = std::make_unique<InputHandoff>(seat, runtime, [clock = time] {
+        return Clock::time_point{} + std::chrono::milliseconds(clock->load());
+      });
   }
   ~Fixture() {
     io->write_gate.release();
@@ -573,4 +574,53 @@ TEST_CASE("Handoff exact notification and terminal backend fault after grant rev
                                   ConsumerKind::Audio,
                                   {"local", 1234, {}},
                                   [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);
+}
+
+TEST_CASE("InputSeat owned worker launch failures roll back unpublished backend and retain cap", "[input-seat]") {
+  InputSeatDomain domain;
+  auto io = std::make_shared<IO>();
+  std::weak_ptr<int> resource;
+  SeatCandidate candidate{RunScope::fresh("1"),
+                          RunScope::fresh("L"),
+                          ConnectionScope::fresh(1),
+                          PeerToken::fresh(1),
+                          BindingRevision::fresh(1),
+                          0};
+  auto factory = [&](auto callback) {
+    auto owned = std::make_shared<int>(42);
+    resource = owned;
+    auto xbox =
+        inputtino::checked::Xbox::adopt({std::move(owned), 42}, io->ops(), std::move(callback), start_seat_thread);
+    return std::make_shared<CheckedXboxBackend>(std::move(xbox));
+  };
+  SeatThreadFactory start;
+  SECTION("thread launch exception") {
+    start = [](auto) -> std::thread {
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+    };
+  }
+  SECTION("factory returns no thread") {
+    start = [](auto) { return std::thread{}; };
+  }
+  REQUIRE_THROWS(
+      domain.create(candidate, {true, true, true}, [](auto &) { return true; }, factory, {}, std::move(start)));
+  CHECK(resource.expired());
+  CHECK_FALSE(domain.create(candidate, {true, true, true}, [](auto &) { return true; }, factory));
+}
+TEST_CASE("Handoff supervisor launch failures quarantine retained seat without replacement", "[input-seat]") {
+  Fixture f({}, false);
+  SeatThreadFactory start;
+  SECTION("thread launch exception") {
+    start = [](auto) -> std::thread {
+      throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+    };
+  }
+  SECTION("factory returns no thread") {
+    start = [](auto) { return std::thread{}; };
+  }
+  CHECK_THROWS(InputHandoff(f.seat, f.runtime, [] { return Clock::now(); }, std::move(start)));
+  CHECK(f.seat->quarantined());
+  CHECK_FALSE(f.seat->current());
+  REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
+  CHECK_THROWS(InputHandoff(f.seat, f.runtime)); // reserved supervisor slot is not reusable
 }

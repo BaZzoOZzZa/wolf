@@ -64,7 +64,8 @@ public:
   InputHandoff(
       std::shared_ptr<control::InputSeat>,
       std::shared_ptr<streaming::ConsumerRuntime>,
-      std::function<Clock::time_point()> now = [] { return Clock::now(); });
+      std::function<Clock::time_point()> now = [] { return Clock::now(); },
+      control::SeatThreadFactory start = control::start_seat_thread);
   ~InputHandoff(); // owner only, never event/transport callback
   TransferResult request(TransferToken, AuthorizedSelection);
   void poll(); // nonblocking timer decision; also deterministic clock seam

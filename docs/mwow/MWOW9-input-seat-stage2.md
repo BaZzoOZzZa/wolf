@@ -99,3 +99,9 @@ claimed atomic; implementing that protocol is a Stage3 gate. A Granted transfer
 handle records a past decision, not perpetual permission: every input/send/consumer
 admission checks the current gate again. Late terminal backend failure revokes
 future admissions; no claim of impossible failure-after-observation.
+
+Both owned thread launches have a narrow trusted all-or-nothing factory seam.
+Throwing or returning a nonjoinable thread cannot publish a usable seat/coordinator;
+source tests exercise actual rollback, backend resource destruction and cap denial.
+A factory that secretly detaches work violates this internal contract and is not
+supported. The default is std::thread; no threads launch at library load.
