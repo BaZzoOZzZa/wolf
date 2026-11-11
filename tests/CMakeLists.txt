@@ -173,3 +173,10 @@ if (TARGET inputtino::libinputtino)
     target_link_libraries(wolf-inputtino-motion-tests PRIVATE Catch2::Catch2WithMain)
     add_test(NAME inputtino-signed-motion COMMAND wolf-inputtino-motion-tests)
 endif ()
+
+# Scope foundation: real event-bus/lifecycle adapters, no runtime/device startup.
+add_executable(wolf-connection-scope-tests testConnectionScopes.cpp)
+target_link_libraries(wolf-connection-scope-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+target_compile_features(wolf-connection-scope-tests PRIVATE cxx_std_20)
+add_test(NAME wolf-connection-scope-tests COMMAND wolf-connection-scope-tests)
+set_tests_properties(wolf-connection-scope-tests PROPERTIES LABELS "scope;isolated" TIMEOUT 30)

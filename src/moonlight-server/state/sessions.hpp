@@ -30,6 +30,26 @@ inline std::optional<events::StreamSession> get_session_by_id(const immer::vecto
   }
 }
 
+inline std::optional<events::StreamSession> get_session_by_scope(const immer::vector<events::StreamSession> &all,
+                                                                 const sessions::ConnectionScope &scope) {
+  if (!scope)
+    return {};
+  for (const auto &session : all)
+    if (sessions::targets(session.connection_scope, scope, session.session_id))
+      return session;
+  return {};
+}
+
+// Run-scoped administrative cleanup may deliberately address its newest
+// connection. It must never reinterpret a stable ID as another run.
+inline std::optional<events::StreamSession> get_session_by_run(const immer::vector<events::StreamSession> &all,
+                                                               const sessions::RunScope &scope) {
+  for (const auto &session : all)
+    if (session.run_scope.matches(scope))
+      return session;
+  return {};
+}
+
 inline std::optional<events::StreamSession> get_session_by_client(const immer::vector<events::StreamSession> &sessions,
                                                                   const wolf::config::PairedClient &client) {
   auto client_id = get_client_id(client);
@@ -117,14 +137,16 @@ inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<s
       .audio_stream_port = static_cast<unsigned short>(get_port(AUDIO_PING_PORT)),
       .control_stream_port = static_cast<unsigned short>(get_port(CONTROL_PORT))};
 
+  session.connection_scope = sessions::ConnectionScope::fresh(session.session_id);
+  session.run_scope = sessions::RunScope::fresh(std::to_string(session.session_id));
   return std::make_shared<events::StreamSession>(session);
 }
 
 inline immer::vector<events::StreamSession> remove_session(const immer::vector<events::StreamSession> &sessions,
                                                            const events::StreamSession &session) {
   return sessions                                                                                           //
-         | ranges::views::filter([remove_hash = session.session_id](const events::StreamSession &cur_ses) { //
-             return cur_ses.session_id != remove_hash;                                                      //
+         | ranges::views::filter([scope = session.connection_scope](const events::StreamSession &cur_ses) { //
+             return !cur_ses.connection_scope.matches(scope);                                               //
            })                                                                                               //
          | ranges::to<immer::vector<events::StreamSession>>();                                              //
 }

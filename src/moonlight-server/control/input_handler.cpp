@@ -198,7 +198,9 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
               controller_number,
               (int)final_type);
 
-    events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
+    events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id),
+                                    .run_scope = session.run_scope,
+                                    .connection_scope = session.connection_scope};
     std::visit(
         [&plug_ev](auto &pad) {
           plug_ev.udev_events = pad.get_udev_events();
@@ -226,7 +228,9 @@ bool create_pen_tablet(events::StreamSession &session) {
   session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(
       events::PlugDeviceEvent{.session_id = std::to_string(session.session_id),
                               .udev_events = tablet_ptr->get_udev_events(),
-                              .udev_hw_db_entries = tablet_ptr->get_udev_hw_db_entries()}));
+                              .udev_hw_db_entries = tablet_ptr->get_udev_hw_db_entries(),
+                              .run_scope = session.run_scope,
+                              .connection_scope = session.connection_scope}));
   if (auto wl = *session.wayland_display->load()) {
     for (const auto node : tablet_ptr->get_nodes()) {
       add_input_device(*wl, node);
@@ -251,7 +255,9 @@ bool create_touch_screen(events::StreamSession &session) {
   session.event_bus->fire_event(immer::box<events::PlugDeviceEvent>(
       events::PlugDeviceEvent{.session_id = std::to_string(session.session_id),
                               .udev_events = touch_screen->get_udev_events(),
-                              .udev_hw_db_entries = touch_screen->get_udev_hw_db_entries()}));
+                              .udev_hw_db_entries = touch_screen->get_udev_hw_db_entries(),
+                              .run_scope = session.run_scope,
+                              .connection_scope = session.connection_scope}));
   if (auto wl = *session.wayland_display->load()) {
     for (const auto node : touch_screen->get_nodes()) {
       add_input_device(*wl, node);
@@ -428,8 +434,9 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
           },
           session.keyboard->value());
       session.held_modifiers->store(0);
-      session.event_bus->fire_event(
-          immer::box<events::ClientWolfUIComboEvent>{events::ClientWolfUIComboEvent{.session_id = session.session_id}});
+      session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
+          events::ClientWolfUIComboEvent{.session_id = session.session_id,
+                                         .connection_scope = session.connection_scope}});
       return;
     }
 
@@ -658,7 +665,9 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
     if (!(pkt.active_gamepad_mask & (1 << pkt.controller_number))) {
       logs::log(logs::debug, "Removing joypad {}", pkt.controller_number);
       // Send the event downstream, Docker will pick it up and remove the device
-      events::UnplugDeviceEvent unplug_ev{.session_id = std::to_string(session.session_id)};
+      events::UnplugDeviceEvent unplug_ev{.session_id = std::to_string(session.session_id),
+                                          .run_scope = session.run_scope,
+                                          .connection_scope = session.connection_scope};
       std::visit(
           [&unplug_ev](auto &pad) {
             unplug_ev.udev_events = pad.get_udev_events();
@@ -684,7 +693,8 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
           if (pressed_buttons & inputtino::Joypad::START && pressed_buttons & inputtino::Joypad::DPAD_UP &&
               pressed_buttons & inputtino::Joypad::RIGHT_BUTTON) {
             session.event_bus->fire_event(immer::box<events::ClientWolfUIComboEvent>{
-                events::ClientWolfUIComboEvent{.session_id = session.session_id}});
+                events::ClientWolfUIComboEvent{.session_id = session.session_id,
+                                               .connection_scope = session.connection_scope}});
           }
           pad.set_pressed_buttons(pressed_buttons);
           pad.set_stick(inputtino::Joypad::LS, pkt.left_stick_x, pkt.left_stick_y);
@@ -728,6 +738,8 @@ void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSess
 bool handle_input(events::StreamSession &session,
                   immer::box<std::shared_ptr<ControlPeer>> connected_client,
                   std::string_view bytes) {
+  if (!session.connection_scope || session.connection_scope.id() != session.session_id || !session.run_scope)
+    return false;
   if (!valid_input_packet(bytes)) {
     logs::log(logs::warning, "[INPUT] Invalid input packet ({} bytes)", bytes.size());
     return false;

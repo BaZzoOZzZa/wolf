@@ -256,13 +256,13 @@ void run() {
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
   for (const auto &lobby : local_state->lobbies->load().get()) {
     local_state->event_bus->fire_event(
-        immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id}));
+        immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id, .run_scope = lobby.run_scope}));
   }
 
   // Then stop any remaining standalone streams.
   for (const auto &session : local_state->running_sessions->load().get()) {
-    local_state->event_bus->fire_event(
-        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session.session_id}));
+    local_state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+        events::GameStopRequest{.session_id = std::to_string(session.session_id), .run_scope = session.run_scope}));
   }
 
   // fire_event is synchronous, but container/pipeline teardown can still settle

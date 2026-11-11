@@ -157,7 +157,7 @@ void concurrent_joins() {
   CHECK(gate.join(entry, winner, false) == LobbyLifecycle::Join::already_joined);
   auto other = ready(gate, "other", "other-prefix");
   CHECK(gate.join(other, winner, true) == LobbyLifecycle::Join::session_busy);
-  CHECK(gate.leave(entry, winner));
+  CHECK(gate.leave(entry, wolf::core::sessions::ConnectionScope::fresh(winner)));
   gate.finish(entry, winner);
   CHECK(gate.join(other, winner, true) == LobbyLifecycle::Join::admitted);
 }
@@ -167,13 +167,15 @@ void stop_during_join_and_reentrant_leave() {
   auto entry = ready(gate, "lobby", "prefix");
   CHECK(gate.join(entry, 42, false) == LobbyLifecycle::Join::admitted);
   // These represent synchronous events re-entering while device migration runs.
-  CHECK(!gate.leave(entry, 42));
+  const auto connection = wolf::core::sessions::ConnectionScope::fresh(42);
+  CHECK(!gate.leave(entry, connection));
   CHECK(!gate.stop(entry));
   CHECK(gate.join(entry, 43, false) == LobbyLifecycle::Join::unavailable);
   auto deferred = gate.finish(entry);
   CHECK(deferred.stop);
-  CHECK(deferred.leaves == std::vector<std::size_t>{42});
-  CHECK(gate.leave(entry, 42));
+  CHECK(deferred.leaves.size() == 1);
+  CHECK(deferred.leaves.front().matches(connection));
+  CHECK(gate.leave(entry, connection));
   CHECK(!gate.stop(entry));
   CHECK(gate.finish(entry, 42).stop);
   CHECK(gate.stop(entry));

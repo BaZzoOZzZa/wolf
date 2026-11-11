@@ -30,7 +30,7 @@ struct WaylandDisplayReady {
   gstreamer::gst_element_ptr wayland_plugin;
 };
 
-void start_video_producer(const std::string &session_id,
+void start_video_producer(const wolf::core::sessions::RunScope &run_scope,
                           const std::string &buffer_format,
                           const std::string &render_node,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
@@ -38,7 +38,7 @@ void start_video_producer(const std::string &session_id,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
                           std::shared_ptr<events::EventBusType> event_bus);
 
-void start_audio_producer(const std::string &session_id,
+void start_audio_producer(const wolf::core::sessions::RunScope &run_scope,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,

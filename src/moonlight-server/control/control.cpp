@@ -94,6 +94,8 @@ std::optional<events::StreamSession> match_control_session(const state::Sessions
                                                            std::uint32_t connect_token) {
   std::optional<events::StreamSession> match;
   for (const auto &session : *running_sessions->load()) {
+    if (!session.connection_scope || !session.run_scope)
+      continue;
     // Legacy clients send zero. Only that explicit legacy case may select by
     // IP, and only when unambiguous. Selection is NOT authentication.
     bool candidate = connect_token != 0
@@ -272,19 +274,22 @@ void run_control(int port,
       if (!peer_state.authenticated) {
         peer_state.authenticated = true;
         owners[session.session_id] = event.peer;
-        event_bus->fire_event(immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = session.session_id}));
+        event_bus->fire_event(immer::box<ResumeStreamEvent>(
+            ResumeStreamEvent{.session_id = session.session_id, .connection_scope = session.connection_scope}));
       }
       // Recheck after synchronous event handlers; a resume may have revoked us.
       if (!current(session))
         continue;
       if (type == TERMINATION) {
-        event_bus->fire_event(immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = session.session_id}));
+        event_bus->fire_event(immer::box<PauseStreamEvent>(
+            PauseStreamEvent{.session_id = session.session_id, .connection_scope = session.connection_scope}));
         forget(event.peer);
         enet_peer_disconnect_now(event.peer, 0);
       } else if (type == INPUT_DATA) {
         handle_input(session, {peer_state.sender}, decrypted);
       } else if (type == IDR_FRAME) {
-        event_bus->fire_event(immer::box<IDRRequestEvent>(IDRRequestEvent{.session_id = session.session_id}));
+        event_bus->fire_event(immer::box<IDRRequestEvent>(
+            IDRRequestEvent{.session_id = session.session_id, .connection_scope = session.connection_scope}));
       }
     } catch (const std::runtime_error &e) {
       logs::log(logs::warning, "[ENET] Invalid encrypted control packet: {}", e.what());

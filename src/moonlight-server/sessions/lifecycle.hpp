@@ -1,5 +1,6 @@
 #pragma once
 
+#include "connection_scope.hpp"
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -25,6 +26,7 @@ public:
   };
   struct Entry {
     const std::string id;
+    const RunScope run_scope;
 
   private:
     std::string resource;
@@ -44,11 +46,12 @@ public:
     bool forget_claimed = false;
     bool stop_notified = false;
     std::set<std::size_t> members;
-    std::set<std::size_t> deferred_leaves;
+    std::map<std::size_t, ConnectionScope> deferred_leaves;
 
   public:
     Entry(std::string id, std::string resource, std::string fingerprint)
-        : id(std::move(id)), resource(std::move(resource)), fingerprint(std::move(fingerprint)) {}
+        : id(std::move(id)), run_scope(RunScope::fresh(this->id)), resource(std::move(resource)),
+          fingerprint(std::move(fingerprint)) {}
   };
   using Ticket = std::shared_ptr<Entry>;
   enum class Producer {
@@ -75,7 +78,7 @@ public:
   };
   struct Deferred {
     bool stop = false;
-    std::vector<std::size_t> leaves;
+    std::vector<ConnectionScope> leaves;
   };
 
   explicit LobbyLifecycle(std::size_t capacity = 1024) : capacity_(capacity) {}
@@ -258,13 +261,16 @@ public:
     return Join::admitted;
   }
 
-  bool leave(const Ticket &entry, std::size_t session) {
+  bool leave(const Ticket &entry, const ConnectionScope &scope) {
+    if (!scope)
+      return false;
+    const auto session = scope.id();
     std::lock_guard lock(mutex_);
     if (!entry->members.count(session)) {
       return false;
     }
     if (entry->operation) {
-      entry->deferred_leaves.insert(session);
+      entry->deferred_leaves.insert_or_assign(session, scope);
       return false;
     }
     entry->operation = true;
@@ -278,8 +284,9 @@ public:
       session_owners_.erase(*leaving);
     }
     entry->operation = false;
-    Deferred deferred{.stop = entry->phase == Phase::stopping && !entry->cleaning && !entry->cleaned,
-                      .leaves = {entry->deferred_leaves.begin(), entry->deferred_leaves.end()}};
+    Deferred deferred{.stop = entry->phase == Phase::stopping && !entry->cleaning && !entry->cleaned};
+    for (const auto &[id, scope] : entry->deferred_leaves)
+      deferred.leaves.push_back(scope);
     entry->deferred_leaves.clear();
     close_if_finished(entry);
     return deferred;

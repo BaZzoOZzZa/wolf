@@ -24,10 +24,11 @@ void run_control(int port,
                  std::chrono::milliseconds timeout = 1000ms,
                  const std::string &host_ip = "0.0.0.0");
 
-// Existing per-launch random transport secrets identify a generation. A stable
+// Strong in-process scope identifies a generation; transport secrets only correlate it. A stable
 // paired-client session_id alone must never authorize an old ENet connection.
 inline bool same_control_generation(const events::StreamSession &a, const events::StreamSession &b) {
-  return a.control_crypto == b.control_crypto && a.session_id == b.session_id &&
+  return a.connection_scope.matches(b.connection_scope) && a.run_scope.matches(b.run_scope) &&
+         a.control_crypto == b.control_crypto && a.session_id == b.session_id &&
          a.enet_secret_payload == b.enet_secret_payload && a.rtp_secret_payload == b.rtp_secret_payload &&
          a.aes_key == b.aes_key && a.aes_iv == b.aes_iv;
 }

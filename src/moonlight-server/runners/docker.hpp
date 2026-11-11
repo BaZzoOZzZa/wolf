@@ -84,7 +84,7 @@ public:
                      docker_socket);
   }
 
-  void run(std::string_view session_id,
+  void run(const wolf::core::sessions::RunScope &run_scope,
            std::string_view app_state_folder,
            std::string_view host_xdg_runtime_dir,
            std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,

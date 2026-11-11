@@ -32,7 +32,7 @@ static std::optional<std::string> get_device_major(std::string_view type) {
   return std::nullopt;
 }
 
-void RunDocker::run(std::string_view session_id,
+void RunDocker::run(const wolf::core::sessions::RunScope &run_scope,
                     std::string_view app_state_folder,
                     std::string_view host_xdg_runtime_dir,
                     std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
@@ -40,6 +40,9 @@ void RunDocker::run(std::string_view session_id,
                     const immer::array<std::pair<std::string, std::string>> &paths,
                     const immer::map<std::string, std::string> &env_variables,
                     std::string_view render_node) {
+  if (!run_scope)
+    return;
+  const auto session_id = run_scope.id();
 
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
@@ -192,15 +195,15 @@ void RunDocker::run(std::string_view session_id,
 
   auto stop_requested = std::make_shared<ContainerStopRequests>();
   const std::string owned_session_id(session_id);
-  auto terminate_handler = this->ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [owned_session_id, stop_requested](const immer::box<events::StopStreamEvent> &ev) {
-        if (std::to_string(ev->session_id) == owned_session_id) {
+  auto terminate_handler = this->ev_bus->register_handler<immer::box<events::GameStopRequest>>(
+      [owned_session_id, stop_requested, run_scope](const immer::box<events::GameStopRequest> &ev) {
+        if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
           stop_requested->request();
         }
       });
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-      [owned_session_id, stop_requested](const immer::box<events::StopLobbyEvent> &ev) {
-        if (ev->lobby_id == owned_session_id) {
+      [owned_session_id, stop_requested, run_scope](const immer::box<events::StopLobbyEvent> &ev) {
+        if (sessions::targets(run_scope, ev->run_scope.get(), ev->lobby_id)) {
           stop_requested->request();
         }
       });
@@ -228,11 +231,12 @@ void RunDocker::run(std::string_view session_id,
         .container_id = container_id,
         .hostname = inspected_hostname,
         .session_id = owned_session_id,
+        .run_scope = run_scope,
     }});
 
     auto unplug_device_handler = this->ev_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
-        [session_id, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
-          if (ev->session_id == session_id) {
+        [session_id, run_scope, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
             logs::log(logs::debug, "[DOCKER] Received UnplugDeviceEvent for session: {}", ev->session_id);
             for (const auto &[filename, content] : ev->udev_hw_db_entries) {
               try {
@@ -281,6 +285,8 @@ void RunDocker::run(std::string_view session_id,
       }
       // Bound each device batch so hotplug traffic cannot starve inspection/stop.
       if (auto device_ev = plugged_devices_queue->pop(50ms)) {
+        if (!sessions::targets(run_scope, (*device_ev)->run_scope.get(), (*device_ev)->session_id))
+          continue;
         if (device_ev->get().session_id == session_id) {
           logs::log(logs::debug, "[DOCKER] Plugging device from queue in session: {}", session_id);
           if (use_fake_udev) {
@@ -318,6 +324,7 @@ void RunDocker::run(std::string_view session_id,
         .container_id = container_id,
         .hostname = inspected_hostname,
         .session_id = std::string(session_id),
+        .run_scope = run_scope,
     }});
 
     if (const auto env = utils::get_env("WOLF_STOP_CONTAINER_ON_EXIT")) {

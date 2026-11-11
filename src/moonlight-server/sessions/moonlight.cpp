@@ -9,7 +9,11 @@
 
 namespace wolf::core::sessions {
 
-using session_devices = immer::map<std::string /* session_id */, std::shared_ptr<events::devices_atom_queue>>;
+struct OwnedDeviceQueue {
+  RunScope scope;
+  std::shared_ptr<events::devices_atom_queue> queue;
+};
+using session_devices = immer::map<std::string, OwnedDeviceQueue>;
 
 /**
  * Will stop the execution until an event of type RTPPingType is triggered
@@ -57,25 +61,50 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
    */
   auto plugged_devices_queue = std::make_shared<immer::atom<session_devices>>();
 
-  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [&app_state, plugged_devices_queue](const immer::box<events::StopStreamEvent> &ev) {
-        // Remove session from app state so that HTTP/S applist gets updated
-        // This should effectively destroy the virtual Wayland session since it holds the last reference
-        app_state->running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
-          return state::remove_session(ses_v, {.session_id = ev->session_id});
+  // A connection stop never destroys a persistent game/runner or its devices.
+  auto stop_connections = [app_state](const RunScope &run) {
+    auto snapshot = app_state->running_sessions->load();
+    for (const auto &session : *snapshot) {
+      if (session.run_scope.matches(run)) {
+        app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>{
+            events::StopStreamEvent{.session_id = session.session_id, .connection_scope = session.connection_scope}});
+      }
+    }
+  };
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::GameStopRequest>>(
+      [stop_connections](const immer::box<events::GameStopRequest> &ev) {
+        if (ev->run_scope.get() && ev->run_scope.get().id() == ev->session_id)
+          stop_connections(ev->run_scope.get());
+      }));
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::RunEnded>>(
+      [app_state, plugged_devices_queue, stop_connections](const immer::box<events::RunEnded> &ev) {
+        const auto run = ev->run_scope.get();
+        if (!run || run.id() != ev->session_id)
+          return;
+        stop_connections(run);
+        app_state->running_sessions->update([run](const auto &all) {
+          return all | ranges::views::filter([&](const auto &s) { return !s.run_scope.matches(run); }) |
+                 ranges::to<immer::vector<events::StreamSession>>();
         });
-
-        plugged_devices_queue->update([=](const auto map) { return map.erase(std::to_string(ev->session_id)); });
+        plugged_devices_queue->update([run](const auto &map) {
+          auto entry = map.find(run.id());
+          return entry && entry->scope.matches(run) ? map.erase(run.id()) : map;
+        });
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
-      [plugged_devices_queue, lobbies = app_state->lobbies](const immer::box<events::PlugDeviceEvent> &hotplug_ev) {
+      [plugged_devices_queue, app_state, lobbies = app_state->lobbies](
+          const immer::box<events::PlugDeviceEvent> &hotplug_ev) {
+        if (!state::get_session_by_scope(app_state->running_sessions->load(), hotplug_ev->connection_scope.get()))
+          return;
         logs::log(logs::debug, "{} received hot-plug device event", hotplug_ev->session_id);
 
         // If we are currently in a lobby we don't want to plug the device to the original wolf-ui session
         if (!state::get_lobby_by_connected_session(lobbies->load(), hotplug_ev->session_id)) {
-          if (auto session_devices_queue = plugged_devices_queue->load()->find(hotplug_ev->session_id)) {
-            session_devices_queue->get()->push(hotplug_ev);
+          auto queues = plugged_devices_queue->load();
+          if (auto entry = queues->find(hotplug_ev->session_id);
+              entry && entry->scope.matches(hotplug_ev->run_scope.get())) {
+            entry->queue->push(hotplug_ev);
           } else {
             logs::log(logs::warning, "Unable to find plugged_devices_queue for session {}", hotplug_ev->session_id);
           }
@@ -88,10 +117,14 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
   // Run process and our custom wayland as soon as a new StreamSession is created
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StreamSession>>(
       [=](const immer::box<events::StreamSession> &session) {
+        if (!session->run_scope ||
+            !state::get_session_by_scope(app_state->running_sessions->load(), session->connection_scope))
+          return;
         /* Initialise plugged device queue */
         auto devices_q = std::make_shared<events::devices_atom_queue>();
-        plugged_devices_queue->update(
-            [=](const session_devices map) { return map.set(std::to_string(session->session_id), devices_q); });
+        plugged_devices_queue->update([=](const session_devices map) {
+          return map.set(std::to_string(session->session_id), OwnedDeviceQueue{session->run_scope, devices_q});
+        });
 
         std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
             std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
@@ -101,7 +134,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
 
           // Start Gstreamer producer pipeline
           std::thread([session, on_ready, gst_context = app_state->gst_context]() {
-            streaming::start_video_producer(std::to_string(session->session_id),
+            streaming::start_video_producer(session->run_scope,
                                             session->app->video_producer_buffer_caps,
                                             session->app->render_node,
                                             {.width = session->display_mode.width,
@@ -121,7 +154,9 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
             devices_q->push(immer::box<events::PlugDeviceEvent>(
                 events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
                                         .udev_events = mouse_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries()}));
+                                        .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries(),
+                                        .run_scope = session->run_scope,
+                                        .connection_scope = session->connection_scope}));
             session->mouse->emplace(std::move(mouse_ptr));
           }
 
@@ -133,7 +168,9 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
             devices_q->push(immer::box<events::PlugDeviceEvent>(
                 events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
                                         .udev_events = keyboard_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries()}));
+                                        .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries(),
+                                        .run_scope = session->run_scope,
+                                        .connection_scope = session->connection_scope}));
             session->keyboard->emplace(std::move(keyboard_ptr));
           }
           on_ready->set_value({});
@@ -152,7 +189,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
 
           std::thread([session, audio_server = audio_server->server]() {
             auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
-            streaming::start_audio_producer(std::to_string(session->session_id),
+            streaming::start_audio_producer(session->run_scope,
                                             session->event_bus,
                                             session->audio_channel_count,
                                             sink_name,
@@ -177,8 +214,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
             logs::log(logs::error,
                       "[STREAM_SESSION] Wayland socket {} was not ready, aborting runner startup",
                       ready.wayland_socket_name);
-            session->event_bus->fire_event(
-                immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session->session_id}));
+            session->event_bus->fire_event(immer::box<events::RunEnded>(
+                events::RunEnded{.session_id = std::to_string(session->session_id), .run_scope = session->run_scope}));
             return;
           }
 
@@ -193,17 +230,21 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
   /* Start runner */
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StartRunner>>(
       [=](const immer::box<events::StartRunner> &run_session) {
+        if (!run_session->stream_session || !run_session->stream_session->run_scope)
+          return;
         auto session_id = std::to_string(run_session->stream_session->session_id);
-        auto devices_q = plugged_devices_queue->load()->find(session_id);
-        if (!devices_q) {
+        auto queues = plugged_devices_queue->load();
+        auto entry = queues->find(session_id);
+        if (!entry || !entry->scope.matches(run_session->stream_session->run_scope)) {
           logs::log(logs::warning, "No devices queue found for session {}", session_id);
           return;
         }
 
+        auto devices_q = entry->queue; // Own it across worker launch and map replacement.
         std::thread([=]() {
           auto outcome = start_runner(
               run_session->runner,
-              *devices_q,
+              devices_q,
               immer::box<RunnerArgs>{RunnerArgs{
                   .session_id = session_id,
                   .video_settings =
@@ -222,7 +263,8 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                   .app_local_state_folder = run_session->stream_session->app_local_state_folder,
                   .app_host_state_folder = run_session->stream_session->app_host_state_folder,
                   .xdg_runtime_dir = runtime_dir,
-                  .client_settings = run_session->stream_session->client_settings}});
+                  .client_settings = run_session->stream_session->client_settings,
+                  .run_scope = run_session->stream_session->run_scope}});
 
           if (outcome.state == RunnerOutcome::State::unknown) {
             logs::log(logs::error, "[STREAM_SESSION] Runner {} is unknown; session retained", outcome.identity);
@@ -232,19 +274,23 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           if (run_session->stop_stream_when_over) {
             run_session->stream_session->wayland_display->store(nullptr);
 
-            app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>(
-                events::StopStreamEvent{.session_id = run_session->stream_session->session_id}));
+            app_state->event_bus->fire_event(immer::box<events::RunEnded>(
+                events::RunEnded{.session_id = session_id, .run_scope = run_session->stream_session->run_scope}));
           }
         }).detach();
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::VideoSession>>(
-      [ev_bus = app_state->event_bus,
-       gst_context = app_state->gst_context](const immer::box<events::VideoSession> &sess) {
+      [app_state, ev_bus = app_state->event_bus, gst_context = app_state->gst_context](
+          const immer::box<events::VideoSession> &sess) {
+        if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+          return;
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, gst_context]() {
+        std::thread([app_state, sess, ev_bus, gst_context]() {
           auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
 
+          if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+            return;
           // Start streaming
           streaming::start_streaming_video(sess,
                                            ev_bus,
@@ -256,11 +302,15 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::AudioSession>>(
-      [ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
+      [app_state, ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
+        if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+          return;
         // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, audio_server]() {
+        std::thread([app_state, sess, ev_bus, audio_server]() {
           auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
 
+          if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+            return;
           // Start streaming
           auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
                                                 : std::optional<std::string>();

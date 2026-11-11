@@ -40,7 +40,9 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
   events::JoypadList joypads = session.joypads->load();
   for (auto [_joypad_nr, joypad] : joypads) {
     // Plug them into original session
-    events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id)};
+    events::PlugDeviceEvent plug_ev{.session_id = std::to_string(session.session_id),
+                                    .run_scope = session.run_scope,
+                                    .connection_scope = session.connection_scope};
     std::visit(
         [&plug_ev](auto &pad) {
           plug_ev.udev_events = pad.get_udev_events();
@@ -52,14 +54,18 @@ void leave_lobby(const std::shared_ptr<events::EventBusType> &ev_bus,
     ev_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
         events::UnplugDeviceEvent{.session_id = lobby.id,
                                   .udev_events = plug_ev.udev_events,
-                                  .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
+                                  .udev_hw_db_entries = plug_ev.udev_hw_db_entries,
+                                  .run_scope = lobby.run_scope,
+                                  .connection_scope = session.connection_scope}});
   }
   // TODO: hotplug pen_tablet and touch_screen
 
   // Switch audio/video gstreamer stream producers
   ev_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
       events::SwitchStreamProducerEvents{.session_id = session.session_id,
-                                         .interpipe_src_id = std::to_string(session.session_id)}});
+                                         .interpipe_src_id = std::to_string(session.session_id),
+                                         .connection_scope = session.connection_scope,
+                                         .producer_scope = session.run_scope}});
 
   if (lobby.stop_when_everyone_leaves && lobby.connected_sessions->load()->size() == 0) {
     // Nobody left in the lobby, and it's set to stop when everyone leaves
@@ -87,9 +93,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
       // A repeated event or a failure after completion must not resolve twice.
     }
   };
-  auto cleanup_lobby = [=](const std::string &id) {
+  auto cleanup_lobby = [=](const RunScope &scope) {
+    const auto &id = scope.id();
     auto ticket = lifecycle->find(id);
-    if (!ticket) {
+    if (!ticket || !ticket->run_scope.matches(scope)) {
       return;
     }
     handle_lobby_stop(
@@ -98,13 +105,18 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         [&] {
           auto lobbies = app_state->lobbies->load();
           auto lobby = state::get_lobby_by_id(lobbies.get(), id);
-          if (!lobby) {
+          if (!lobby || !lobby->run_scope.matches(scope)) {
             return lifecycle->setup_complete(ticket);
           }
-          auto connected = lobby->connected_sessions->load();
-          for (const auto &session_id : *connected) {
+          auto connected = lobby->members->load();
+          for (const auto &[session_id, member] : *connected) {
+            auto current = state::get_session_by_run(app_state->running_sessions->load(), member->run_scope);
+            const auto &session = current ? *current : *member;
             app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
-                events::LeaveLobbyEvent{.lobby_id = id, .moonlight_session_id = std::stoul(*session_id)}});
+                events::LeaveLobbyEvent{.lobby_id = id,
+                                        .moonlight_session_id = session_id,
+                                        .lobby_scope = scope,
+                                        .connection_scope = session.connection_scope}});
           }
           return lobby->connected_sessions->load()->empty();
         },
@@ -112,7 +124,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           // Only confirmed terminal workers and completed membership cleanup can
           // remove this addressable record. Unknown/failed stop keeps the ID/PIN.
           auto lobbies = app_state->lobbies->load();
-          if (auto lobby = state::get_lobby_by_id(lobbies.get(), id)) {
+          if (auto lobby = state::get_lobby_by_id(lobbies.get(), id); lobby && lobby->run_scope.matches(scope)) {
             if (audio_server && audio_server->server) {
               std::shared_ptr<audio::VSink> sink = lobby->audio_sink->load();
               if (sink) {
@@ -121,8 +133,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
               }
             }
           }
-          app_state->lobbies->update([id](const immer::vector<events::Lobby> &lobbies) {
-            return lobbies | ranges::views::filter([&](const events::Lobby &lobby) { return lobby.id != id; }) |
+          app_state->lobbies->update([scope](const immer::vector<events::Lobby> &lobbies) {
+            return lobbies |
+                   ranges::views::filter([&](const events::Lobby &lobby) { return !lobby.run_scope.matches(scope); }) |
                    ranges::to<immer::vector<events::Lobby>>();
           });
         });
@@ -131,16 +144,21 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
     notify_lobby_completion(
         *lifecycle,
         ticket,
-        [&] { ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = ticket->id}}); },
-        [&] { cleanup_lobby(ticket->id); });
+        [&] {
+          ev_bus->fire_event(immer::box<events::StopLobbyEvent>{
+              events::StopLobbyEvent{.lobby_id = ticket->id, .run_scope = ticket->run_scope}});
+        },
+        [&] { cleanup_lobby(ticket->run_scope); });
   };
   auto dispatch_deferred = [cleanup_lobby, ev_bus = app_state->event_bus](const auto &ticket, const auto &deferred) {
-    for (auto session_id : deferred.leaves) {
-      ev_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
-          events::LeaveLobbyEvent{.lobby_id = ticket->id, .moonlight_session_id = session_id}});
+    for (const auto &scope : deferred.leaves) {
+      ev_bus->fire_event(immer::box<events::LeaveLobbyEvent>{events::LeaveLobbyEvent{.lobby_id = ticket->id,
+                                                                                     .moonlight_session_id = scope.id(),
+                                                                                     .lobby_scope = ticket->run_scope,
+                                                                                     .connection_scope = scope}});
     }
     if (deferred.stop) {
-      cleanup_lobby(ticket->id);
+      cleanup_lobby(ticket->run_scope);
     }
   };
 
@@ -190,7 +208,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                   .multi_user = lobby_settings->multi_user,
                                   .pin = lobby_settings->pin,
                                   .stop_when_everyone_leaves = lobby_settings->stop_when_everyone_leaves,
-                                  .runner = lobby_settings->runner});
+                                  .runner = lobby_settings->runner,
+                                  .run_scope = ticket->run_scope});
                 app_state->lobbies->update(
                     [lobby](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(*lobby); });
                 if (lifecycle->stopping(ticket)) {
@@ -217,7 +236,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                           try {
                             if (!lifecycle->stopping(ticket)) {
                               auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
-                              streaming::start_audio_producer(lobby->id,
+                              streaming::start_audio_producer(lobby->run_scope,
                                                               ev_bus,
                                                               channel_count,
                                                               sink_name,
@@ -241,7 +260,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                         try {
                                           if (!lifecycle->stopping(ticket)) {
                                             streaming::start_video_producer(
-                                                lobby->id,
+                                                lobby->run_scope,
                                                 lobby_settings->video_settings.video_producer_buffer_caps,
                                                 lobby_settings->video_settings.wayland_render_node,
                                                 {.width = lobby_settings->video_settings.width,
@@ -328,7 +347,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                                              lobby_settings->runner_state_folder,
                                     .xdg_runtime_dir = runtime_dir,
                                     .client_settings = lobby_settings->client_settings,
-                                    .cleanup_audio_sink = false}});
+                                    .cleanup_audio_sink = false,
+                                    .run_scope = lobby->run_scope}});
                             if (outcome.state == RunnerOutcome::State::unknown) {
                               lifecycle->quarantine(ticket);
                               logs::log(logs::error,
@@ -362,7 +382,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
               },
               [=] {
                 if (lifecycle->stopping(ticket)) {
-                  cleanup_lobby(ticket->id);
+                  cleanup_lobby(ticket->run_scope);
                 }
               });
         } catch (const std::exception &e) {
@@ -378,9 +398,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), join_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();
-        auto session = state::get_session_by_id(sessions.get(), join_lobby_event->moonlight_session_id);
+        auto session = state::get_session_by_scope(sessions.get(), join_lobby_event->connection_scope.get());
 
-        if (!lobby || !session) {
+        if (!lobby || !session || !lobby->run_scope.matches(join_lobby_event->lobby_scope.get()) ||
+            session->session_id != join_lobby_event->moonlight_session_id) {
           logs::log(logs::error,
                     "[LOBBY] Failed to join lobby: lobby {} or session {} not found",
                     join_lobby_event->lobby_id,
@@ -410,7 +431,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           // plug
           events::JoypadList joypads = session->joypads->load();
           for (auto [_joypad_nr, joypad] : joypads) {
-            events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
+            events::PlugDeviceEvent plug_ev{.session_id = lobby->id,
+                                            .run_scope = lobby->run_scope,
+                                            .connection_scope = session->connection_scope};
             std::visit(
                 [&plug_ev](auto &pad) {
                   plug_ev.udev_events = pad.get_udev_events();
@@ -421,7 +444,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
                 events::UnplugDeviceEvent{.session_id = std::to_string(session->session_id),
                                           .udev_events = plug_ev.udev_events,
-                                          .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
+                                          .udev_hw_db_entries = plug_ev.udev_hw_db_entries,
+                                          .run_scope = session->run_scope,
+                                          .connection_scope = session->connection_scope}});
 
             // Add it to the lobby runner's devices queue, addressed to the lobby id
             // (same routing the PlugDeviceEvent relay performs for connected sessions)
@@ -429,6 +454,9 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           }
           // TODO: hotplug pen_tablet
 
+          lobby->members->update([session](const auto &members) {
+            return members.set(session->session_id, std::make_shared<events::StreamSession>(*session));
+          });
           // Update the lobby with the new session
           lobby->connected_sessions->update(
               [session](const immer::vector<immer::box<std::string>> &connected_sessions) {
@@ -443,7 +471,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
 
           // Switch audio/video gstreamer stream producers
           app_state->event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
-              events::SwitchStreamProducerEvents{.session_id = session->session_id, .interpipe_src_id = lobby->id}});
+              events::SwitchStreamProducerEvents{.session_id = session->session_id,
+                                                 .interpipe_src_id = lobby->id,
+                                                 .connection_scope = session->connection_scope,
+                                                 .producer_scope = lobby->run_scope}});
           settle_join(join_lobby_event, "");
           dispatch_deferred(ticket, lifecycle->finish(ticket));
         } catch (const std::exception &e) {
@@ -461,20 +492,34 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), leave_lobby_event->lobby_id);
         auto sessions = app_state->running_sessions->load();
-        auto session = state::get_session_by_id(sessions.get(), leave_lobby_event->moonlight_session_id);
+        auto session = state::get_session_by_scope(sessions.get(), leave_lobby_event->connection_scope.get());
+        // Run cleanup may follow removal from running_sessions. Retain the exact
+        // member snapshot; never redirect a late leave to a replacement session.
+        if (!session && lobby && !state::get_session_by_id(sessions.get(), leave_lobby_event->moonlight_session_id)) {
+          auto members = lobby->members->load();
+          if (auto member = members->find(leave_lobby_event->moonlight_session_id);
+              member && (*member)->connection_scope.matches(leave_lobby_event->connection_scope.get()))
+            session = **member;
+        }
 
-        if (!lobby || !session) {
+        if (!lobby || !session || !lobby->run_scope.matches(leave_lobby_event->lobby_scope.get()) ||
+            session->session_id != leave_lobby_event->moonlight_session_id) {
           logs::log(logs::error,
                     "[LOBBY] Failed to leave lobby: lobby {} or session {} not found",
                     leave_lobby_event->lobby_id,
                     leave_lobby_event->moonlight_session_id);
         } else {
+          auto members = lobby->members->load();
+          auto member = members->find(session->session_id);
+          if (!member || !(*member)->run_scope.matches(session->run_scope))
+            return;
           auto ticket = lifecycle->find(lobby->id);
-          if (!ticket || !lifecycle->leave(ticket, session->session_id)) {
+          if (!ticket || !lifecycle->leave(ticket, session->connection_scope)) {
             return;
           }
           try {
             leave_lobby(app_state->event_bus, lobby.value(), session.value(), [=] { signal_stop(ticket); });
+            lobby->members->update([session](const auto &members) { return members.erase(session->session_id); });
             dispatch_deferred(ticket, lifecycle->finish(ticket, session->session_id));
           } catch (const std::exception &e) {
             lifecycle->quarantine(ticket);
@@ -486,20 +531,28 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
   // Membership cleanup does not mean the runner stopped. Keep the record until
   // terminal completion, so the public stop API can address an explicit retry.
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-      [=](const immer::box<events::StopLobbyEvent> &event) { cleanup_lobby(event->lobby_id); }));
+      [=](const immer::box<events::StopLobbyEvent> &event) {
+        if (event->run_scope.get().id() == event->lobby_id)
+          cleanup_lobby(event->run_scope.get());
+      }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::DockerContainerCreated>>(
       [=](const immer::box<events::DockerContainerCreated> &created) {
         auto ticket = lifecycle->find(created->session_id);
-        if (ticket && lifecycle->stopping(ticket)) {
-          app_state->event_bus->fire_event(
-              immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = ticket->id}});
+        if (ticket && ticket->run_scope.matches(created->run_scope.get()) && lifecycle->stopping(ticket)) {
+          app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>{
+              events::StopLobbyEvent{.lobby_id = ticket->id, .run_scope = ticket->run_scope}});
         }
       }));
 
   // On a PlugDeviceEvent, we have to add the device to the lobby queue so that the runner will pick it up
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
       [=](const immer::box<events::PlugDeviceEvent> &plug_device_event) {
+        auto source =
+            state::get_session_by_scope(app_state->running_sessions->load(), plug_device_event->connection_scope.get());
+        if (!source ||
+            !sessions::targets(source->run_scope, plug_device_event->run_scope.get(), plug_device_event->session_id))
+          return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_by_connected_session(lobbies, plug_device_event->session_id)) {
           logs::log(logs::info,
@@ -510,50 +563,85 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           lobby->plugged_devices_queue->push(immer::box<events::PlugDeviceEvent>{
               events::PlugDeviceEvent{.session_id = lobby->id,
                                       .udev_events = plug_device_event->udev_events,
-                                      .udev_hw_db_entries = plug_device_event->udev_hw_db_entries}});
+                                      .udev_hw_db_entries = plug_device_event->udev_hw_db_entries,
+                                      .run_scope = lobby->run_scope,
+                                      .connection_scope = plug_device_event->connection_scope}});
         }
       }));
 
   // When a device is unplugged from a Moonlight session, we have to re-fire the event on our lobby
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
       [=](const immer::box<events::UnplugDeviceEvent> &unplug_device_event) {
+        auto source = state::get_session_by_scope(app_state->running_sessions->load(),
+                                                  unplug_device_event->connection_scope.get());
+        if (!source || !sessions::targets(source->run_scope,
+                                          unplug_device_event->run_scope.get(),
+                                          unplug_device_event->session_id))
+          return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_by_connected_session(lobbies, unplug_device_event->session_id)) {
           logs::log(logs::debug, "[LOBBY] Unplug device for session {}", unplug_device_event->session_id);
           app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
               events::UnplugDeviceEvent{.session_id = lobby->id,
                                         .udev_events = unplug_device_event->udev_events,
-                                        .udev_hw_db_entries = unplug_device_event->udev_hw_db_entries}});
+                                        .udev_hw_db_entries = unplug_device_event->udev_hw_db_entries,
+                                        .run_scope = lobby->run_scope,
+                                        .connection_scope = unplug_device_event->connection_scope}});
         }
       }));
 
-  auto on_moonlight_session_over = [app_state](std::size_t moonlight_session_id) {
-    immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
-    if (auto lobby = state::get_lobby_by_connected_session(lobbies, std::to_string(moonlight_session_id))) {
-      logs::log(logs::info, "[LOBBY] Moonlight stream {} over, leaving lobby {}", moonlight_session_id, lobby->id);
-      // Fire the LeaveLobbyEvent so that it can also be picked up by WolfUI via SSE
-      app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
-          events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = moonlight_session_id}});
+  auto on_explicit_leave = [app_state](const ConnectionScope &scope) {
+    auto session = state::get_session_by_scope(app_state->running_sessions->load(), scope);
+    if (!session)
+      return;
+    auto lobbies = app_state->lobbies->load();
+    if (auto lobby = state::get_lobby_by_connected_session(*lobbies, std::to_string(scope.id()))) {
+      app_state->event_bus->fire_event(
+          immer::box<events::LeaveLobbyEvent>{events::LeaveLobbyEvent{.lobby_id = lobby->id,
+                                                                      .moonlight_session_id = scope.id(),
+                                                                      .lobby_scope = lobby->run_scope,
+                                                                      .connection_scope = scope}});
     }
   };
+  // Network pause/stop ends only its consumers. Membership/device migration is
+  // an explicit leave operation; input revocation/neutral is a later stage.
 
-  // When a Moonlight client Pauses a session, we get the user out of a lobby
-  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-      [=](const immer::box<events::PauseStreamEvent> &pause_stream_event) {
-        on_moonlight_session_over(pause_stream_event->session_id);
+  auto on_run_over = [app_state](const RunScope &run) {
+    if (!run)
+      return;
+    auto lobbies = app_state->lobbies->load();
+    for (const auto &lobby : *lobbies) {
+      auto members = lobby.members->load();
+      for (const auto &[id, member] : *members) {
+        if (!member->run_scope.matches(run))
+          continue;
+        auto current = state::get_session_by_run(app_state->running_sessions->load(), run);
+        const auto &session = current ? *current : *member;
+        app_state->event_bus->fire_event(
+            immer::box<events::LeaveLobbyEvent>{events::LeaveLobbyEvent{.lobby_id = lobby.id,
+                                                                        .moonlight_session_id = id,
+                                                                        .lobby_scope = lobby.run_scope,
+                                                                        .connection_scope = session.connection_scope}});
+      }
+    }
+  };
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::GameStopRequest>>(
+      [on_run_over](const immer::box<events::GameStopRequest> &ev) {
+        if (ev->run_scope.get().id() == ev->session_id)
+          on_run_over(ev->run_scope.get());
       }));
-
-  // When a Moonlight client Stops a session, we get the user out of a lobby
-  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [=](const immer::box<events::StopStreamEvent> &stop_stream_event) {
-        on_moonlight_session_over(stop_stream_event->session_id);
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::RunEnded>>(
+      [on_run_over](const immer::box<events::RunEnded> &ev) {
+        if (ev->run_scope.get().id() == ev->session_id)
+          on_run_over(ev->run_scope.get());
       }));
 
   // When a client presses the WolfUI special combo, we get the user out of the lobby (and back to WolfUI)
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
       [=](const immer::box<events::ClientWolfUIComboEvent> &event) {
         logs::log(logs::info, "Detected WolfUI combo for session {}", event->session_id);
-        on_moonlight_session_over(event->session_id);
+        if (event->connection_scope.get().id() == event->session_id)
+          on_explicit_leave(event->connection_scope.get());
       }));
 
   return handlers.persistent();

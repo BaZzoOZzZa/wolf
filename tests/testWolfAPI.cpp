@@ -525,6 +525,12 @@ TEST_CASE("Lobby relays a device unplug to its runner", "[API]") {
 
   auto lobbies_handlers = sessions::setup_lobbies_handlers(app_state, api_runtime_dir(), {});
 
+  lobby.run_scope = sessions::RunScope::fresh(lobby_id);
+  app_state->lobbies->store(immer::vector<events::Lobby>{lobby});
+  events::StreamSession source{.session_id = 1234,
+                               .connection_scope = sessions::ConnectionScope::fresh(1234),
+                               .run_scope = sessions::RunScope::fresh(moonlight_session_id)};
+  app_state->running_sessions->store(immer::vector<events::StreamSession>{source});
   int relayed_to_lobby = 0;
   auto observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
       [&](const immer::box<events::UnplugDeviceEvent> &ev) {
@@ -534,7 +540,9 @@ TEST_CASE("Lobby relays a device unplug to its runner", "[API]") {
       });
 
   event_bus->fire_event(
-      immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{.session_id = moonlight_session_id}});
+      immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{.session_id = moonlight_session_id,
+                                                                      .run_scope = source.run_scope,
+                                                                      .connection_scope = source.connection_scope}});
 
   REQUIRE(relayed_to_lobby == 1);
 }
@@ -612,7 +620,10 @@ TEST_CASE("Lobbies APIs", "[API]") {
   { // Test joining a lobby
     // First, create a StreamSession
     running_sessions->update([moonlight_session_id](const immer::vector<events::StreamSession> &sessions) {
-      return sessions.push_back(events::StreamSession{.session_id = moonlight_session_id});
+      return sessions.push_back(
+          events::StreamSession{.session_id = moonlight_session_id,
+                                .connection_scope = sessions::ConnectionScope::fresh(moonlight_session_id),
+                                .run_scope = sessions::RunScope::fresh(std::to_string(moonlight_session_id))});
     });
     // Then, call the join endpoint
     auto payload =
@@ -902,6 +913,10 @@ TEST_CASE("Control association does not fall back from an incorrect token", "[CO
                                  .enet_secret_payload = 456,
                                  .session_id = 2,
                                  .ip = "192.0.2.2"};
+  a.connection_scope = wolf::core::sessions::ConnectionScope::fresh(a.session_id);
+  a.run_scope = wolf::core::sessions::RunScope::fresh("1");
+  b.connection_scope = wolf::core::sessions::ConnectionScope::fresh(b.session_id);
+  b.run_scope = wolf::core::sessions::RunScope::fresh("2");
   sessions->update([&](auto v) { return v.push_back(a).push_back(b); });
   REQUIRE_FALSE(control::match_control_session(sessions, a.ip, 999));
   REQUIRE_FALSE(control::match_control_session(sessions, "192.0.2.9", 999));
@@ -920,6 +935,7 @@ TEST_CASE("Control association does not fall back from an incorrect token", "[CO
   sessions->update([&](auto) { return immer::vector<events::StreamSession>{a, b}; });
   REQUIRE_FALSE(control::match_control_session(sessions, a.ip, a.enet_secret_payload));
   auto resumed = a;
+  resumed.connection_scope = wolf::core::sessions::ConnectionScope::fresh(a.session_id);
   resumed.control_crypto = std::make_shared<moonlight::control::ControlCryptoState>();
   // Even reused stable ID, transport tokens and key do not grant the old peer
   // ownership of a newly created launch/resume object.

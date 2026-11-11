@@ -43,6 +43,7 @@ struct RunnerArgs {
   immer::box<config::ClientSettings> client_settings;
   // Lobby finalization owns its sink, including failures before a runner exists.
   bool cleanup_audio_sink = true;
+  sessions::RunScope run_scope;
 };
 
 struct RunnerOutcome {

@@ -20,10 +20,13 @@
 #include <moonlight/data-structures.hpp>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
+#include <sessions/connection_scope.hpp>
 #include <state/serialised_config.hpp>
 #include <string_view>
 
 namespace wolf::core::events {
+
+struct StreamSession;
 
 struct PairSignal {
   std::string client_ip;
@@ -35,12 +38,16 @@ struct PlugDeviceEvent {
   std::string session_id;
   std::vector<std::map<std::string, std::string>> udev_events;
   std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries;
+  rfl::Skip<sessions::RunScope> run_scope;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct UnplugDeviceEvent {
   std::string session_id;
   std::vector<std::map<std::string, std::string>> udev_events;
   std::vector<std::pair<std::string, std::vector<std::string>>> udev_hw_db_entries;
+  rfl::Skip<sessions::RunScope> run_scope;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 using devices_atom_queue = TSQueue<immer::box<events::PlugDeviceEvent>>;
@@ -49,7 +56,7 @@ using RunnerTypes = rfl::TaggedUnion<"type", wolf::config::AppCMD, wolf::config:
 struct Runner {
   virtual ~Runner() = default;
 
-  virtual void run(std::string_view session_id,
+  virtual void run(const sessions::RunScope &run_scope,
                    std::string_view app_state_folder,
                    std::string_view host_xdg_runtime_dir,
                    std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
@@ -137,6 +144,9 @@ struct Lobby {
    * A queue of devices that will be plugged into the runner when ready
    */
   std::shared_ptr<events::devices_atom_queue> plugged_devices_queue = std::make_shared<events::devices_atom_queue>();
+  sessions::RunScope run_scope;
+  std::shared_ptr<immer::atom<immer::map<std::size_t, std::shared_ptr<StreamSession>>>> members =
+      std::make_shared<immer::atom<immer::map<std::size_t, std::shared_ptr<StreamSession>>>>();
 };
 
 struct VideoSettings {
@@ -186,16 +196,21 @@ struct JoinLobbyEvent {
    * A promise to know if there's been an error message
    */
   rfl::Skip<std::shared_ptr<std::promise<std::string>>> error_message = std::make_shared<std::promise<std::string>>();
+  rfl::Skip<sessions::RunScope> lobby_scope;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct LeaveLobbyEvent {
   const std::string lobby_id;
   const std::size_t moonlight_session_id;
+  rfl::Skip<sessions::RunScope> lobby_scope;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct StopLobbyEvent {
   const std::string lobby_id;
   std::optional<std::vector<short>> pin = std::nullopt;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 struct DockerPullImageStartEvent {
@@ -211,12 +226,14 @@ struct DockerContainerCreated {
   std::string container_id;
   std::string hostname;
   std::string session_id;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 struct DockerContainerStopped {
   std::string container_id;
   std::string hostname;
   std::string session_id;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 using MouseTypes = std::variant<input::Mouse, virtual_display::WaylandMouse>;
@@ -263,6 +280,8 @@ struct VideoSession {
 
   std::string client_ip;
   std::array<char, 16> rtp_secret_payload;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 struct AudioSession {
@@ -282,27 +301,45 @@ struct AudioSession {
 
   int packet_duration;
   wolf::core::audio::AudioMode audio_mode;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 struct IDRRequestEvent {
   // A unique ID that identifies this session
   std::size_t session_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct PauseStreamEvent {
   std::size_t session_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct ResumeStreamEvent {
   std::size_t session_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct StopStreamEvent {
   std::size_t session_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
+};
+
+// Game lifetime is independent of a connection. Only trusted administrative
+// ingress or a captured run failure requests stop; completion is a distinct fact.
+struct GameStopRequest {
+  std::string session_id;
+  rfl::Skip<sessions::RunScope> run_scope;
+};
+struct RunEnded {
+  std::string session_id;
+  rfl::Skip<sessions::RunScope> run_scope;
 };
 
 struct ClientWolfUIComboEvent {
   std::size_t session_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
 };
 
 struct SwitchStreamProducerEvents {
@@ -311,6 +348,8 @@ struct SwitchStreamProducerEvents {
    * The source ID of the interpipe that will be used to produce the stream.
    */
   std::string interpipe_src_id;
+  rfl::Skip<sessions::ConnectionScope> connection_scope;
+  rfl::Skip<sessions::RunScope> producer_scope;
 };
 
 struct RTPVideoPingEvent {
@@ -345,6 +384,8 @@ using EventBusHandlers = dp::handler_registration<immer::box<PlugDeviceEvent>,
                                                   immer::box<PauseStreamEvent>,
                                                   immer::box<ResumeStreamEvent>,
                                                   immer::box<StopStreamEvent>,
+                                                  immer::box<GameStopRequest>,
+                                                  immer::box<RunEnded>,
                                                   immer::box<ClientWolfUIComboEvent>,
                                                   immer::box<RTPVideoPingEvent>,
                                                   immer::box<RTPAudioPingEvent>,
@@ -366,6 +407,8 @@ using EventBusType = dp::event_bus<immer::box<PlugDeviceEvent>,
                                    immer::box<PauseStreamEvent>,
                                    immer::box<ResumeStreamEvent>,
                                    immer::box<StopStreamEvent>,
+                                   immer::box<GameStopRequest>,
+                                   immer::box<RunEnded>,
                                    immer::box<ClientWolfUIComboEvent>,
                                    immer::box<RTPVideoPingEvent>,
                                    immer::box<RTPAudioPingEvent>,
@@ -387,6 +430,8 @@ using EventsVariant = std::variant<immer::box<PlugDeviceEvent>,
                                    immer::box<PauseStreamEvent>,
                                    immer::box<ResumeStreamEvent>,
                                    immer::box<StopStreamEvent>,
+                                   immer::box<GameStopRequest>,
+                                   immer::box<RunEnded>,
                                    immer::box<ClientWolfUIComboEvent>,
                                    immer::box<RTPVideoPingEvent>,
                                    immer::box<RTPAudioPingEvent>,
@@ -466,6 +511,8 @@ struct StreamSession {
 
   std::shared_ptr<std::optional<input::PenTablet>> pen_tablet =
       std::make_shared<std::optional<input::PenTablet>>(); /* Optional, will be set on first use */
+  sessions::ConnectionScope connection_scope;
+  sessions::RunScope run_scope;
 };
 
 } // namespace wolf::core::events

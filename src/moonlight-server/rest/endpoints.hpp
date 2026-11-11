@@ -450,9 +450,9 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
-  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
+  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
@@ -470,6 +470,9 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   if (old_session) {
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    new_session->run_scope = old_session->run_scope;
+    new_session->audio_sink = old_session->audio_sink;
+    new_session->held_modifiers = old_session->held_modifiers;
     // Carry over the old session display handle
     new_session->wayland_display = std::move(old_session->wayland_display);
     // Carry over the old session devices, they'll be already plugged into the container
@@ -480,9 +483,18 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     new_session->touch_screen = std::move(old_session->touch_screen);
 
     state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
+      if (!state::get_session_by_scope(ses_v, old_session->connection_scope))
+        return ses_v;
       return state::remove_session(ses_v, old_session.value()).push_back(*new_session);
     });
 
+    if (!state::get_session_by_scope(state->running_sessions->load(), new_session->connection_scope)) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
+    state->event_bus->fire_event(immer::box<events::StopStreamEvent>{
+        events::StopStreamEvent{.session_id = old_session->session_id,
+                                .connection_scope = old_session->connection_scope}});
     auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
     auto xml = moonlight::launch_resume(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
     send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
@@ -500,12 +512,10 @@ void cancel(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_session = state::get_session_by_client(state->running_sessions->load(), current_client);
   if (client_session) {
-    state->event_bus->fire_event(
-        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = client_session->session_id}));
+    state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+        events::GameStopRequest{.session_id = std::to_string(client_session->session_id),
+                                .run_scope = client_session->run_scope}));
 
-    state->running_sessions->update([&client_session](const immer::vector<events::StreamSession> &ses_v) {
-      return state::remove_session(ses_v, client_session.value());
-    });
   } else {
     auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
     logs::log(logs::warning, "[HTTPS] Received resume event from an unregistered session, ip: {}", client_ip);

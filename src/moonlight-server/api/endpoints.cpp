@@ -307,6 +307,8 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.connection_scope = session->connection_scope;
+      video_session.run_scope = session->run_scope;
       if (video_session.render_node.empty()) {
         video_session.render_node = session->app->render_node;
       }
@@ -314,12 +316,14 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
 
       auto audio_session = start_req.value().audio_session;
       audio_session.session_id = session_id; // Can't be JSON encoded
+      audio_session.connection_scope = session->connection_scope;
+      audio_session.run_scope = session->run_scope;
       state_->app_state->event_bus->fire_event(immer::box<events::AudioSession>(audio_session));
 
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
     } else {
-      logs::log(logs::warning, "[API] Invalid session_id: {}", session.value().session_id);
+      logs::log(logs::warning, "[API] Invalid session_id: {}", session_id);
       auto res = GenericErrorResponse{.error = "Invalid session_id"};
       send_http(socket, 500, rfl::json::write(res));
     }
@@ -335,9 +339,9 @@ void UnixSocketServer::endpoint_StreamSessionPause(const HTTPRequest &req, std::
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
     auto session_id = std::stoul(session.value().session_id);
-    if (state::get_session_by_id(sessions.get(), session_id)) {
-      this->state_->app_state->event_bus->fire_event(
-          immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+    if (auto target = state::get_session_by_id(sessions.get(), session_id)) {
+      this->state_->app_state->event_bus->fire_event(immer::box<events::PauseStreamEvent>(
+          events::PauseStreamEvent{.session_id = session_id, .connection_scope = target->connection_scope}));
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
     } else {
@@ -357,9 +361,9 @@ void UnixSocketServer::endpoint_StreamSessionStop(const HTTPRequest &req, std::s
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
     auto session_id = std::stoul(session.value().session_id);
-    if (state::get_session_by_id(sessions.get(), session_id)) {
-      this->state_->app_state->event_bus->fire_event(
-          immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+    if (auto target = state::get_session_by_id(sessions.get(), session_id)) {
+      this->state_->app_state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+          events::GameStopRequest{.session_id = std::to_string(session_id), .run_scope = target->run_scope}));
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
       return;
@@ -501,6 +505,14 @@ void UnixSocketServer::endpoint_LobbyJoin(const wolf::api::HTTPRequest &req, std
       return;
     }
     auto lobby_ev = event.value();
+    auto target = state::get_session_by_id(state_->app_state->running_sessions->load(), lobby_ev.moonlight_session_id);
+    auto lobby = state::get_lobby_by_id(lobbies.get(), lobby_ev.lobby_id);
+    if (!target || !lobby) {
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid lobby or session"}));
+      return;
+    }
+    lobby_ev.connection_scope = target->connection_scope;
+    lobby_ev.lobby_scope = lobby->run_scope;
     lobby_ev.error_message = std::make_shared<std::promise<std::string>>();
     state_->app_state->event_bus->fire_event(immer::box<events::JoinLobbyEvent>(lobby_ev));
 
@@ -524,7 +536,16 @@ void UnixSocketServer::endpoint_LobbyJoin(const wolf::api::HTTPRequest &req, std
 void UnixSocketServer::endpoint_LobbyLeave(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<events::LeaveLobbyEvent>(req.body);
   if (event) {
-    state_->app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>(event.value()));
+    auto lobby = state::get_lobby_by_id(state_->app_state->lobbies->load(), event->lobby_id);
+    auto target = state::get_session_by_id(state_->app_state->running_sessions->load(), event->moonlight_session_id);
+    if (!target || !lobby) {
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid lobby or session"}));
+      return;
+    }
+    auto scoped = event.value();
+    scoped.lobby_scope = lobby->run_scope;
+    scoped.connection_scope = target->connection_scope;
+    state_->app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>(scoped));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
@@ -540,7 +561,9 @@ void UnixSocketServer::endpoint_LobbyStop(const wolf::api::HTTPRequest &req, std
       send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = err.value()}));
       return;
     }
-    state_->app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(event.value()));
+    auto scoped = event.value();
+    scoped.run_scope = state::get_lobby_by_id(lobbies.get(), scoped.lobby_id)->run_scope;
+    state_->app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(scoped));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
