@@ -16,7 +16,8 @@ if (NOT Boost_FOUND)
 
     # Header-only libraries still need their real targets and transitive includes
     # in Boost's split source layout. Installed Boost already supplies these headers.
-    set(BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS} property_tree)
+    # state/config.hpp uses UUID generators/io in public server headers.
+    set(BOOST_INCLUDE_LIBRARIES ${BOOST_COMPONENTS} property_tree uuid)
     set(BOOST_ENABLE_CMAKE ON)
     # Simple-Web-Server consumes the official Boost::boost compatibility target.
     set(BOOST_ENABLE_COMPATIBILITY_TARGETS ON)
@@ -32,7 +33,7 @@ if (NOT Boost_FOUND)
     # monolithic include directory (libs/headers/include is not such a tree).
     set(Boost_INCLUDE_DIRS "")
     set(Boost_LIBRARIES "")  # cmake-lint: disable=C0103
-    foreach (component ${BOOST_COMPONENTS} property_tree)
+    foreach (component ${BOOST_COMPONENTS} property_tree uuid)
         list(APPEND Boost_LIBRARIES "Boost::${component}")
     endforeach ()
 endif ()

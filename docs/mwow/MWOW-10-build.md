@@ -1,6 +1,6 @@
 # MWOW-10 — tracked CMake dependency fixes
 
-Status: **review candidate; fresh source configure PASS, combined security execution pending**.
+Status: **review candidate; UUID follow-up graph/header checks PASS; combined build/security execution pending**.
 Base: `0e3710be36a6a7fa130f633b358d1b520a3cee9c`, branch `feature/MWOW-10-build-fix`.
 No merge, push, system installation, Wolf/test-main startup, game, Docker or device operation.
 
@@ -220,3 +220,47 @@ on this revision. Inputtino motion fixes and the other isolated targets owned
 by MWOW-6/7 are intentionally not copied into this branch. No OOM fix, complete
 BOM or user acceptance is claimed. Exact usage is unavailable; Manager owns the
 Jiraia lease and no usage numbers are invented.
+
+## UUID dependency follow-up after combined build review
+
+Manager's combined revision `d57e6b0145fb8733b4ec0634604a453ebc7c2478`
+failed compiling `wolf_runner`: `state/config.hpp:4` includes
+`boost/uuid/uuid_generators.hpp` (and `uuid_io.hpp` on line 5), but its generated
+include search path did not contain the split UUID module. The earlier
+configure-only checkpoint did not detect this production compile failure.
+Evidence read without changing the combined checkout/build:
+`/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-8/native-final/build-shared-san.log`.
+
+The FetchContent fallback now selects **`uuid`** alongside `property_tree` and
+adds the real **`Boost::uuid`** to `Boost_LIBRARIES`. The existing PUBLIC link
+on `wolf_runner` propagates its official include directory and transitive
+dependencies to consumers. Boost 1.87's own UUID target also links `atomic` on
+this Clang/Linux configuration; that edge is preserved. No global include,
+manual `-I`, host/monolithic overlay or fake target is added. The installed
+Boost lookup and its original compiled component requirements remain unchanged.
+
+Checks on the existing MWOW-10 worktree (AST root still has no index; no rebuild):
+
+- Incremental CMake configure/graph only: **exit 0**. FetchContent updates were
+  disabled for this light check; no source overrides or external hooks added.
+  Actual edges: `wolf_runner -> boost_uuid (Boost::uuid) -> atomic`.
+- File API includes the UUID module's source include directory in `wolf_runner`.
+  A syntax-only Clang probe using its generated include flags compiles the two
+  UUID headers and generator/string-conversion expressions: **exit 0**. It
+  neither links nor runs an executable and does not inject an extra include path.
+- All **50** distinct direct Boost includes in production `src/` resolve from
+  the generated runner search path to the selected Boost 1.87 source tree,
+  rather than accidentally falling back to host Boost headers: **PASS**.
+- `git diff --check`: **PASS**. No full build/test/main/runtime operation;
+  Manager retains the heavy slot and owns the combined rebuild.
+
+Exact command/log/exit: `uuid-configure-command.json`, `uuid-configure.log`,
+`uuid-configure-exit.json`; graph: `uuid-targets.dot`; generated target/header
+proof including exact syntax-probe argv: `uuid-proof.json`,
+`uuid-header-probe.cpp`, `uuid-header-probe.log`, all under the MWOW-10 artifact
+root. `uuid-fix-source-revision.json` and `uuid-fix-rawhashes.json` identify this
+follow-up. Earlier `source-revision.json`/`rawhashes.json` describe the historical
+912e2cd checkpoint; mutable metadata inside its own `native-clean-final/` build
+directory was regenerated for this UUID check. Earlier raw configure logs and
+source-provenance records remain retained. This follow-up does not claim that
+the combined production build or security suites have passed.
