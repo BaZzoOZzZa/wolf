@@ -476,3 +476,78 @@ remains NOT global shutdown proof. No Wolf/live/device execution in tests. Tests
 the actual extracted loop, fakehost/service table, real ENet packet create/free,
 real encrypted client packets and actual registry/replay; optional attached Seat is
 software-only. Concrete residuals/actual checks will be appended after verification.
+
+### 3B2 implemented boundary and review checkpoint
+
+The actual State/loop was extracted into **control/control_loop.cpp**, with the
+public lifecycle types in control_loop.hpp. The earlier checkpoint's proposed
+placement in control.cpp is superseded by this separate allowed source unit.
+control.cpp retains init/get_ip/queue_feedback/match_control_session and a narrow
+current_control_session forwarding helper calling the unchanged state helper.
+This avoids importing global sessions/InputHandoff into legacy state headers.
+No second network loop; Wolf's former detached run_control call is removed.
+
+Every real CONNECT mints a fresh PeerToken and forgets only its prior association.
+It does NOT reset the newly connected ENet peer: ENet owns slot recycling. The
+actual loop maintains the same authenticated client/owner maps, same retained
+1024-key registry (no eviction/reconnect reset), MWOW6 structure/tag/replay/current
+checks and host-direction sequence reservation. PeerToken snapshots contain no raw
+peer. Legacy ControlPeer::send remains bool queue acceptance, never delivery.
+A sender lease closes at exact forget/whole-loop stop. Default peers20 (1..20)
+counts unauthenticated records too; Unknown consumes the one start/attach slot.
+
+Legacy outbox cap256 counts queued+popped+ENet-owned packets, max128 plaintext
+bytes each (existing protocol MAX_PAYLOAD_SIZE). Fixed256 PacketCells and one
+received-packet cell survive callbacks. Plaintext/cipher overlap is finite
+(256*128 plus one encryption attempt, packet envelope/cells/container overhead);
+this is not a measured RSS bound nor the separate protected executor64KiB charge.
+Callbacks allocate payload before queue lock; queue commit/release only changes
+owned records/counts, last payload/sender release occurs outside queue/snapshot
+locks. Frames cover drain/encryption/send, actual service+dispatch+received RAII,
+reset/disconnect/flush/hostdestroy. Packet callback is marker-only. Credits/feedback
+reservation retire only after real operation returns and local payloads die.
+
+Operations defaults call real ENet only on execution owner; table injection is a
+trusted synchronous dependency seam, not a public transport/authority API. On
+known send rejection the caller destroys; uncertain transfer retains the cell and
+stops, actual owner reset/host teardown may prove release. Uncertain release itself
+is never retried/guessed: Unknown may retain the worker/State indefinitely. A
+missing callback also cannot establish completion. No detach/reaper/replacement;
+passive retention does not make transport progress. Default ENet allocator abort,
+mutex/system/throwing-destructor/noexcept ingress limits are not repaired here.
+
+Start reserves before construction; constructor/launch/null-host failure cannot
+retry. Trusted ThreadFactory guarantees no escaped thread on throw/nonjoinable.
+Readiness is host+registry+owner existence, not thread exit or protected readiness.
+Exit future is signalled at thread exit (after TLS), Joined additionally performs
+actual join. Domain and external owner can retain immutable operation dependencies
+after join; final dependency release occurs on lifecycle owner outside locks.
+Destroying Domain/Owner on its active execution stack is forbidden. A blocked call
+keeps status/stop usable;5s is decision policy, not physical completion latency.
+Successful eventual join does not clear a previous Unknown or enable replacement.
+
+Optional attach_feedback takes an EXISTING seat, one reserved slot, accepted for
+owner-thread setup; acceptance is NOT readiness/authority. It builds views from
+actual authenticated maps and the same key registry. No Wolf caller attaches a
+seat. Non-Linux compilation excludes the Linux protected adapter; attach refuses.
+The software handoff case exercises S/T peer bindings, actual InputHandoff and
+ConsumerRuntime, checked injected IO, real encrypted rumble and real ENet packet
+free across callback/stack gates. Natural SENT release is covered; authorized
+transfer cancellation/selection/transport-disconnect policy is NOT wired by this
+loop. Existing executor cancel_for_transfer semantics remain unchanged.
+
+Wolf intentionally starts control after handlers but before HTTP/HTTPS/RTSP/RTP/
+Unix API/mDNS ingress, waits readiness, and on shutdown requests stop then actual
+join. Existing other-subsystem10s wait is explicitly not global completion. Control
+Unknown can extend shutdown indefinitely. initialize's existing setup/init paths,
+audio/null behavior, other ingress implementations and GameStop logic are unchanged.
+Source order+compile evidence is not a live startup/shutdown test.
+
+Checks/raw failures/source inventory and exact revision are recorded in
+`/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-3B2.md`
+and `checks/3B2/native-evidence.json`. Initial build/header failures are ordinary
+compile failures, not semantic RED. Independent review is required before3C.
+Protected ingress remains disabled; no GameACL/selection/Seat construction/runtime
+configuration/UI/deviceexecutor/allroutes/reconciliation/isolation/live acceptance.
+WoW must never launch without NEW explicit permission; current game/prefix untouched.
+Future physical tests prefer local games after separate grants, not this checkpoint.

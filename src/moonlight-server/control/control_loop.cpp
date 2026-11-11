@@ -105,9 +105,11 @@ struct State : std::enable_shared_from_this<State> {
   std::array<PacketCell, 256> packets;
   PacketCell received;
   bool release_uncertain = false;
+#ifdef __linux__
   std::shared_ptr<InputSeat> seat;
   std::unique_ptr<protected_feedback::FeedbackDomain> feedback_domain;
   std::optional<protected_feedback::ProtectedFeedbackExecutor> feedback;
+#endif
   State(Config c, state::SessionsAtoms s, std::shared_ptr<events::EventBusType> b, Operations o)
       : config(std::move(c)), sessions(std::move(s)), bus(std::move(b)),
         transport(std::make_shared<Transport>(std::move(o))), started(config.now()) {}
@@ -203,12 +205,15 @@ struct State : std::enable_shared_from_this<State> {
     } call{this, body};
     ++calls;
     bool ok = true;
+#ifdef __linux__
     if (feedback) {
       ok = feedback->owner_call(&call, [](void *p) {
         auto &c = *static_cast<Call *>(p);
         c.body(*c.self);
       });
-    } else {
+    } else
+#endif
+    {
       try {
         body(*this);
       } catch (...) {
@@ -458,6 +463,7 @@ struct State : std::enable_shared_from_this<State> {
     dispatch(event);
   }
   void attach() {
+#ifdef __linux__
     std::shared_ptr<InputSeat> next;
     {
       std::lock_guard lock(snapshot_mutex);
@@ -489,8 +495,10 @@ struct State : std::enable_shared_from_this<State> {
     feedback = feedback_domain->create(seat, std::move(ops));
     if (!feedback || !feedback->bind_current_thread())
       throw std::runtime_error("Feedback owner setup failed");
+#endif
   }
   void pump_feedback() {
+#ifdef __linux__
     if (!feedback || stop)
       return;
     auto grant = seat->current();
@@ -537,14 +545,17 @@ struct State : std::enable_shared_from_this<State> {
       feedback->pump_one(view);
       return;
     }
+#endif
   }
   void shutdown() {
     outbox->close();
     for (auto &[raw, peer] : clients)
       peer.lease->closed = true;
     drain_outbox();
+#ifdef __linux__
     if (feedback)
       feedback->request_close(); // explicit WHOLE loop shutdown, not stale scope error
+#endif
     if (transport->host) {
       for (size_t i = 0; i < transport->host->peerCount; ++i) {
         auto *peer = &transport->host->peers[i];
@@ -581,7 +592,11 @@ struct State : std::enable_shared_from_this<State> {
       request_stop();
     }
     bool cleaned = !release_uncertain && frame([](State &s) { s.shutdown(); });
-    if (!cleaned || packets_pending() || (feedback && feedback->status().packet_live)) {
+    bool protected_pending = false;
+#ifdef __linux__
+    protected_pending = feedback && feedback->status().packet_live;
+#endif
+    if (!cleaned || packets_pending() || protected_pending) {
       // Uncertain free/callback is NOT exit. Retain State/host/cell forever if no
       // completion can be established; no detach/retry/cross-thread guessed free.
       unknown = true;
@@ -589,8 +604,10 @@ struct State : std::enable_shared_from_this<State> {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     // Actual owner frames already drained; no active callback/packet remains.
+#ifdef __linux__
     feedback.reset();
     feedback_domain.reset();
+#endif
   }
 };
 ControlLoopOwner::ControlLoopOwner(std::shared_ptr<State> s, std::shared_future<void> exit)
@@ -619,6 +636,7 @@ std::vector<PeerLease> ControlLoopOwner::peers() const {
   return state_->snapshots;
 }
 bool ControlLoopOwner::attach_feedback(std::shared_ptr<InputSeat> seat) {
+#ifdef __linux__
   if (!seat || state_->stop)
     return false;
   std::lock_guard lock(state_->snapshot_mutex);
@@ -627,6 +645,9 @@ bool ControlLoopOwner::attach_feedback(std::shared_ptr<InputSeat> seat) {
   state_->attach_reserved = true;
   state_->pending_seat.swap(seat);
   return true;
+#else
+  return false; // protected Linux backend has no implementation on other platforms
+#endif
 }
 JoinResult ControlLoopOwner::join_when_exited() {
   if (exited_.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
