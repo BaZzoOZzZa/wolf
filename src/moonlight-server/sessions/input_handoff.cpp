@@ -188,37 +188,56 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                                                           const control::PeerToken &peer,
                                                           streaming::ConsumerKind kind,
                                                           streaming::ConsumerCorrelation correlation,
-                                                          streaming::ConsumerRuntime::Work work) {
-  // Outer retention outlives lock on every return/unwind. Runtime receives only
-  // a shared wrapper: rejection, launch rollback, or immediate worker completion
-  // cannot destroy the last payload owner while our gate is held. If Runtime
-  // keeps it longer, its own worker retirement retains the usual completion law.
-  const auto retained_work = std::make_shared<streaming::ConsumerRuntime::Work>(std::move(work));
+                                                          streaming::ConsumerRuntime::Work work,
+                                                          std::function<void()> before_cleanup) {
+  // These actual callable owners are prepared before the gate. Swap leaves the
+  // function parameters empty, including on implementations retaining moved-from
+  // std::function state. Parameters must not release payload after local cleanup.
+  const auto retained_work = std::make_shared<streaming::ConsumerRuntime::Work>();
+  retained_work->swap(work);
   streaming::ConsumerRuntime::Work forwarded = [retained_work](streaming::ConsumerJob &job,
                                                                const streaming::ConsumerPing &ping) {
     return (*retained_work)(job, ping);
   };
-  std::lock_guard lock(seat_->gate_->mutex);
-  auto &g = *seat_->gate_;
-  if (!handle || handle->status() != TransferStatus::Granted || !g.open || g.quarantined ||
-      !g.matches(handle->prepared_grant) || !connection.matches(handle->prepared_grant->owner.connection) ||
-      !peer.matches(handle->prepared_grant->owner.peer))
-    return streaming::ConsumerAdmission::Revoked;
-  try {
-    const auto status = seat_->backend_->listener_status();
-    if (status.failed || status.stop_requested || !handle->validate_(handle->prepared_grant->owner)) {
+  std::function<void()> cleanup_hook;
+  cleanup_hook.swap(before_cleanup);
+  bool runtime_returned = false;
+  auto result = [&] {
+    std::lock_guard lock(seat_->gate_->mutex);
+    auto &g = *seat_->gate_;
+    if (!handle || handle->status() != TransferStatus::Granted || !g.open || g.quarantined ||
+        !g.matches(handle->prepared_grant) || !connection.matches(handle->prepared_grant->owner.connection) ||
+        !peer.matches(handle->prepared_grant->owner.peer))
+      return streaming::ConsumerAdmission::Revoked;
+    try {
+      const auto status = seat_->backend_->listener_status();
+      if (status.failed || status.stop_requested || !handle->validate_(handle->prepared_grant->owner)) {
+        quarantine_locked();
+        return streaming::ConsumerAdmission::Revoked;
+      }
+      auto admitted = consumers_->admit(connection,
+                                        handle->prepared_grant->owner.source,
+                                        kind,
+                                        std::move(correlation),
+                                        std::move(forwarded));
+      runtime_returned = true;
+      return admitted;
+    } catch (...) {
       quarantine_locked();
       return streaming::ConsumerAdmission::Revoked;
     }
-    return consumers_->admit(connection,
-                             handle->prepared_grant->owner.source,
-                             kind,
-                             std::move(correlation),
-                             std::move(forwarded));
+  }();
+  // Internal injected synchronization seam, never a completion acknowledgement.
+  // Invocation AND capture destruction are outside the serial gate.
+  try {
+    if (runtime_returned && cleanup_hook)
+      cleanup_hook();
   } catch (...) {
+    std::lock_guard lock(seat_->gate_->mutex);
     quarantine_locked();
-    return streaming::ConsumerAdmission::Revoked;
+    result = streaming::ConsumerAdmission::Revoked;
   }
+  return result;
 }
 } // namespace sessions
 #endif

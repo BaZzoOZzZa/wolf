@@ -79,7 +79,8 @@ public:
                                               const control::PeerToken &,
                                               streaming::ConsumerKind,
                                               streaming::ConsumerCorrelation,
-                                              streaming::ConsumerRuntime::Work);
+                                              streaming::ConsumerRuntime::Work,
+                                              std::function<void()> before_cleanup = {});
   // Actual commit predicate; invalid/broken future never constitutes completion.
   static bool drain_complete(const std::optional<streaming::ConsumerDrainTicket> &, const control::ConnectionScope &);
 };

@@ -730,9 +730,9 @@ TEST_CASE(
                                         }) == ConsumerAdmission::Accepted);
     }
     auto p = cleanup_probe(f);
-    CleanupThreads threads(p);
     std::atomic<ConsumerAdmission> result{ConsumerAdmission::Stale};
     std::atomic_bool ran{false};
+    CleanupThreads threads(p);
     threads.caller = std::jthread(
         [&, holder = std::make_shared<CleanupHolder>(p)]() mutable {
           throw_current_query = path == 2;
@@ -818,8 +818,8 @@ TEST_CASE(
         throw std::runtime_error("actual transaction preparation clock fault");
       });
   auto p = cleanup_probe(f);
-  CleanupThreads threads(p);
   std::atomic<TransferAdmission> result{TransferAdmission::Invalid};
+  CleanupThreads threads(p);
   threads.caller =
       std::jthread([&, holder = std::make_shared<CleanupHolder>(p)]() mutable {
         auto selection = f.selection();
@@ -832,4 +832,160 @@ TEST_CASE(
       });
   probe_cleanup(threads, f);
   CHECK(result.load() == TransferAdmission::Quarantined);
+}
+namespace {
+struct AdmissionCleanupGates {
+  Gate hook;
+  std::shared_ptr<CleanupProbe> callback = std::make_shared<CleanupProbe>();
+  std::shared_ptr<CleanupProbe> work = std::make_shared<CleanupProbe>();
+  std::jthread caller;
+  ~AdmissionCleanupGates() {
+    hook.release();
+    callback->gate.release();
+    work->gate.release();
+  }
+};
+} // namespace
+TEST_CASE("F12 real joined ticket cannot bypass owned admission cleanup",
+          "[input-seat][f12-fence]") {
+  for (bool timeout : {false, true}) {
+    INFO("cancel-before-ping and decision timeout: " << timeout);
+    Fixture f;
+    auto first = f.transfer();
+    REQUIRE(eventually(
+        [&] { return first.handle->status() == TransferStatus::Granted; }));
+    auto next = f.target;
+    next.connection = ConnectionScope::fresh(42);
+    next.peer = PeerToken::fresh(1);
+    f.current->add(next.connection);
+    std::atomic_bool ran{false};
+    std::atomic<ConsumerAdmission> admitted{ConsumerAdmission::Stale};
+    AdmissionCleanupGates gates;
+    // Both callbacks reenter actual gate methods on their admission caller
+    // thread.
+    auto reenter = [&] {
+      (void)f.seat->current();
+      (void)f.seat->revoke(
+          f.old, f.initial.peer); // exact stale grant; cannot revoke target
+      f.handoff->poll();
+    };
+    gates.callback->reenter = reenter;
+    gates.work->reenter = reenter;
+    gates.caller = std::jthread([&] {
+      admitted = f.handoff->admit_prepared(
+          first.handle, f.target.connection, f.target.peer, ConsumerKind::Video,
+          {"local", 1234, {}},
+          [holder = std::make_shared<CleanupHolder>(gates.work),
+           &ran](auto &, const auto &) {
+            ran = true;
+            return true;
+          },
+          [holder = std::make_shared<CleanupHolder>(gates.callback), &gates] {
+            gates.hook.wait();
+          });
+    });
+    REQUIRE(eventually([&] { return gates.hook.entered.load(); }));
+    if (!timeout) {
+      f.runtime->ping(ConsumerKind::Video,
+                      ConsumerPing{"local", 1234, std::array<char, 16>{}, {}});
+      REQUIRE(eventually([&] { return ran.load(); }));
+    }
+    auto ticket = f.runtime->revoke(f.target.connection);
+    REQUIRE(ticket);
+    REQUIRE(eventually([&] {
+      return ticket->complete();
+    })); // actual join, outer owners remain
+    auto second = f.handoff->request(
+        TransferToken::fresh(2),
+        AuthorizedSelection{first.handle->prepared_grant, next,
+                            [](const auto &) { return true; }});
+    REQUIRE(second.handle);
+    REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
+    auto progress_and_pending = [&] {
+      reenter();
+      CHECK(second.handle->saved_ticket()->complete());
+      CHECK(second.handle->status() == TransferStatus::Pending);
+      CHECK_FALSE(f.seat->current());
+    };
+    progress_and_pending(); // invocation still retains both callables
+    gates.hook.release();
+    REQUIRE(eventually([&] { return gates.callback->gate.entered.load(); }));
+    progress_and_pending(); // callback capture destructor itself is now blocked
+    gates.callback->allow_reentry = true;
+    gates.callback->gate.release();
+    REQUIRE(eventually([&] { return gates.work->gate.entered.load(); }));
+    CHECK(gates.callback->reentered.load());
+    progress_and_pending(); // actual sole outer Work capture destructor blocked
+    if (timeout) {
+      *f.time = 15000;
+      f.handoff->poll();
+      CHECK(second.handle->status() == TransferStatus::Quarantined);
+    }
+    gates.work->allow_reentry = true;
+    gates.work->gate.release();
+    gates.caller.join();
+    CHECK(gates.work->destroyed.load());
+    CHECK(gates.work->reentered.load());
+    CHECK(admitted.load() == ConsumerAdmission::Accepted);
+    CHECK(ran.load() == !timeout);
+    if (timeout) {
+      f.handoff->poll();
+      CHECK_FALSE(f.seat->current());
+      CHECK(second.handle->status() == TransferStatus::Quarantined);
+    } else {
+      CHECK(eventually(
+          [&] { return second.handle->status() == TransferStatus::Granted; }));
+      CHECK(f.seat->current() == second.handle->prepared_grant);
+    }
+  }
+}
+
+TEST_CASE("F12 cleanup slot overflow and throwing hook fail closed",
+          "[input-seat][f12-fence]") {
+  for (bool overflow : {false, true}) {
+    INFO("overflow: " << overflow);
+    Fixture f;
+    auto transfer = f.transfer();
+    REQUIRE(eventually(
+        [&] { return transfer.handle->status() == TransferStatus::Granted; }));
+    auto hook = std::make_shared<CleanupProbe>();
+    std::atomic<ConsumerAdmission> result{ConsumerAdmission::Stale};
+    std::atomic_bool ran{false}, cancelled{false};
+    CleanupThreads threads(hook);
+    threads.caller = std::jthread([&] {
+      result = f.handoff->admit_prepared(
+          transfer.handle, f.target.connection, f.target.peer,
+          ConsumerKind::Video, {"local", 1234, {}},
+          [&](ConsumerJob &job, const auto &) {
+            ran = true;
+            cancelled = eventually([&] { return job.cancelled(); });
+            return true;
+          },
+          [&] {
+            hook->gate.wait();
+            if (!overflow)
+              throw std::runtime_error("injected after-unlock hook fault");
+          });
+    });
+    REQUIRE(eventually([&] { return hook->gate.entered.load(); }));
+    f.runtime->ping(ConsumerKind::Video,
+                    ConsumerPing{"local", 1234, std::array<char, 16>{}, {}});
+    REQUIRE(eventually([&] { return ran.load(); }));
+    if (overflow) {
+      CHECK(f.handoff->admit_prepared(transfer.handle, f.target.connection,
+                                      f.target.peer, ConsumerKind::Audio,
+                                      {"local", 1235, {}},
+                                      [](auto &, const auto &) {
+                                        return true;
+                                      }) == ConsumerAdmission::Capacity);
+    }
+    threads.finish();
+    f.handoff->poll();
+    CHECK(eventually([&] { return f.seat->quarantined(); }));
+    CHECK(eventually([&] { return cancelled.load(); }));
+    CHECK(eventually([&] { return f.seat->neutral_complete(); }));
+    CHECK_FALSE(f.seat->current());
+    CHECK(result.load() == (overflow ? ConsumerAdmission::Accepted
+                                     : ConsumerAdmission::Revoked));
+  }
 }
