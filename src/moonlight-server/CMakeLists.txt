@@ -67,14 +67,19 @@ FetchContent_Declare(
         # Forked from https://gitlab.com/eidheim/Simple-Web-Server in order to support latest boost
         # see: https://gitlab.com/eidheim/Simple-Web-Server/-/merge_requests/283
         GIT_REPOSITORY https://gitlab.com/ReenigneArcher/Simple-Web-Server.git
-        GIT_TAG 546895a9)
+        GIT_TAG 546895a93a29062bb178367b46c7afb72da9881e
+        PATCH_COMMAND ${CMAKE_COMMAND}
+            -DSIMPLEWEBSERVER_SOURCE_DIR=<SOURCE_DIR>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/PatchSimpleWebBoost.cmake)
 FetchContent_MakeAvailable(simplewebserver)
 target_link_libraries_system(wolf_runner PUBLIC simple-web-server)
 
 # mDNS
 FetchContent_Declare(
         mdns_cpp
-        GIT_REPOSITORY https://github.com/games-on-whales/mdns_cpp.git)
+        GIT_REPOSITORY https://github.com/games-on-whales/mdns_cpp.git
+        # Exact revision used in the MWOW-6 qualified build (see docs/mwow/MWOW-10-build.md).
+        GIT_TAG 0d57ae3db73d94ab2e7ac0a799a9165c8a221c80)
 FetchContent_MakeAvailable(mdns_cpp)
 target_link_libraries_system(wolf_runner PUBLIC mdns_cpp::mdns_cpp)
 
