@@ -171,6 +171,20 @@ bool InputHandoff::drain_complete(const std::optional<streaming::ConsumerDrainTi
                                   const control::ConnectionScope &scope) {
   return ticket && ticket->connection.matches(scope) && ticket->complete();
 }
+void InputHandoff::poll_deadline() {
+  std::lock_guard lock(seat_->gate_->mutex);
+  if (!pending_ || pending_->status() != TransferStatus::Pending)
+    return;
+  try {
+    const auto now = now_();
+    const auto elapsed_ticks = uint64_t(now.time_since_epoch().count()) -
+                               uint64_t(pending_->started.time_since_epoch().count());
+    if (now < pending_->started || elapsed_ticks >= uint64_t(std::chrono::duration_cast<Clock::duration>(5s).count()))
+      quarantine_locked();
+  } catch (...) {
+    quarantine_locked();
+  }
+}
 void InputHandoff::poll() {
   bool additional_valid = true, validation_ready = !seat_->gate_->authority;
   TransferToken observed_identity;

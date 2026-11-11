@@ -70,7 +70,11 @@ public:
       control::SeatThreadFactory start = control::start_seat_thread);
   ~InputHandoff(); // owner only, never event/transport callback
   TransferResult request(TransferToken, AuthorizedSelection);
-  void poll(); // nonblocking timer decision; also deterministic clock seam
+  void poll(); // May invoke the trusted nonblocking validator outside gate; blocked validators delay this caller.
+  // Deadline-only decision, no validator/Runtime/IO. The existing clock must be
+  // nonblocking and nonreentrant; clock exceptions quarantine the exact Pending.
+  // Progress requires a caller/tick; this is not an autonomous timer guarantee.
+  void poll_deadline();
   bool candidate_gone(const control::ConnectionScope &, const control::PeerToken &);
   // Inspection only; execution must use admit_prepared under the serial gate.
   bool prepared_admission(const std::shared_ptr<const TransferHandle> &,

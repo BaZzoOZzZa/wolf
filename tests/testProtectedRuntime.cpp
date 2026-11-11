@@ -482,3 +482,82 @@ TEST_CASE("Protected queue rejects oversized inputs and retirement can coexist w
   CHECK(a.receipt->media == ConsumerAdmission::Accepted);
   CHECK(v.receipt->media == ConsumerAdmission::Accepted);
 }
+
+TEST_CASE("Protected status decides exact deadline while actual supervisor validator is occupied",
+          "[protected-runtime]") {
+  for (bool backwards : {false, true}) {
+    std::atomic_size_t entries{0}; // outlives fixture/supervisor on REQUIRE unwind
+    Fixture f;
+    auto gate = f.gate();
+    auto submitted = f.owner->submit(f.selection([&entries, gate](auto &) {
+      if (++entries >= 2)
+        gate->wait(); // request first, actual supervisor second
+      return true;
+    }));
+    REQUIRE(submitted.receipt);
+    REQUIRE(eventually([&] { return gate->entered.load(); }));
+    auto h = f.owner->transfer();
+    REQUIRE(h);
+    REQUIRE(h->status() == TransferStatus::Pending);
+    REQUIRE(h->saved_ticket());
+    f.clock->store(14999);
+    CHECK_FALSE(f.owner->status().unknown);
+    CHECK(h->status() == TransferStatus::Pending);
+    CHECK(entries.load() == 2);
+    f.clock->store(backwards ? 9999 : 15000);
+    CHECK(f.owner->status().unknown);
+    CHECK(h->status() == TransferStatus::Quarantined);
+    CHECK(entries.load() == 2); // no additional callback from deadline-only decision
+    CHECK_FALSE(f.owner->current());
+    gate->release();
+    CHECK_FALSE(f.owner->current());
+    CHECK(h->status() == TransferStatus::Quarantined);
+    CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Closed);
+  }
+}
+
+TEST_CASE("Protected deadline observation does not revoke absent or Granted transfer", "[protected-runtime]") {
+  Fixture f;
+  f.clock->store(100000);
+  CHECK_FALSE(f.owner->status().unknown);
+  CHECK(f.owner->current());
+  auto h = f.transfer();
+  f.clock->store(999999);
+  CHECK_FALSE(f.owner->status().unknown);
+  CHECK(h->status() == TransferStatus::Granted);
+  CHECK(f.owner->current());
+  auto another = std::make_shared<ConsumerComposition>(f.running);
+  ProtectedRuntimeOwner never_started(another);
+  CHECK_FALSE(never_started.status().started);
+  CHECK_FALSE(never_started.status().unknown);
+}
+
+TEST_CASE("Protected trusted clock fault quarantines Pending without status exception", "[protected-runtime]") {
+  std::atomic_bool fault{false};
+  std::atomic_size_t entries{0};
+  Fixture f(false);
+  auto bootstrap = f.bootstrap();
+  bootstrap.now = [&fault] {
+    if (fault)
+      throw std::runtime_error("clock fault");
+    return Clock::time_point{} + 10s;
+  };
+  REQUIRE(f.owner->start(std::move(bootstrap)));
+  REQUIRE(eventually([&] { return bool(f.owner->current()); }));
+  auto gate = f.gate();
+  auto submitted = f.owner->submit(f.selection([&entries, gate](auto &) {
+    if (++entries >= 2)
+      gate->wait();
+    return true;
+  }));
+  REQUIRE(submitted.receipt);
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  auto h = f.owner->transfer();
+  REQUIRE(h);
+  REQUIRE(h->status() == TransferStatus::Pending);
+  fault = true;
+  CHECK(f.owner->status().unknown);
+  CHECK(h->status() == TransferStatus::Quarantined);
+  CHECK(entries.load() == 2);
+  gate->release();
+}

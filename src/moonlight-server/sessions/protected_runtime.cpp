@@ -280,6 +280,10 @@ void ProtectedRuntimeOwner::run() {
 }
 RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
   auto &s = *state_;
+  // Never queue -> Seat. Responsive decision when observed, not an autonomous
+  // timer if all callers (including the existing supervisor) are blocked/idle.
+  if (s.handoff)
+    s.handoff->poll_deadline();
   std::shared_ptr<const TransferHandle> observed;
   RuntimeOwnerStatus result{};
   {

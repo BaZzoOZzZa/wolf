@@ -420,3 +420,21 @@ lifecycle-only, can wait indefinitely on blocked user cleanup, and cannot run on
 Prepared callbacks/Work are trusted internal seams; actual Gst work construction, loop cancellation,
 TLS/candidate/ANNOUNCE routing and enabled readiness remain 3C3/later gates. Tests use real classes,
 DER facts and injected checked IO, with no game/device/network runtime.
+
+3C2 refinement: diagnostic transfer storage is weak; actual Handoff alone retains its current
+validator. Preparation and media phases refuse overlap while either cell is charged (queued,
+executing, destructor retirement or Unknown). Thus no orchestration-owned old media/handle can
+outlive F12 cleanup into a later request. There are four fixed cells, with at most preparation+
+retirement or audio+video+retirement simultaneously occupied; refusal is Busy without effects.
+Direct scope string capacities (≤256 each), correlation IP capacity (≤256), vector capacity,
+job/receipt and fixed-cell sizeof are charged. Allocator overhead/external callable capture graphs
+remain explicitly excluded; caller prepares payload off ingress, submission transfers ownership
+without copying it. Raw runtime access is composition/diagnostics, never protected admission authority.
+
+Manager-approved narrow expansion: `InputHandoff::poll_deadline()` checks only the existing Pending
+handle/started/clock under its existing Seat gate and quarantines on exact five-second expiry,
+backward clock or clock exception. It never invokes validator, Runtime, IO, grants or releases
+payload. Clock remains trusted nonblocking/nonreentrant. Owner status calls this BEFORE queue lock.
+This proves a responsive decision WHEN status/tick runs while a validator is blocked; it does not
+prove autonomous notification within five seconds when every caller is idle/blocked. 3C3 periodic
+caller integration is still missing. Existing poll/F15 reservation behavior is unchanged.
