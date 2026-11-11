@@ -59,6 +59,17 @@ void InputHandoff::quarantine_locked() {
     pending_->status_ = TransferStatus::Quarantined;
 }
 TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection selection) {
+  // Retain the actual callable, not a potentially independent std::function copy.
+  // Both allocations happen before the gate. Constructor rollback may destroy
+  // its wrapper under the gate, but cannot retire this callable until unlock.
+  std::shared_ptr<control::SeatValidation> retained_validation;
+  if (selection.validate) {
+    retained_validation = std::make_shared<control::SeatValidation>(std::move(selection.validate));
+    selection.validate = [retained_validation](const control::SeatCandidate &candidate) {
+      return (*retained_validation)(candidate);
+    };
+  }
+  std::shared_ptr<TransferHandle> retired_transaction;
   std::lock_guard lock(seat_->gate_->mutex);
   auto &g = *seat_->gate_;
   if (pending_ && identity.matches(pending_->identity))
@@ -78,6 +89,10 @@ TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection
     // Allocate complete strong transaction/prepared grant BEFORE revoking anything.
     auto transaction = std::shared_ptr<TransferHandle>(
         new TransferHandle(seat_->gate_, std::move(identity), std::move(selection), now_()));
+    // The old handle can be the sole owner of an arbitrary validator capture.
+    // Declare its retirement owner before lock so replacement cannot run cleanup
+    // inside the serial domain, including when a later revoke throws.
+    retired_transaction = std::move(pending_);
     pending_ = std::move(transaction);
     g.close(false);
     // Exact old scope, still held/current here. No ID lookup or shadow registry.
@@ -174,6 +189,15 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                                                           streaming::ConsumerKind kind,
                                                           streaming::ConsumerCorrelation correlation,
                                                           streaming::ConsumerRuntime::Work work) {
+  // Outer retention outlives lock on every return/unwind. Runtime receives only
+  // a shared wrapper: rejection, launch rollback, or immediate worker completion
+  // cannot destroy the last payload owner while our gate is held. If Runtime
+  // keeps it longer, its own worker retirement retains the usual completion law.
+  const auto retained_work = std::make_shared<streaming::ConsumerRuntime::Work>(std::move(work));
+  streaming::ConsumerRuntime::Work forwarded = [retained_work](streaming::ConsumerJob &job,
+                                                               const streaming::ConsumerPing &ping) {
+    return (*retained_work)(job, ping);
+  };
   std::lock_guard lock(seat_->gate_->mutex);
   auto &g = *seat_->gate_;
   if (!handle || handle->status() != TransferStatus::Granted || !g.open || g.quarantined ||
@@ -190,7 +214,7 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                              handle->prepared_grant->owner.source,
                              kind,
                              std::move(correlation),
-                             std::move(work));
+                             std::move(forwarded));
   } catch (...) {
     quarantine_locked();
     return streaming::ConsumerAdmission::Revoked;

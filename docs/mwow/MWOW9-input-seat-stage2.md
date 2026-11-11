@@ -120,3 +120,41 @@ attempt direct current/revoke reentry. On RED this last attempt is suppressed to
 avoid a permanent self-deadlock; all test gates release before owned threads join.
 Bootstrap checks gate progress, not another worker operation while that same
 worker is executing cleanup. Original fifteen cases remain intact.
+
+
+F12 ownership law: `admit_prepared` creates one retained Work object and a shared
+forwarding callable **before** acquiring the seat gate. The outer strong owner is
+declared before the lock, so every local return/unwind destroys the lock first.
+Runtime rejection (including Duplicate/Revoked/Busy/Capacity/Stale), exceptions,
+and a worker finishing immediately cannot remove that outer owner. If the worker
+outlives admission, Runtime's original capture-retirement/join law still applies.
+No external gate is removed from actual Runtime admission. No cleanup thread or
+recursive mutex is introduced. Payload cleanup can delay the caller after unlock;
+it does not promise bounded physical resource destruction.
+
+`request` similarly retains the single actual validator behind a forwarding
+callable before locking. Partial TransferHandle construction (including prepared
+grant allocation failure) only destroys shared wrappers under the gate. An old
+pending handle is moved into an outer retirement owner before replacement; it is
+released after unlock, including subsequent revoke exceptions. Bootstrap moves
+its validator to a worker-local retirement owner outside the completion lock.
+Serial invocation/commit semantics are unchanged. Bootstrap resource cleanup can
+still delay that same worker's next operation, but cannot monopolize the gate.
+
+Pre-gate payload/wrapper allocation failure propagates to the trusted caller with
+no admission/revoke mutation; captures unwind outside this gate. No claim of full
+ingress exception safety. The actual throwing Clock seam exercises transaction
+argument preparation rollback; no allocation fault injector/global new override
+was added. Mid-constructor prepared-grant bad_alloc is covered by ownership and
+C++ destruction order, **not** claimed as an executed allocation-fault test. Fast
+successful Work is executed, but the scheduler's exact pre-unlock worker return
+interleaving is not forced; the outer-owner proof covers that interleaving.
+
+Native RED at 61b34d6880af5c75b2a748195bbc2816631d0d00: four cases,59 assertions,
+ten expected progress/reentry failures, normal Catch exit42. Early refusal and
+fast-success paths passed their checks. Five cleanup paths failed: actual Runtime
+Duplicate, actual Runtime Current exception, bootstrap validator, previous granted
+handle replacement, and throwing transaction preparation. Original test bodies
+are preserved. Final GREEN/evidence are recorded separately in the F12 report.
+No ConsumerRuntime, dependency, public interface or ingress changes. Remaining
+Stage3/physical gates and the prohibition on launching WoW are unchanged.

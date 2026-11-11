@@ -151,6 +151,9 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
       gate->writing = true;
       gate->inflight_bytes = command ? sizeof(SeatCommand) + command->packet.capacity() : 0;
     }
+    // The bootstrap validator may own resources with blocking/reentrant cleanup.
+    // Retire the actual callable only after the completion gate is released.
+    SeatValidation retired_validation;
     inputtino::checked::WriteReceipt receipt;
     try {
       receipt = neutral ? backend->neutral(gate->device) : backend->apply(gate->device, command->frame);
@@ -181,7 +184,7 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
           gate->open = accepted && valid && !gate->quarantined && !status.failed && !status.stop_requested;
           if (!gate->open)
             gate->quarantined = true;
-          gate->initial_validation = {};
+          retired_validation = std::move(gate->initial_validation);
         }
       } else if (!accepted)
         gate->close(true);
