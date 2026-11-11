@@ -1,6 +1,6 @@
 # MWOW-10 — tracked CMake dependency fixes
 
-Status: **review candidate; UUID and ENet PIC metadata checks PASS; combined build/security execution pending**.
+Status: **review candidate; UUID, ENet PIC and test-only Beast metadata/header checks PASS; combined build/security execution pending**.
 Base: `0e3710be36a6a7fa130f633b358d1b520a3cee9c`, branch `feature/MWOW-10-build-fix`.
 No merge, push, system installation, Wolf/test-main startup, game, Docker or device operation.
 
@@ -297,3 +297,50 @@ argv/type/pin evidence: `enet-pic-proof.json`. Revision and raw hashes are in
 artifact root. Own mutable CMake metadata was regenerated; earlier checkpoint
 manifests remain historical. This evidence does not claim a successful actual
 shared/sanitized link or combined security run.
+
+## Test-only Beast dependency follow-up
+
+Manager reports combined `49b7284` now links ENet and `libwolf_runner.so`.
+The binary `wolf` link is **PENDING**, per the corrected report. Existing
+`wolftests` compilation stops at `testRTSP.cpp:6` because
+`boost/beast/_experimental/test/stream.hpp` is missing from its search path
+(`MWOW-8/native-final/enet-build.log:23`). That header **exists** in the actual
+pinned Boost 1.87 archive under `libs/beast/include`; its hash is recorded.
+
+The narrow change is confined to `tests/CMakeLists.txt`: a function loads the
+official `logic`, `static_string` and `beast` CMake modules from the same fetched
+Boost tree, then links **`Boost::beast PRIVATE` to `wolftests`**. Logic and
+static_string are the two Beast dependencies absent from the original selection.
+They are genuine upstream targets, with their own transitive usage requirements;
+no hand-written target/header adapter or manual include directory is introduced.
+Their own tests are disabled in function-local scope, and directories are
+EXCLUDE_FROM_ALL. Project testing/discovery flags outside the function are
+unchanged. Installed Boost keeps its existing common header path, consuming its
+Beast target as well if the package already exposes one.
+
+Beast is deliberately not appended to production `Boost_LIBRARIES` or to the
+initial selection aggregated by `Boost::headers`: doing that would expose its
+headers to production through SimpleWeb's compatibility target. No pin, runtime
+file, native target definition or existing guard is changed. Other combined
+native targets remain owned by their original branches; none were copied here.
+
+Checks: incremental configure/graph **exit 0**, private graph edge
+`wolftests -> boost_beast`, official Beast-to-logic/static_string edges.
+File API confirms the Beast include is available to `wolftests` and absent
+from production `wolf_runner`, `wolf`, `moonlight` and both safe targets present
+in this branch. All **3** direct test Boost includes (Beast stream, endian
+conversion, locale) resolve within the selected Boost 1.87 tree and compile in
+a syntax-only header probe using the generated `testRTSP.cpp` flags: **exit 0**.
+A read-only audit of the combined tests, including the separately owned cases,
+finds the same three includes and no further module omission. `git diff --check`
+is **PASS**. No full build, link, CTest/main or runtime was executed; root retains
+the heavy slot and verifies the actual combined build.
+
+Exact command/log/exit, graph and proof: `beast-test-command.json`,
+`beast-test-configure.log`, `beast-test-exit.json`, `beast-test-targets.dot`,
+`beast-test-proof.json`, `beast-test-header-probe.cpp`,
+`beast-test-header-probe.log`. Revision and raw hashes are in
+`beast-test-source-revision.json` and `beast-test-rawhashes.json` under the MWOW-10
+artifact root. Own build metadata is mutable; prior manifests remain historical.
+This does not claim the upstream test executable or combined suites compile,
+link or run successfully.

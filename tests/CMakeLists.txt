@@ -105,6 +105,29 @@ target_link_libraries_system(wolftests PRIVATE
         wolf::runner
         Catch2::Catch2)
 
+# Load test-only modules from the same pinned split Boost without adding them
+# to Boost::headers/Boost_LIBRARIES and thereby exposing Beast to production.
+function(wolf_link_beast_for_tests)
+    FetchContent_GetProperties(Boost SOURCE_DIR boost_test_source BINARY_DIR boost_test_binary)
+    if (boost_test_source)
+        set(BOOST_SUPERPROJECT_VERSION "${BOOST_VERSION}")
+        set(BUILD_TESTING OFF) # Do not enable the dependencies' own test suites.
+        # Missing header-only dependencies of Beast in the pinned Boost 1.87.
+        foreach (component logic static_string beast)
+            if (NOT TARGET Boost::${component})
+                add_subdirectory("${boost_test_source}/libs/${component}"
+                        "${boost_test_binary}/wolf-test-boost/${component}" EXCLUDE_FROM_ALL)
+            endif ()
+        endforeach ()
+    endif ()
+    # Installed Boost keeps its existing common header path; use its component
+    # target too when the package exposes one.
+    if (TARGET Boost::beast)
+        target_link_libraries(wolftests PRIVATE Boost::beast)
+    endif ()
+endfunction()
+wolf_link_beast_for_tests()
+
 ## Test assets
 configure_file(assets/config.test.toml ${CMAKE_CURRENT_BINARY_DIR}/config.test.toml COPYONLY)
 configure_file(assets/config.test.toml ${CMAKE_CURRENT_BINARY_DIR}/config.test.EDITED.toml COPYONLY)
