@@ -216,3 +216,43 @@ assertion remains. Input-object identities and absence of implicit leave are
 checked; these synthetic joined-state fixtures do not create a Wayland display,
 exercise physical input, or prove the pending InputSeat/neutral/drain contract.
 No CMake/build dependencies or other future-stage implementation is changed.
+
+## F6/F7 correction checkpoint (GREEN source)
+
+RED predecessor: `8241631b08efe5846f34fc072c27e4facff8d70f`.
+The correction is confined to the two production decisions in `state/sessions.hpp`:
+
+- `get_lobby_for_session` now requires a valid source connection/run, a valid lobby
+  run, the retained `members[source.session_id]` snapshot with the **same RunScope**,
+  and its committed connected-session projection. A new connection of the same run
+  is allowed; a different run reusing the ID, absent member, absent projection,
+  or null lobby scope is not. The ID-only lookup helper is removed entirely.
+- `prepare_stream_consumer` selects that confirmed lobby's RunScope, otherwise the
+  source's own RunScope. Both audio/video use this decision after ping; the prepared
+  value and the actual streaming ProducerBinding retain the selection. The original
+  connection/run identities are unchanged. A supplied producer_scope is overwritten.
+- Plug relay, unplug relay, own-queue suppression, and UI-combo routing all use the
+  same guard. A mismatched replacement run gets no lobby scope; the own-queue adapter
+  instead enqueues the unchanged event into that run's queue. No silent leave or
+  raw-ID sink alias was introduced. The regression assertions are unchanged from RED.
+
+Ownership/interfaces: only `events/events.hpp` (hidden selected-producer field),
+`state/sessions.hpp` (three seams), `sessions/moonlight.cpp` (after-ping/queue adapters),
+`sessions/lobbies.cpp` (shared membership decision), `streaming/streaming.cpp`
+(initial selected binding), `tests/testConnectionScopes.cpp`, `tests/testWolfAPI.cpp`
+and this document. No CMake, Boost, ENet, Beast, security guards or Docker Unknown
+logic changed. Scope type interfaces from 8e930ba remain unchanged.
+
+Qualified syntax checks use Manager's current native compile database with source
+paths remapped here; UUID already exists in those native flags, no extra include
+qualification is added this time. These are not a native build/link pass. Root owns
+RED/GREEN native builds and suite execution. Until that evidence and independent
+review arrive, this is a **review candidate**, not a measured GREEN test result.
+Artifacts: thread-storage `thr_z5wceyp8m4/checks/f6-f7-red/` and `f6-f7-green/`.
+
+This fixes the sequential membership/producer decisions in F6/F7. It does not make
+separate snapshot reads atomic with concurrent join/leave/resume or GStreamer side
+effects. Consumer cancellation/drain, serial InputSeat and neutral delivery, feedback
+rebinding, bounded device executor and retained-member reconciliation stay deferred.
+The tests use committed membership records and input-object identity markers; actual
+Wayland input redirection and audio/video transport are not exercised here.

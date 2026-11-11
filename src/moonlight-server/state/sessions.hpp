@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
 #include <helpers/utils.hpp>
@@ -72,29 +73,33 @@ inline std::optional<events::Lobby> get_lobby_by_id(const immer::vector<events::
   }
 }
 
-inline std::optional<events::Lobby> get_lobby_by_connected_session(const immer::vector<events::Lobby> &lobbies,
-                                                                   std::string_view session_id) {
-  for (const events::Lobby &lobby : lobbies) {
-    immer::vector<immer::box<std::string>> sessions = lobby.connected_sessions->load();
-    auto session = std::find_if(sessions.begin(), sessions.end(), [session_id](const auto &session) {
-      return session == session_id;
-    });
-    if (session == sessions.end()) {
+// Membership authority is the retained run, not its numeric display index.
+// A resumed connection of that run is permitted; a replacement run is not.
+// Require the committed projection too: join publishes members before the index,
+// and leave removes the index before deleting the retained snapshot.
+inline std::optional<events::Lobby> get_lobby_for_session(const immer::vector<events::Lobby> &lobbies,
+                                                          const events::StreamSession &source) {
+  if (!source.connection_scope || source.connection_scope.id() != source.session_id || !source.run_scope)
+    return {};
+  const auto session_id = std::to_string(source.session_id);
+  for (const auto &lobby : lobbies) {
+    if (!lobby.run_scope || lobby.run_scope.id() != lobby.id)
       continue;
-    }
-    return lobby;
+    auto members = lobby.members->load();
+    auto member = members->find(source.session_id);
+    if (!member || !*member || (*member)->session_id != source.session_id ||
+        !sessions::targets(source.run_scope, (*member)->run_scope, session_id))
+      continue;
+    auto connected = lobby.connected_sessions->load();
+    if (std::any_of(connected->begin(), connected->end(), [&](const auto &id) { return *id == session_id; }))
+      return lobby;
   }
   return {};
 }
 
-// Shared routing decision for consumer setup, device relays and own-queue suppression.
-inline std::optional<events::Lobby> get_lobby_for_session(const immer::vector<events::Lobby> &lobbies,
-                                                          const events::StreamSession &source) {
-  return get_lobby_by_connected_session(lobbies, std::to_string(source.session_id));
-}
-
 // Called after RTP ping, on the captured connection, for BOTH audio and video.
-// This seam keeps the existing self-producer decision until F6 is corrected.
+// Resolve membership for the exact captured current run. Keep connection/run
+// identity separate from the selected producer; no caller-provided producer wins.
 template <typename Consumer>
 std::optional<Consumer> prepare_stream_consumer(const Consumer &request,
                                                 const immer::vector<events::StreamSession> &all,
@@ -103,7 +108,8 @@ std::optional<Consumer> prepare_stream_consumer(const Consumer &request,
   if (!source || source->session_id != request.session_id || !source->run_scope.matches(request.run_scope.get()))
     return {};
   auto prepared = request;
-  prepared.producer_scope = source->run_scope;
+  auto lobby = get_lobby_for_session(lobbies, *source);
+  prepared.producer_scope = lobby ? lobby->run_scope : source->run_scope;
   return prepared;
 }
 
