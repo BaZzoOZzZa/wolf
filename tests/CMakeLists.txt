@@ -116,3 +116,20 @@ include(Catch)
 catch_discover_tests(wolftests
         PROPERTIES
         ENVIRONMENT "WOLF_SKIP_WAYLAND_SOCKET_WAIT=TRUE")
+
+# State-only regression executable: no Wolf runtime, Docker daemon or devices.
+find_package(Threads REQUIRED)
+add_executable(wolf-lifecycle-tests testLifecycle.cpp)
+target_compile_features(wolf-lifecycle-tests PRIVATE cxx_std_20)
+target_include_directories(wolf-lifecycle-tests PRIVATE ../src/moonlight-server ../src/core/src)
+target_link_libraries(wolf-lifecycle-tests PRIVATE Threads::Threads)
+add_test(NAME wolf-lifecycle-tests COMMAND wolf-lifecycle-tests)
+
+if (UNIX AND NOT APPLE)
+    add_executable(wolf-docker-lifecycle-tests docker/testDockerLifecycle.cpp)
+    target_compile_features(wolf-docker-lifecycle-tests PRIVATE cxx_std_20)
+    target_include_directories(wolf-docker-lifecycle-tests PRIVATE ../src/core/src)
+    target_link_libraries(wolf-docker-lifecycle-tests PRIVATE wolf::docker Threads::Threads)
+    add_test(NAME wolf-docker-lifecycle-tests COMMAND wolf-docker-lifecycle-tests)
+    set_tests_properties(wolf-docker-lifecycle-tests PROPERTIES TIMEOUT 30)
+endif ()

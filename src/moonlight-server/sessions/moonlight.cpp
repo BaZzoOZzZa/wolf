@@ -201,7 +201,7 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         }
 
         std::thread([=]() {
-          start_runner(
+          auto outcome = start_runner(
               run_session->runner,
               *devices_q,
               immer::box<RunnerArgs>{RunnerArgs{
@@ -224,6 +224,10 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                   .xdg_runtime_dir = runtime_dir,
                   .client_settings = run_session->stream_session->client_settings}});
 
+          if (outcome.state == RunnerOutcome::State::unknown) {
+            logs::log(logs::error, "[STREAM_SESSION] Runner {} is unknown; session retained", outcome.identity);
+            return;
+          }
           // Runner process ended
           if (run_session->stop_stream_when_over) {
             run_session->stream_session->wayland_display->store(nullptr);

@@ -1,4 +1,5 @@
 #include <api/api.hpp>
+#include <boost/uuid/name_generator_sha1.hpp>
 #include <control/input_handler.hpp>
 #include <core/docker.hpp>
 #include <rtp/udp-ping.hpp>
@@ -413,6 +414,17 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();
+    if (auto key = req.headers.find("Idempotency-Key"); key != req.headers.end()) {
+      if (key->second.empty() || key->second.size() > 128 || req.headers.count("Idempotency-Key") != 1) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid Idempotency-Key"}));
+        return;
+      }
+      // Stable opaque ID, scoped to the caller's profile. Changed payloads using
+      // the same key are rejected by the lifecycle fingerprint check.
+      boost::uuids::name_generator_sha1 generator(boost::uuids::ns::url());
+      lobby_id =
+          boost::uuids::to_string(generator(rfl::json::write(event.value().profile_id.get()) + "\n" + key->second));
+    }
     auto create_lobby_ev = events::CreateLobbyEvent{
         .id = lobby_id,
         .profile_id = event.value().profile_id.get(),
@@ -439,14 +451,24 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
                     default_client_settings.motion_controller_override)},
         .runner_state_folder = event.value().runner_state_folder,
         .runner = state::get_runner(event.value().runner, this->state_->app_state->event_bus)};
-    // Fire the event
-    state_->app_state->event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create_lobby_ev));
-
     auto setup_over_future = create_lobby_ev.on_setup_over.get()->get_future();
+    state_->app_state->event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create_lobby_ev));
     auto result = setup_over_future.wait_for(std::chrono::seconds(20));
     if (result == std::future_status::timeout) {
       logs::log(logs::warning, "[API] Lobby setup timed out");
-      send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Lobby setup timed out"}));
+      send_http(socket,
+                504,
+                rfl::json::write(
+                    GenericErrorResponse{.error = "Lobby setup timed out; launch remains reserved. Retry with the same "
+                                                  "Idempotency-Key or inspect /lobbies. Lobby ID: " +
+                                                  lobby_id}));
+    } else if (!setup_over_future.get()) {
+      send_http(socket,
+                409,
+                rfl::json::write(GenericErrorResponse{
+                    .error = "Lobby launch is pending, stopped, conflicts with an existing resource, "
+                             "or admission is exhausted. Lobby ID: " +
+                             lobby_id}));
     } else {
       auto res = LobbyCreateResponse{.lobby_id = lobby_id};
       send_http(socket, 200, rfl::json::write(res));

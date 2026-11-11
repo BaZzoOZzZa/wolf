@@ -1,6 +1,8 @@
 #include <immer/vector_transient.hpp>
+#include <rfl/json.hpp>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
+#include <sessions/lifecycle.hpp>
 #include <state/config.hpp>
 #include <state/data-structures.hpp>
 #include <state/sessions.hpp>
@@ -69,46 +71,154 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                        const std::string &runtime_dir,
                        const std::optional<AudioServer> &audio_server) {
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
+  auto lifecycle = std::make_shared<LobbyLifecycle>();
+  auto settle_setup = [](const auto &settings, bool ready) {
+    try {
+      settings->on_setup_over.get()->set_value(ready);
+    } catch (const std::future_error &) {
+      // Stop and asynchronous setup completion can both resolve the same request.
+    }
+  };
+  auto settle_join = [](const auto &request, std::string message) {
+    try {
+      request->error_message.get()->set_value(std::move(message));
+    } catch (const std::future_error &) {
+      // A repeated event or a failure after completion must not resolve twice.
+    }
+  };
+  auto dispatch_deferred = [ev_bus = app_state->event_bus](const auto &ticket, const auto &deferred) {
+    for (auto session_id : deferred.leaves) {
+      ev_bus->fire_event(immer::box<events::LeaveLobbyEvent>{
+          events::LeaveLobbyEvent{.lobby_id = ticket->id, .moonlight_session_id = session_id}});
+    }
+    if (deferred.stop) {
+      ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = ticket->id}});
+    }
+  };
 
   // On create lobby event
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::CreateLobbyEvent>>(
       [=](const immer::box<events::CreateLobbyEvent> &lobby_settings) {
-        logs::log(logs::info, "[LOBBY] Creating new lobby");
         auto ev_bus = app_state->event_bus;
+        std::string resource;
+        std::string fingerprint;
+        try {
+          // All lobbies sharing the canonical runner state directory compete for
+          // one launch slot, including legacy requests without an idempotency key.
+          resource = std::filesystem::weakly_canonical(std::filesystem::path(app_state->host->host_base_state_folder) /
+                                                       lobby_settings->runner_state_folder)
+                         .string();
+          fingerprint = rfl::json::write(lobby_settings->runner->serialize()) + "\n" +
+                        rfl::json::write(lobby_settings->profile_id) + "\n" + rfl::json::write(lobby_settings->name) +
+                        "\n" + rfl::json::write(lobby_settings->icon_png_path) + "\n" +
+                        rfl::json::write(lobby_settings->pin) + "\n" + rfl::json::write(lobby_settings->multi_user) +
+                        "\n" + rfl::json::write(lobby_settings->stop_when_everyone_leaves) + "\n" +
+                        rfl::json::write(lobby_settings->video_settings) + "\n" +
+                        rfl::json::write(lobby_settings->audio_settings) + "\n" +
+                        rfl::json::write(lobby_settings->client_settings);
+        } catch (const std::exception &e) {
+          logs::log(logs::error, "[LOBBY] Invalid launch resource: {}", e.what());
+          settle_setup(lobby_settings, false);
+          return;
+        }
+        auto admission = lifecycle->create(lobby_settings->id, resource, fingerprint);
+        if (admission.result != LobbyLifecycle::Create::admitted) {
+          settle_setup(lobby_settings, admission.result == LobbyLifecycle::Create::replay_ready);
+          return;
+        }
+        auto ticket = admission.ticket;
+        logs::log(logs::info, "[LOBBY] Creating new lobby {}", ticket->id);
 
-        auto lobby = std::make_shared<events::Lobby>(
-            events::Lobby{.id = lobby_settings->id,
-                          .name = lobby_settings->name,
-                          .started_by_profile_id = lobby_settings->profile_id,
-                          .icon_png_path = lobby_settings->icon_png_path,
-                          .multi_user = lobby_settings->multi_user,
-                          .pin = lobby_settings->pin,
-                          .stop_when_everyone_leaves = lobby_settings->stop_when_everyone_leaves,
-                          .runner = lobby_settings->runner});
-        app_state->lobbies->update(
-            [lobby](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(*lobby); });
+        try {
+          auto lobby = std::make_shared<events::Lobby>(
+              events::Lobby{.id = lobby_settings->id,
+                            .name = lobby_settings->name,
+                            .started_by_profile_id = lobby_settings->profile_id,
+                            .icon_png_path = lobby_settings->icon_png_path,
+                            .multi_user = lobby_settings->multi_user,
+                            .pin = lobby_settings->pin,
+                            .stop_when_everyone_leaves = lobby_settings->stop_when_everyone_leaves,
+                            .runner = lobby_settings->runner});
+          app_state->lobbies->update(
+              [lobby](const immer::vector<events::Lobby> &lobbies) { return lobbies.push_back(*lobby); });
+          if (lifecycle->stopping(ticket)) {
+            settle_setup(lobby_settings, false);
+            lifecycle->producer_finished(ticket); // No producer has been started.
+            ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+            return;
+          }
 
-        { // Start Wayland compositor and Gstreamer producer pipeline
-          logs::log(logs::debug, "[LOBBY] Create wayland compositor");
+          { // Create audio virtual sink
+            logs::log(logs::debug, "[LOBBY] Create audio virtual sink");
+            auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, lobby->id);
+            if (audio_server && audio_server->server && lifecycle->add_audio_producer(ticket)) {
+              auto channel_count = lobby_settings->audio_settings.channel_count;
+              auto v_device = audio::create_virtual_sink(
+                  audio_server->server,
+                  audio::AudioDevice{.sink_name = pulse_sink_name, .mode = state::get_audio_mode(channel_count, true)});
 
-          std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
-              std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
+              lobby->audio_sink->store(v_device);
 
-          std::thread([lobby, lobby_settings, ev_bus, on_ready, gst_context = app_state->gst_context]() {
-            streaming::start_video_producer(lobby->id,
-                                            lobby_settings->video_settings.video_producer_buffer_caps,
-                                            lobby_settings->video_settings.wayland_render_node,
-                                            {.width = lobby_settings->video_settings.width,
-                                             .height = lobby_settings->video_settings.height,
-                                             .refreshRate = lobby_settings->video_settings.refresh_rate},
-                                            gst_context,
-                                            on_ready,
-                                            ev_bus);
-          }).detach();
+              // Start Gstreamer producer pipeline
+              std::thread([=, server = audio_server->server]() {
+                try {
+                  if (!lifecycle->stopping(ticket)) {
+                    auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
+                    streaming::start_audio_producer(lobby->id,
+                                                    ev_bus,
+                                                    channel_count,
+                                                    sink_name,
+                                                    audio::get_server_name(server));
+                  }
+                } catch (const std::exception &e) {
+                  logs::log(logs::error, "[LOBBY] Audio producer failed: {}", e.what());
+                }
+                lifecycle->producer_finished(ticket, LobbyLifecycle::Producer::audio);
+                ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+              }).detach();
+            }
+          }
+          { // Start Wayland compositor and Gstreamer producer pipeline
+            logs::log(logs::debug, "[LOBBY] Create wayland compositor");
 
-          auto w_display_ready = on_ready->get_future().then(
-              [lobby, runtime_dir, ev_bus, audio_server, lobby_settings, host = app_state->host](auto fut) {
+            std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
+                std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
+
+            std::thread([=, gst_context = app_state->gst_context]() {
+              try {
+                if (!lifecycle->stopping(ticket)) {
+                  streaming::start_video_producer(lobby->id,
+                                                  lobby_settings->video_settings.video_producer_buffer_caps,
+                                                  lobby_settings->video_settings.wayland_render_node,
+                                                  {.width = lobby_settings->video_settings.width,
+                                                   .height = lobby_settings->video_settings.height,
+                                                   .refreshRate = lobby_settings->video_settings.refresh_rate},
+                                                  gst_context,
+                                                  on_ready,
+                                                  ev_bus);
+                }
+              } catch (const std::exception &e) {
+                logs::log(logs::error, "[LOBBY] Video producer failed: {}", e.what());
+              }
+              // Resolve a producer that ended without publishing ready as a failure.
+              try {
+                on_ready->set_exception(boost::copy_exception(std::runtime_error("Video producer ended")));
+              } catch (const boost::promise_already_satisfied &) {
+              }
+              lifecycle->producer_finished(ticket);
+              settle_setup(lobby_settings, false);
+              ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+            }).detach();
+
+            auto w_display_ready = on_ready->get_future().then([=, host = app_state->host](auto fut) {
+              try {
                 streaming::WaylandDisplayReady ready = fut.get();
+                if (lifecycle->stopping(ticket)) {
+                  settle_setup(lobby_settings, false);
+                  // The first stop can predate the producer's EOS handler.
+                  gst_element_send_event(ready.wayland_plugin.get(), gst_event_new_eos());
+                  return;
+                }
 
                 auto wl_state =
                     virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
@@ -131,20 +241,52 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                   std::filesystem::create_directories(full_path);
 
                   std::thread([=]() {
-                    start_runner(lobby->runner,
-                                 lobby->plugged_devices_queue,
-                                 immer::box<RunnerArgs>{RunnerArgs{
-                                     .session_id = lobby->id,
-                                     .video_settings = lobby_settings->video_settings,
-                                     .wayland_display = lobby->wayland_display->load(),
-                                     .audio_server = audio_server,
-                                     .audio_sink = lobby->audio_sink->load(),
-                                     .host = host,
-                                     .app_local_state_folder = full_path.string(),
-                                     .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
-                                                              lobby_settings->runner_state_folder,
-                                     .xdg_runtime_dir = runtime_dir,
-                                     .client_settings = lobby_settings->client_settings}});
+                    if (!lifecycle->launch(ticket)) {
+                      settle_setup(lobby_settings, false);
+                      ev_bus->fire_event(
+                          immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                      return;
+                    }
+                    if (!lifecycle->ready(ticket)) {
+                      lifecycle->runner_finished(ticket); // Cancelled before invoking the runner.
+                      settle_setup(lobby_settings, false);
+                      ev_bus->fire_event(
+                          immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+                      return;
+                    }
+                    settle_setup(lobby_settings, true);
+                    try {
+                      auto outcome = start_runner(
+                          lobby->runner,
+                          lobby->plugged_devices_queue,
+                          immer::box<RunnerArgs>{
+                              RunnerArgs{.session_id = lobby->id,
+                                         .video_settings = lobby_settings->video_settings,
+                                         .wayland_display = lobby->wayland_display->load(),
+                                         .audio_server = audio_server,
+                                         .audio_sink = lobby->audio_sink->load(),
+                                         .host = host,
+                                         .app_local_state_folder = full_path.string(),
+                                         .app_host_state_folder = std::filesystem::path(host->host_base_state_folder) /
+                                                                  lobby_settings->runner_state_folder,
+                                         .xdg_runtime_dir = runtime_dir,
+                                         .client_settings = lobby_settings->client_settings}});
+                      if (outcome.state == RunnerOutcome::State::unknown) {
+                        lifecycle->quarantine(ticket);
+                        logs::log(logs::error,
+                                  "[LOBBY] Runner {} unknown; lobby {} resource retained",
+                                  outcome.identity,
+                                  lobby->id);
+                        return;
+                      }
+                    } catch (const std::exception &e) {
+                      // Unknown runner outcome retains the resource. There is no
+                      // safe automatic retry after arbitrary startup side effects.
+                      logs::log(logs::error, "[LOBBY] Runner outcome unknown, resource retained: {}", e.what());
+                      lifecycle->quarantine(ticket);
+                      return;
+                    }
+                    lifecycle->runner_finished(ticket);
                     // Runner process ended, stop the lobby
                     lobby->wayland_display->store(nullptr);
 
@@ -153,31 +295,18 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                   }).detach();
                 }
 
-                lobby_settings->on_setup_over.get()->set_value(true);
-              });
-        }
-
-        { // Create audio virtual sink
-          logs::log(logs::debug, "[LOBBY] Create audio virtual sink");
-          auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, lobby->id);
-          if (audio_server && audio_server->server) {
-            auto channel_count = lobby_settings->audio_settings.channel_count;
-            auto v_device = audio::create_virtual_sink(
-                audio_server->server,
-                audio::AudioDevice{.sink_name = pulse_sink_name, .mode = state::get_audio_mode(channel_count, true)});
-
-            lobby->audio_sink->store(v_device);
-
-            // Start Gstreamer producer pipeline
-            std::thread([lobby, audio_server = audio_server->server, ev_bus, channel_count]() {
-              auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, lobby->id);
-              streaming::start_audio_producer(lobby->id,
-                                              ev_bus,
-                                              channel_count,
-                                              sink_name,
-                                              audio::get_server_name(audio_server));
-            }).detach();
+              } catch (const std::exception &e) {
+                logs::log(logs::error, "[LOBBY] Setup failed: {}", e.what());
+                settle_setup(lobby_settings, false);
+                ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = lobby->id}});
+              }
+            });
           }
+
+        } catch (const std::exception &e) {
+          logs::log(logs::error, "[LOBBY] Setup outcome unknown, resource retained: {}", e.what());
+          settle_setup(lobby_settings, false);
+          ev_bus->fire_event(immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = ticket->id}});
         }
       }));
 
@@ -194,54 +323,74 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                     "[LOBBY] Failed to join lobby: lobby {} or session {} not found",
                     join_lobby_event->lobby_id,
                     join_lobby_event->moonlight_session_id);
-          join_lobby_event->error_message.get()->set_value("Lobby or session not found");
+          settle_join(join_lobby_event, "Lobby or session not found");
           return;
         }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
 
-        if (!lobby->multi_user && lobby->connected_sessions->load()->size() >= 1) {
-          logs::log(logs::error, "[LOBBY] Lobby {} is full", lobby->id);
-          join_lobby_event->error_message.get()->set_value("Lobby is full");
+        auto ticket = lifecycle->find(lobby->id);
+        if (!ticket || lobby->pin != join_lobby_event->pin) {
+          settle_join(join_lobby_event, "Lobby unavailable or invalid PIN");
           return;
         }
-
-        // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued plug
-        events::JoypadList joypads = session->joypads->load();
-        for (auto [_joypad_nr, joypad] : joypads) {
-          events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
-          std::visit(
-              [&plug_ev](auto &pad) {
-                plug_ev.udev_events = pad.get_udev_events();
-                plug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
-              },
-              *joypad);
-          // Unplug it from the current session's runner
-          app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
-              events::UnplugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = plug_ev.udev_events,
-                                        .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
-
-          // Add it to the lobby runner's devices queue, addressed to the lobby id
-          // (same routing the PlugDeviceEvent relay performs for connected sessions)
-          lobby->plugged_devices_queue->push(immer::box<events::PlugDeviceEvent>{plug_ev});
+        auto admission = lifecycle->join(ticket, session->session_id, lobby->multi_user);
+        if (admission == LobbyLifecycle::Join::already_joined) {
+          settle_join(join_lobby_event, "");
+          return;
         }
-        // TODO: hotplug pen_tablet
+        if (admission != LobbyLifecycle::Join::admitted) {
+          settle_join(join_lobby_event, "Lobby full, stopping, or session busy; retry later");
+          return;
+        }
+        try {
 
-        // Update the lobby with the new session
-        lobby->connected_sessions->update([session](const immer::vector<immer::box<std::string>> &connected_sessions) {
-          return connected_sessions.push_back({std::to_string(session->session_id)});
-        });
+          // Migrate joypads BEFORE adding the session to connected_sessions, or the relayed unplug races the queued
+          // plug
+          events::JoypadList joypads = session->joypads->load();
+          for (auto [_joypad_nr, joypad] : joypads) {
+            events::PlugDeviceEvent plug_ev{.session_id = lobby->id};
+            std::visit(
+                [&plug_ev](auto &pad) {
+                  plug_ev.udev_events = pad.get_udev_events();
+                  plug_ev.udev_hw_db_entries = pad.get_udev_hw_db_entries();
+                },
+                *joypad);
+            // Unplug it from the current session's runner
+            app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
+                events::UnplugDeviceEvent{.session_id = std::to_string(session->session_id),
+                                          .udev_events = plug_ev.udev_events,
+                                          .udev_hw_db_entries = plug_ev.udev_hw_db_entries}});
 
-        // switch mouse and keyboard in session to use the lobby wayland server
-        auto wl_state = lobby->wayland_display->load();
-        session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
-        session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
-        session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
+            // Add it to the lobby runner's devices queue, addressed to the lobby id
+            // (same routing the PlugDeviceEvent relay performs for connected sessions)
+            lobby->plugged_devices_queue->push(immer::box<events::PlugDeviceEvent>{plug_ev});
+          }
+          // TODO: hotplug pen_tablet
 
-        // Switch audio/video gstreamer stream producers
-        app_state->event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
-            events::SwitchStreamProducerEvents{.session_id = session->session_id, .interpipe_src_id = lobby->id}});
-        join_lobby_event->error_message.get()->set_value("");
+          // Update the lobby with the new session
+          lobby->connected_sessions->update(
+              [session](const immer::vector<immer::box<std::string>> &connected_sessions) {
+                return connected_sessions.push_back({std::to_string(session->session_id)});
+              });
+
+          // switch mouse and keyboard in session to use the lobby wayland server
+          auto wl_state = lobby->wayland_display->load();
+          session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
+          session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
+          session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
+
+          // Switch audio/video gstreamer stream producers
+          app_state->event_bus->fire_event(immer::box<events::SwitchStreamProducerEvents>{
+              events::SwitchStreamProducerEvents{.session_id = session->session_id, .interpipe_src_id = lobby->id}});
+          settle_join(join_lobby_event, "");
+          dispatch_deferred(ticket, lifecycle->finish(ticket));
+        } catch (const std::exception &e) {
+          // Keep the admission reserved after partially applied device changes.
+          // Full input rollback/neutralisation belongs to the handoff work.
+          lifecycle->quarantine(ticket);
+          logs::log(logs::error, "[LOBBY] Join outcome unknown, admission retained: {}", e.what());
+          settle_join(join_lobby_event, "Join failed; operator reconciliation required");
+        }
       }));
 
   // When a Moonlight session leaves the lobby
@@ -258,18 +407,33 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                     leave_lobby_event->lobby_id,
                     leave_lobby_event->moonlight_session_id);
         } else {
-          leave_lobby(app_state->event_bus, lobby.value(), session.value());
+          auto ticket = lifecycle->find(lobby->id);
+          if (!ticket || !lifecycle->leave(ticket, session->session_id)) {
+            return;
+          }
+          try {
+            leave_lobby(app_state->event_bus, lobby.value(), session.value());
+            dispatch_deferred(ticket, lifecycle->finish(ticket, session->session_id));
+          } catch (const std::exception &e) {
+            lifecycle->quarantine(ticket);
+            logs::log(logs::error, "[LOBBY] Leave outcome unknown, admission retained: {}", e.what());
+          }
         }
       }));
 
   // Stopping a lobby will trigger leave for all the connected sessions
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
       [=](const immer::box<events::StopLobbyEvent> &stop_lobby_event) {
+        auto ticket = lifecycle->find(stop_lobby_event->lobby_id);
+        if (!ticket || !lifecycle->stop(ticket)) {
+          return;
+        }
         auto lobbies = app_state->lobbies->load();
         auto lobby = state::get_lobby_by_id(lobbies.get(), stop_lobby_event->lobby_id);
 
         if (!lobby) {
           logs::log(logs::warning, "[LOBBY] lobby {} not found", stop_lobby_event->lobby_id);
+          lifecycle->retry_stop(ticket); // Create may not have published its lobby yet.
           return;
         }
         logs::log(logs::info, "[LOBBY] stopping lobby {}", stop_lobby_event->lobby_id);
@@ -280,6 +444,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
               events::LeaveLobbyEvent{.lobby_id = lobby->id, .moonlight_session_id = std::stoul(*session_id)}});
         }
 
+        // A partially failed leave retains the lobby and its resource for inspection.
+        if (!lobby->connected_sessions->load()->empty()) {
+          return;
+        }
         // Finally, remove the lobby from the app_state
         app_state->lobbies->update([stop_lobby_event](const immer::vector<events::Lobby> &lobbies) {
           return lobbies | //
@@ -288,6 +456,16 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                  }) | //
                  ranges::to<immer::vector<events::Lobby>>();
         });
+        lifecycle->stopped(ticket);
+      }));
+
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::DockerContainerCreated>>(
+      [=](const immer::box<events::DockerContainerCreated> &created) {
+        auto ticket = lifecycle->find(created->session_id);
+        if (ticket && lifecycle->stopping(ticket)) {
+          app_state->event_bus->fire_event(
+              immer::box<events::StopLobbyEvent>{events::StopLobbyEvent{.lobby_id = ticket->id}});
+        }
       }));
 
   // On a PlugDeviceEvent, we have to add the device to the lobby queue so that the runner will pick it up

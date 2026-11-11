@@ -43,12 +43,21 @@ struct RunnerArgs {
   immer::box<config::ClientSettings> client_settings;
 };
 
+struct RunnerOutcome {
+  enum class State {
+    ended,
+    unknown
+  };
+  State state = State::ended;
+  std::string identity;
+};
+
 /**
  * Setup and starts the runner. The current thread will be blocked until the
  * runner is stopped.
  */
-void start_runner(std::shared_ptr<events::Runner> runner,
-                  std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
-                  immer::box<RunnerArgs> args);
+RunnerOutcome start_runner(std::shared_ptr<events::Runner> runner,
+                           std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
+                           immer::box<RunnerArgs> args);
 
 } // namespace wolf::core::sessions
