@@ -726,13 +726,17 @@ TEST_CASE("checked FF advancing clock delay repeat continuous and stop", "[check
     f.expect(1000, 2000);
     f.step(2147483647LL);
     f.expect(0, 0);
-    // Max chrono time is representable; no deadline addition overflow.
-    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max()).count();
-    f.put(max_ms - 1, 1, 65535, 65535);
-    f.send(max_ms - 1, EV_FF, 1, std::numeric_limits<int>::max());
-    f.step(max_ms);
-    f.expect(0, 0);
   }
+}
+
+TEST_CASE("checked FF clock boundary never adds overflowing deadlines", "[checked-xbox][ff-overflow]") {
+  FFDriver f;
+  // Max chrono time is representable; no deadline addition overflow.
+  const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max()).count();
+  f.put(max_ms - 1, 1, 65535, 65535);
+  f.send(max_ms - 1, EV_FF, 1, std::numeric_limits<int>::max());
+  f.step(max_ms);
+  f.expect(0, 0);
 }
 
 TEST_CASE("checked FF active update retains remaining repetitions and restarts timing",
