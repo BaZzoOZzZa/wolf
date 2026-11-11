@@ -493,3 +493,55 @@ TEST_CASE("checked Xbox stop before worker entry and allocation failure retain n
     CHECK(f.fake->polls == 0);
   }
 }
+
+TEST_CASE("checked Xbox individual wire buttons keep pinned Xbox mapping", "[checked-xbox]") {
+  Fixture f;
+  f.create();
+  // Independent protocol golden pairs: all-bits-set alone cannot catch swapped buttons.
+  const std::array<std::pair<uint32_t, uint16_t>, 11> golden{{{0x0010, BTN_START},
+                                                              {0x0020, BTN_SELECT},
+                                                              {0x0040, BTN_THUMBL},
+                                                              {0x0080, BTN_THUMBR},
+                                                              {0x0100, BTN_TL},
+                                                              {0x0200, BTN_TR},
+                                                              {0x0400, BTN_MODE},
+                                                              {0x1000, BTN_SOUTH},
+                                                              {0x2000, BTN_EAST},
+                                                              {0x4000, BTN_NORTH},
+                                                              {0x8000, BTN_WEST}}};
+  for (auto [wire, expected] : golden) {
+    CAPTURE(wire, expected);
+    f.fake->written.clear();
+    REQUIRE(f.xbox->apply(f.xbox->generation(), Frame{wire}).outcome == WriteOutcome::KernelFrameAccepted);
+    size_t pressed = 0;
+    for (const auto &event : f.fake->written) {
+      if (event.type == EV_KEY) {
+        CHECK(event.value == (event.code == expected ? 1 : 0));
+        pressed += event.value;
+      }
+    }
+    CHECK(pressed == 1);
+  }
+}
+
+TEST_CASE("checked Xbox transient feedback IO remains cancellable", "[checked-xbox]") {
+  Fixture f;
+  f.fake->rumble();
+  SECTION("poll EINTR") {
+    f.fake->poll_failure = {-1, EINTR};
+  }
+  SECTION("read EAGAIN") {
+    f.fake->fail_read = true;
+    f.fake->read_failure = {-1, EAGAIN};
+  }
+  SECTION("read EINTR") {
+    f.fake->fail_read = true;
+    f.fake->read_failure = {-1, EINTR};
+  }
+  f.create([fake = f.fake](int, int) { ++fake->callbacks; });
+  REQUIRE(wait_for([&] { return f.fake->fail_read ? f.fake->reads >= 2 : f.fake->polls >= 2; }));
+  REQUIRE(f.xbox->retire_until(Clock::now() + 2s) == Retirement::Retired);
+  CHECK_FALSE(f.xbox->listener_status().failed);
+  CHECK(f.resource.expired());
+  CHECK(f.fake->callbacks == 0);
+}

@@ -51,7 +51,7 @@ Callback/read/poll/ioctl exceptions or terminal errors mark failed and initiate 
 Transient read EAGAIN/EINTR and poll EINTR remain cancellable. The callback copy stays
 owned through invocation; no mutable callback swapping during handoff exists here.
 
-`request_stop` is nonblocking. A reserved in-flight frame may finish. The listener's
+`request_stop` is terminal backend retirement, not InputSeat revoke: a future handoff must retain this backend/listener and mute its router while invoking neutral through the serial owner. `request_stop` is nonblocking. A reserved in-flight frame may finish. The listener's
 cleanup waits for that writer, destroys callback/IO captures and the device owner,
 then signals completion. `retire_until(deadline)` on the creating owner thread joins
 only after completion; Unknown retains the object/thread/resources and denies future
@@ -72,10 +72,10 @@ exposure changes are necessary. Non-Linux translation units remain empty.
 adapter, with fake write/poll/read/ioctl/thread factory. No device-opening factory,
 real device fd, real ioctl, Wolf/Gst/ENet startup is invoked. Coverage includes every
 failure index including SYN (EAGAIN/EINTR/EIO/zero/short/oversized/exception), full
-mapping/extremes/cache progress, explicit neutral after partial state, same-fd ABA,
+mapping/extremes/cache progress (including individual one-hot wire buttons), explicit neutral after partial state, same-fd ABA,
 null/absent handles, thread start/allocation rollback, stop-before-entry, callback
 capture/in-flight retirement, stop during poll, in-flight writes, delayed device
-destruction, listener faults and wrong-thread retirement. Test gates and writers
+destruction, listener faults/transient IO cancellation and wrong-thread retirement. Test gates and writers
 are released/joined even during assertion unwinding. No model mirror/global new hook.
 
 Native evidence and patch-driver fixture results are recorded separately after
