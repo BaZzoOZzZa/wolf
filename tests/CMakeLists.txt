@@ -244,3 +244,12 @@ if (TARGET inputtino::libinputtino)
     add_test(NAME wolf-input-seat-tests COMMAND wolf-input-seat-tests)
     set_tests_properties(wolf-input-seat-tests PROPERTIES LABELS "input;isolated" TIMEOUT 45)
 endif ()
+
+# Disabled protected access facts: real DER primitives/evaluator only, no ingress.
+add_executable(wolf-protected-access-tests testProtectedAccess.cpp
+        ../src/moonlight-server/sessions/protected_access.cpp)
+target_compile_features(wolf-protected-access-tests PRIVATE cxx_std_20)
+target_include_directories(wolf-protected-access-tests PRIVATE ../src/moonlight-server)
+target_link_libraries(wolf-protected-access-tests PRIVATE wolf::crypto Catch2::Catch2WithMain Threads::Threads)
+add_test(NAME wolf-protected-access-tests COMMAND wolf-protected-access-tests)
+set_tests_properties(wolf-protected-access-tests PROPERTIES LABELS "security;isolated" TIMEOUT 45)
