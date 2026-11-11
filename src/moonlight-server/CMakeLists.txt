@@ -91,6 +91,10 @@ FetchContent_Declare(
         GIT_REPOSITORY https://github.com/cgutman/enet
         GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf)
 FetchContent_MakeAvailable(enet)
+if (BUILD_SHARED_LIBS)
+    # The pinned ENet builds a static archive consumed by the shared wolf_runner.
+    set_target_properties(enet PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif ()
 target_link_libraries_system(wolf_runner PUBLIC enet)
 unset(CMAKE_PROJECT_INCLUDE_BEFORE)
 

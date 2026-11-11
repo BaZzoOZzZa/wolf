@@ -1,6 +1,6 @@
 # MWOW-10 — tracked CMake dependency fixes
 
-Status: **review candidate; UUID follow-up graph/header checks PASS; combined build/security execution pending**.
+Status: **review candidate; UUID and ENet PIC metadata checks PASS; combined build/security execution pending**.
 Base: `0e3710be36a6a7fa130f633b358d1b520a3cee9c`, branch `feature/MWOW-10-build-fix`.
 No merge, push, system installation, Wolf/test-main startup, game, Docker or device operation.
 
@@ -264,3 +264,36 @@ follow-up. Earlier `source-revision.json`/`rawhashes.json` describe the historic
 directory was regenerated for this UUID check. Earlier raw configure logs and
 source-provenance records remain retained. This follow-up does not claim that
 the combined production build or security suites have passed.
+
+## ENet PIC follow-up after combined link failure
+
+Combined `7e3c430a199d8fdc81a2fd983271e7f71afdb539` compiled all production
+translation units, then failed linking `libwolf_runner.so`: the pinned ENet
+build hardcodes a static `enet` target, whose `host.c.o` was not PIC.
+`/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-8/native-final/uuid-build.log`
+reports `R_X86_64_PC32` against `enet_host_connect` and `recompile with -fPIC`;
+`uuid-combined-commands.json` identifies that revision and exact failed commands.
+That actual combined build remains **FAILED** until Manager rebuilds it.
+
+Immediately after `FetchContent_MakeAvailable(enet)`, Wolf now sets the actual
+`enet` target's **`POSITION_INDEPENDENT_CODE ON` when `BUILD_SHARED_LIBS` is ON**.
+This fixes the static archive's compilation for shared consumption. The original
+ENet SHA `44c85e16279553d9c052e572bcbfcd745fb74abf`, static library type, PUBLIC
+link to the runner and non-shared branch remain unchanged. No global compiler
+flags, sanitizer changes or linker relaxation are introduced. Runtime/test
+sources and `tests/CMakeLists.txt` are not changed by this follow-up.
+
+Configure-only check in the existing MWOW-10 build directory: **exit 0**.
+File API confirms `enet=STATIC_LIBRARY`, `wolf_runner=SHARED_LIBRARY` and the
+real runner-to-ENet dependency. All **9** generated ENet C compile commands,
+including `host.c`, contain **`-fPIC`**; global `CMAKE_C_FLAGS` does not.
+No object compilation, link, full build, test, main or runtime was executed.
+The combined checkout/build was read only; Manager retains the heavy slot.
+
+Exact args/log/exit: `enet-pic-command.json`, `enet-pic-configure.log`,
+`enet-pic-exit.json`; graph: `enet-pic-targets.dot`; complete generated ENet
+argv/type/pin evidence: `enet-pic-proof.json`. Revision and raw hashes are in
+`enet-pic-source-revision.json` and `enet-pic-rawhashes.json`, under the MWOW-10
+artifact root. Own mutable CMake metadata was regenerated; earlier checkpoint
+manifests remain historical. This evidence does not claim a successful actual
+shared/sanitized link or combined security run.
