@@ -64,14 +64,46 @@ struct PacketCell {
   ENetPacket *packet = nullptr;
   std::atomic_bool released{false};
   bool charged = false;
-  static void marker(ENetPacket *packet) noexcept {
-    static_cast<PacketCell *>(packet->userData)->released = true;
+
+private:
+  bool reserved = false;
+  struct Key {};
+
+public:
+  static void marker(ENetPacket *p) noexcept {
+    auto &cell = *static_cast<PacketCell *>(p->userData);
+    if (cell.packet == p) // another packet's callback never discharges this obligation
+      cell.released = true;
   }
-  void take(ENetPacket *p) {
-    packet = p;
-    released = false;
-    p->userData = this;
-    p->freeCallback = marker;
+  // A noncopyable/nonmovable empty-cell capability, acquired BEFORE any C
+  // operation can return a transfer-full packet. Only its one owning operation
+  // installs a packet; callbacks only mark and cannot acquire/replace the cell.
+  class Reservation {
+    PacketCell &cell;
+
+  public:
+    Reservation(PacketCell &c, Key) noexcept : cell(c) {
+      cell.reserved = true;
+    }
+    Reservation(const Reservation &) = delete;
+    Reservation &operator=(const Reservation &) = delete;
+    ~Reservation() {
+      cell.reserved = false;
+    }
+    void take(ENetPacket *p) noexcept {
+      // Called exactly once by this operation, with a nonnull transfer-full
+      // result. Empty/exclusive ownership was established before acquisition,
+      // so no refusal/throw/drop is possible in ReceiveOwner's destructor.
+      cell.packet = p;
+      cell.released = false;
+      p->userData = &cell;
+      p->freeCallback = marker;
+    }
+  };
+  std::optional<Reservation> reserve() noexcept {
+    if (packet || reserved)
+      return std::nullopt;
+    return std::optional<Reservation>(std::in_place, *this, Key{});
   }
 };
 } // namespace
@@ -221,6 +253,13 @@ struct State : std::enable_shared_from_this<State> {
       }
     }
     retire_packets();
+    if (received.packet) {
+      // The enclosing operation returned without confirmed receive retirement.
+      // Keep the exact cell/identity; never service again or overwrite it. The
+      // owner shutdown operation may establish a late real release, not a retry.
+      unknown = true;
+      request_stop();
+    }
     --calls;
     if (!ok) {
       logs::log(logs::error, "[ENET] Owned control operation failed; stopping with retained cleanup");
@@ -233,12 +272,15 @@ struct State : std::enable_shared_from_this<State> {
     auto cell = std::find_if(packets.begin(), packets.end(), [](auto &c) { return !c.packet; });
     if (cell == packets.end())
       throw std::runtime_error("Control packet capacity exhausted");
+    auto slot = cell->reserve();
+    if (!slot)
+      throw std::runtime_error("Control packet cell is occupied"); // BEFORE acquisition
     auto &ops = transport->ops;
     auto *p = ops.packet(ops.owner.get(), bytes.data(), bytes.size(), ENET_PACKET_FLAG_RELIABLE);
     if (!p)
       return;
     // Immediate nonallocating owner before any throwing work.
-    cell->take(p);
+    slot->take(p);
     cell->charged = true;
     request.charged = false;
     bool caller = true;
@@ -435,6 +477,14 @@ struct State : std::enable_shared_from_this<State> {
     }
   }
   void step() {
+    // Reserve before drain/service: even an unexpected internal reentry cannot
+    // acquire another receive while this call or an old packet owns the cell.
+    auto receive_slot = received.reserve();
+    if (!receive_slot) {
+      unknown = true;
+      request_stop();
+      return;
+    }
     drain_outbox();
     if (stop)
       return;
@@ -442,10 +492,11 @@ struct State : std::enable_shared_from_this<State> {
     struct ReceiveOwner {
       State &s;
       ENetEvent &event;
+      PacketCell::Reservation &slot;
       ~ReceiveOwner() {
         if (event.type != ENET_EVENT_TYPE_RECEIVE || !event.packet)
           return;
-        s.received.take(event.packet); // transfer-full, no allocation/throwing work
+        slot.take(event.packet); // reserved before service; no refusal/throw/allocation
         try {
           s.transport->ops.destroy_packet(s.transport->ops.owner.get(), event.packet);
         } catch (...) {
@@ -454,7 +505,7 @@ struct State : std::enable_shared_from_this<State> {
           s.request_stop();
         }
       }
-    } packet{*this, event}; // precedes actual service, covers valid output even on throw
+    } packet{*this, event, *receive_slot}; // covers valid transfer-full output even on throw
     int count = transport->ops.service(transport->ops.owner.get(), transport->host, &event, 10);
     if (count < 0)
       throw std::runtime_error("ENet service failed");

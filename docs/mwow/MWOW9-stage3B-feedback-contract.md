@@ -551,3 +551,46 @@ Protected ingress remains disabled; no GameACL/selection/Seat construction/runti
 configuration/UI/deviceexecutor/allroutes/reconciliation/isolation/live acceptance.
 WoW must never launch without NEW explicit permission; current game/prefix untouched.
 Future physical tests prefer local games after separate grants, not this checkpoint.
+
+### F14 correction — received-cell identity and acquisition boundary
+
+Independent review part18 found a P2 in the separately claimed missing-callback
+fault path: P1 could remain unresolved, then a later RECEIVE overwrote its cell
+and P2's callback allowed false retirement. Ordinary pinned ENet synchronous
+packet_destroy is not claimed broken; this is fail-closed fault bookkeeping.
+
+PacketCell now reserves an EMPTY cell before an operation may acquire any
+transfer-full packet. Its noncopyable/nonmovable Reservation is the only installing
+path, and remains exclusive through the operation. Outgoing reserve precedes
+packet_create; receive reserve precedes drain/service and outlives ReceiveOwner.
+ReceiveOwner installs exactly one valid output (including output followed by a
+service throw) and destroys it without allocating/throwing/refusing after ownership
+has arrived. No emergency packet discard or guessed cleanup is introduced. A
+failed reserve occurs BEFORE service/create, so it cannot orphan a newly returned
+packet. All callback code only marks; it cannot install/reassign/acquire cells.
+
+Marker now requires exact packet identity, not merely copied userData. Retirement
+still occurs only after real callback/data free and enclosing operation/local
+resource completion. After an envelope, unresolved receive is sticky Unknown+stop;
+there is no subsequent service/receive or protected pump. The exact P1 obligation
+remains in the persistent cell. Actual proper-owner shutdown may establish a late
+real release; State does not retry P1 destroy, guess-free or replace its cell. If
+release stays unproven, existing permanent retention remains. Late actual join can
+occur WITH Unknown; no cleared Unknown/reopened start/attach slot.
+
+Actual bounded regression adds one case with missing-marker and foreign-marker
+sections to the original14 unchanged cases. Fixture holds real ENet P1 without
+callback/free; queued P2 cannot be dequeued. Distinct real foreign packet uses a
+copied marker/userData to verify it cannot discharge P1. Only the real execution
+owner fixture reset releases P1, with a gate after real free but before return;
+exit/join remain false until that stack finishes. RED safely requests stop/releases
+all gates, demonstrating actual second-service/cell-overwrite failures without
+hung threads or cross-thread destroy. No new production inspection/test-hook API.
+
+RED5437821af9936153ef220588f4c679f13f18e856: build0, selector[f14] exit42,
+1case/2sections,54assertions of which18failed. Same test bytes used for GREEN;
+full source/native evidence and exact revised checkpoint are in thread report
+`/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F14.md` and
+`checks/F14/native-evidence.json`. Original3B2/F13 history remains immutable.
+No InputSeat/Handoff/Runtime/crypto/wolf/startup/dependency/ingress change; no live
+execution. Independent F14 rereview required before3C; all prior future gates remain.
