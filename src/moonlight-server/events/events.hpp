@@ -16,6 +16,7 @@
 #include <immer/map.hpp>
 #include <immer/vector.hpp>
 #include <moonlight/control.hpp>
+#include <moonlight/control_crypto.hpp>
 #include <moonlight/data-structures.hpp>
 #include <rfl.hpp>
 #include <rfl/json.hpp>
@@ -417,6 +418,8 @@ struct StreamSession {
   // gcm encryption keys
   std::string aes_key;
   std::string aes_iv;
+  std::shared_ptr<moonlight::control::ControlCryptoState> control_crypto =
+      std::make_shared<moonlight::control::ControlCryptoState>();
 
   // Moonlight protocol extension to support IP-less connections
   std::array<char, 16> rtp_secret_payload;

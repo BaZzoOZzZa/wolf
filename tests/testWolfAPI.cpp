@@ -1,12 +1,14 @@
 #include <api/api.hpp>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <control/control.hpp>
 #include <curl/curl.h>
 #include <filesystem>
 #include <helpers/tsqueue.hpp>
 #include <helpers/utils.hpp>
 #include <rfl/toml.hpp>
 #include <sessions/handlers.hpp>
+#include <set>
 #include <state/config.hpp>
 
 using Catch::Matchers::ContainsSubstring;
@@ -805,4 +807,121 @@ TEST_CASE("SSE APIs", "[API]") {
   REQUIRE(event.has_value());
   REQUIRE_THAT(event->event, Equals("wolf::core::events::IDRRequestEvent"));
   REQUIRE_THAT(event->data, Equals("{\"session_id\":\"42\"}"));
+}
+
+TEST_CASE("SSE owns large buffers and serializes concurrent broadcasts", "[API][security]") {
+  // In-process Unix socket fixture: no Wolf process, app runner or virtual device.
+  boost::asio::io_context io;
+  auto path =
+      (std::filesystem::current_path() / ("mwow-sse-" + crypto::str_to_hex(crypto::random(4)) + ".sock")).string();
+  struct SocketPathCleanup {
+    std::string path;
+    ~SocketPathCleanup() {
+      std::filesystem::remove(path);
+    }
+  } cleanup{path};
+  UnixSocketServer server(io, path, immer::box<state::AppState>(state::AppState{}));
+  struct RunIO {
+    boost::asio::io_context &io;
+    std::thread first;
+    std::thread second;
+    explicit RunIO(boost::asio::io_context &ctx)
+        : io(ctx), first([&ctx] { ctx.run(); }), second([&ctx] { ctx.run(); }) {}
+    ~RunIO() {
+      io.stop();
+      first.join();
+      second.join();
+    }
+  } running{io};
+  boost::asio::io_context client_io;
+  boost::asio::local::stream_protocol::socket client(client_io);
+  client.connect(boost::asio::local::stream_protocol::endpoint(path));
+  const std::string request = "GET /api/v1/events HTTP/1.0\r\n\r\n";
+  boost::asio::write(client, boost::asio::buffer(request));
+  client.non_blocking(true);
+  std::string received;
+  auto read_until = [&](auto predicate) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!predicate() && std::chrono::steady_clock::now() < deadline) {
+      char bytes[8192];
+      boost::system::error_code ec;
+      auto count = client.read_some(boost::asio::buffer(bytes), ec);
+      if (!ec)
+        received.append(bytes, count);
+      else if (ec != boost::asio::error::would_block && ec != boost::asio::error::try_again)
+        return false;
+      else
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return predicate();
+  };
+  REQUIRE(read_until([&] { return received.find("\r\n\r\n") != std::string::npos; }));
+  REQUIRE(received.starts_with("HTTP/1.0 200 OK\r\n"));
+  received.erase(0, received.find("\r\n\r\n") + 4);
+
+  std::set<std::string> expected;
+  size_t expected_bytes = 0;
+  for (int producer = 0; producer < 2; ++producer) {
+    for (int n = 0; n < 32; ++n) {
+      auto frame = "event: p" + std::to_string(producer) + "/" + std::to_string(n) +
+                   "\ndata: " + std::string(16384, 'a' + producer) + "\n\n";
+      expected_bytes += frame.size();
+      expected.insert(frame);
+    }
+  }
+  auto publish = [&](int producer) {
+    for (int n = 0; n < 32; ++n)
+      server.broadcast_event("p" + std::to_string(producer) + "/" + std::to_string(n),
+                             std::string(16384, 'a' + producer));
+  };
+  std::thread first(publish, 0), second(publish, 1);
+  first.join();
+  second.join();
+  // Force writes beyond the kernel send buffer; temporary input strings are gone.
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  REQUIRE(read_until([&] { return received.size() >= expected_bytes; }));
+  REQUIRE(received.size() == expected_bytes);
+  while (!received.empty()) {
+    auto end = received.find("\n\n");
+    REQUIRE(end != std::string::npos);
+    REQUIRE(expected.erase(received.substr(0, end + 2)) == 1);
+    received.erase(0, end + 2);
+  }
+  REQUIRE(expected.empty());
+  client.close();
+  server.broadcast_event("after-close", std::string(16384, 'x'));
+}
+
+TEST_CASE("Control association does not fall back from an incorrect token", "[CONTROL][security]") {
+  auto sessions = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto a = events::StreamSession{.aes_key = std::string(32, 'A'),
+                                 .enet_secret_payload = 123,
+                                 .session_id = 1,
+                                 .ip = "192.0.2.1"};
+  auto b = events::StreamSession{.aes_key = std::string(32, 'B'),
+                                 .enet_secret_payload = 456,
+                                 .session_id = 2,
+                                 .ip = "192.0.2.2"};
+  sessions->update([&](auto v) { return v.push_back(a).push_back(b); });
+  REQUIRE_FALSE(control::match_control_session(sessions, a.ip, 999));
+  REQUIRE_FALSE(control::match_control_session(sessions, "192.0.2.9", 999));
+  auto token_match = control::match_control_session(sessions, "192.0.2.9", a.enet_secret_payload);
+  REQUIRE(token_match);
+  REQUIRE(token_match->session_id == a.session_id);
+  REQUIRE(control::same_control_generation(a, *token_match));
+  REQUIRE_FALSE(control::match_control_session(sessions, a.ip, 0));
+  REQUIRE(a.control_crypto->negotiate(0, true));
+  REQUIRE(b.control_crypto->negotiate(0, true));
+  REQUIRE(control::match_control_session(sessions, a.ip, 0));
+  b.ip = a.ip;
+  sessions->update([&](auto) { return immer::vector<events::StreamSession>{a, b}; });
+  REQUIRE_FALSE(control::match_control_session(sessions, a.ip, 0));
+  b.enet_secret_payload = a.enet_secret_payload;
+  sessions->update([&](auto) { return immer::vector<events::StreamSession>{a, b}; });
+  REQUIRE_FALSE(control::match_control_session(sessions, a.ip, a.enet_secret_payload));
+  auto resumed = a;
+  resumed.control_crypto = std::make_shared<moonlight::control::ControlCryptoState>();
+  // Even reused stable ID, transport tokens and key do not grant the old peer
+  // ownership of a newly created launch/resume object.
+  REQUIRE_FALSE(control::same_control_generation(a, resumed));
 }

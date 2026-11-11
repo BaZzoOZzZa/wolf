@@ -106,6 +106,9 @@ describe(const RTSP_PACKET &req, const events::StreamSession &session) {
   payloads.push_back(
       {"a", fmt::format("x-ss-general.featureFlags: {}", FS_PEN_TOUCH_EVENTS | FS_CONTROLLER_TOUCH_EVENTS)});
 
+  payloads.push_back({"a", "x-ss-general.encryptionSupported: 1"});
+  payloads.push_back({"a", "x-ss-general.encryptionRequested: 1"});
+
   return ok_msg(req.seq_number, {}, payloads);
 }
 
@@ -168,6 +171,14 @@ announce(const RTSP_PACKET &req, const events::StreamSession &session) {
                 })                                             //
               | views::transform(parse_arg_line)               // turns an arg line into a pair
               | to<std::map<std::string, std::optional<int>>>; // to map
+
+  auto encryption = args.find("x-ss-general.encryptionEnabled");
+  if (encryption != args.end() && (!encryption->second || *encryption->second < 0))
+    return error_msg(400, "Invalid control encryption mode", req.seq_number);
+  unsigned flags = encryption == args.end() ? 0 : static_cast<unsigned>(*encryption->second);
+  bool allow_legacy = std::string_view(utils::get_env("WOLF_ALLOW_LEGACY_CONTROL", "FALSE")) == "TRUE";
+  if (!session.control_crypto->negotiate(flags, allow_legacy))
+    return error_msg(400, "Control V2 required or mode already fixed", req.seq_number);
 
   bool video_format_hevc = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 1;
   bool video_format_av1 = args["x-nv-vqos[0].bitStreamFormat"].value_or(0) == 2;

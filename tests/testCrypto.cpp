@@ -213,3 +213,62 @@ TEST_CASE("OpenSSL sign", "[Crypto]") {
     REQUIRE(crypto::verify(msg, signature, public_cert));
   }
 }
+
+TEST_CASE("Paired identity is an exact certificate pin", "[Crypto][security]") {
+  auto key = x509::generate_key();
+  auto paired = x509::generate_x509(key);
+  auto decoded = x509::cert_from_string(x509::get_cert_pem(paired));
+  REQUIRE_FALSE(x509::verification_error(paired, decoded));
+  REQUIRE(x509::verification_error(paired, {}));
+  REQUIRE(x509::verification_error({}, decoded));
+
+  auto other_key = x509::generate_key();
+  auto other = x509::generate_x509(other_key);
+  REQUIRE(x509::verification_error(paired, other));
+
+  // Same subject and public key, but a different certificate is a different identity.
+  auto reissued = x509::x509_ptr(X509_dup(paired.get()), X509_free);
+  REQUIRE(ASN1_INTEGER_set(X509_get_serialNumber(reissued.get()), 123) == 1);
+  REQUIRE(X509_sign(reissued.get(), key.get(), EVP_sha256()) > 0);
+  REQUIRE(x509::verification_error(paired, reissued));
+
+  // Foreign issuer, including the old unknown-issuer bypass case.
+  auto issuer = X509_NAME_new();
+  REQUIRE(issuer != nullptr);
+  REQUIRE(X509_NAME_add_entry_by_txt(issuer,
+                                     "CN",
+                                     MBSTRING_ASC,
+                                     reinterpret_cast<const unsigned char *>("Foreign CA"),
+                                     -1,
+                                     -1,
+                                     0) == 1);
+  REQUIRE(X509_set_issuer_name(other.get(), issuer) == 1);
+  X509_NAME_free(issuer);
+  REQUIRE(X509_sign(other.get(), other_key.get(), EVP_sha256()) > 0);
+  REQUIRE(x509::verification_error(paired, other));
+
+  // Even a leaf signed by the paired key is not the paired identity.
+  REQUIRE(X509_set_issuer_name(other.get(), X509_get_subject_name(paired.get())) == 1);
+  REQUIRE(X509_sign(other.get(), key.get(), EVP_sha256()) > 0);
+  REQUIRE(x509::verification_error(paired, other));
+
+  // Exact pins continue to work with embedded clients' inaccurate clocks.
+  REQUIRE(X509_gmtime_adj(X509_getm_notAfter(paired.get()), -3600) != nullptr);
+  REQUIRE(X509_sign(paired.get(), key.get(), EVP_sha256()) > 0);
+  REQUIRE_FALSE(x509::verification_error(paired, x509::cert_from_string(x509::get_cert_pem(paired))));
+}
+
+TEST_CASE("GCM rejects incomplete tag and IV storage", "[Crypto][security]") {
+  std::string key(16, 'k');
+  std::string iv(12, 'i');
+  auto [ciphertext, tag] = crypto::aes_encrypt_gcm("message", key, iv, iv.size());
+  for (size_t length = 0; length < 16; ++length) {
+    REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(ciphertext, key, tag.substr(0, length), iv, iv.size()),
+                      std::runtime_error);
+  }
+  REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(ciphertext, key, tag + "x", iv, iv.size()), std::runtime_error);
+  REQUIRE_THROWS_AS(crypto::aes_decrypt_gcm(ciphertext, key, tag, iv, 16), std::runtime_error);
+  REQUIRE_THROWS_AS(crypto::aes_encrypt_gcm("message", key.substr(1), iv, iv.size()), std::runtime_error);
+  auto [empty, empty_tag] = crypto::aes_encrypt_gcm("", key, iv, iv.size());
+  REQUIRE(crypto::aes_decrypt_gcm(empty, key, empty_tag, iv, iv.size()).empty());
+}

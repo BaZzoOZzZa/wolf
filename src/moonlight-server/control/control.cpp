@@ -3,6 +3,7 @@
 #include <control/input_handler.hpp>
 #include <events/events.hpp>
 #include <immer/box.hpp>
+#include <map>
 #include <state/sessions.hpp>
 #include <sys/socket.h>
 
@@ -54,10 +55,10 @@ enet_host create_host(std::string_view host, std::uint16_t port, std::size_t pee
  * we have to extract them manually
  */
 std::pair<std::string /* ip */, int /* port */> get_ip(const sockaddr *const ip_addr) {
-  char data[INET6_ADDRSTRLEN];
+  char data[INET6_ADDRSTRLEN]{};
 
   auto family = ip_addr->sa_family;
-  std::uint16_t port;
+  std::uint16_t port = 0;
   if (family == AF_INET6) {
     inet_ntop(AF_INET6, &((sockaddr_in6 *)ip_addr)->sin6_addr, data, INET6_ADDRSTRLEN);
     port = ((sockaddr_in6 *)ip_addr)->sin6_port;
@@ -74,6 +75,8 @@ std::pair<std::string /* ip */, int /* port */> get_ip(const sockaddr *const ip_
 bool send_packet(std::string_view payload, ENetPeer *peer) {
   logs::log(logs::trace, "[ENET] Sending packet");
   auto packet = enet_packet_create(payload.data(), payload.size(), ENET_PACKET_FLAG_RELIABLE);
+  if (!packet)
+    return false;
   if (enet_peer_send(peer, 0, packet) < 0) {
     logs::log(logs::warning, "[ENET] Failed to send packet");
     enet_packet_destroy(packet);
@@ -82,55 +85,27 @@ bool send_packet(std::string_view payload, ENetPeer *peer) {
   return true;
 }
 
-bool encrypt_and_send(std::string_view payload,
-                      std::string_view aes_key,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client) {
-  if (auto enet_client = connected_client->get()) {
-    try {
-      auto encrypted = control::encrypt_packet(aes_key, 0, payload); // TODO: seq?
-      return send_packet({(char *)encrypted.get(), encrypted->full_size()}, enet_client);
-    } catch (const std::runtime_error &e) {
-      logs::log(logs::warning, "[ENET] Unable to encrypt outgoing packet: {}", e.what());
-      return false;
-    }
-  } else {
-    logs::log(logs::warning, "[ENET] Failed to send packet, client is not connected");
-    return false;
-  }
+bool queue_feedback(std::string_view payload, immer::box<std::shared_ptr<ControlPeer>> connected_client) {
+  return *connected_client && (*connected_client)->send && (*connected_client)->send(payload);
 }
 
-std::optional<events::StreamSession> get_current_session(const enet_clients_map &connected_clients,
-                                                         const state::SessionsAtoms &running_sessions,
-                                                         std::string_view client_ip,
-                                                         const ENetEvent &enet_event) {
-  if (enet_event.type == ENET_EVENT_TYPE_CONNECT) {
-    // A new connection, we should check if there's a session that matches the current client
-    for (const StreamSession &session : *running_sessions->load()) {
-      if (session.enet_secret_payload == enet_event.data) {
-        return session;
-      }
-    }
-    logs::log(logs::warning,
-              "[ENET] Unable to find a session that matches the client secret {}, matching by IP",
-              enet_event.data);
-    for (const StreamSession &session : *running_sessions->load()) {
-      if (session.ip == client_ip) {
-        return session;
-      }
-    }
-  } else {
-    // The connection has already been established, we'll check for a match in our connected client map
-    if (auto client = connected_clients.find(enet_event.peer)) {
-      return client->get();
+std::optional<events::StreamSession> match_control_session(const state::SessionsAtoms &running_sessions,
+                                                           std::string_view client_ip,
+                                                           std::uint32_t connect_token) {
+  std::optional<events::StreamSession> match;
+  for (const auto &session : *running_sessions->load()) {
+    // Legacy clients send zero. Only that explicit legacy case may select by
+    // IP, and only when unambiguous. Selection is NOT authentication.
+    bool candidate = connect_token != 0
+                         ? session.enet_secret_payload == connect_token
+                         : session.control_crypto->mode.load() == EncryptionMode::legacy && session.ip == client_ip;
+    if (candidate) {
+      if (match)
+        return std::nullopt;
+      match = session;
     }
   }
-  return std::nullopt;
-}
-
-std::shared_ptr<ENetPeer> to_shared_ptr(ENetPeer *peer) {
-  return std::shared_ptr<ENetPeer>(peer, [](auto _peer) {
-    // DO NOTHING, we don't want to free peer, the lifecycle is dictated by enet
-  });
+  return match;
 }
 
 void run_control(int port,
@@ -143,99 +118,178 @@ void run_control(int port,
   enet_host host = create_host(host_ip, port, peers);
   logs::log(logs::info, "Control server started on port: {}", port);
 
-  ENetEvent event;
+  if (!host)
+    return;
 
-  immer::atom<enet_clients_map> connected_clients;
+  struct PeerState {
+    events::StreamSession session;
+    bool authenticated = false;
+    std::shared_ptr<ControlPeer> sender;
+    ControlKeyState *key_state = nullptr;
+  };
+  // ENet peers, association and ownership are touched only by this thread.
+  std::map<ENetPeer *, PeerState> clients;
+  ControlKeyRegistry key_registry;
+  struct Outgoing {
+    std::weak_ptr<ControlPeer> sender;
+    std::string plaintext;
+  };
+  struct Outbox {
+    std::mutex mutex;
+    std::deque<Outgoing> pending;
+  };
+  auto outbox = std::make_shared<Outbox>();
+  std::map<std::size_t, ENetPeer *> owners;
 
-  auto stop_ev = event_bus->register_handler<immer::box<StopStreamEvent>>(
-      [&connected_clients](const immer::box<StopStreamEvent> &ev) {
-        auto terminate_pkt = ControlTerminatePacket{};
-        std::string plaintext = {(char *)&terminate_pkt, sizeof(terminate_pkt)};
-        for (auto &[peer, session] : *connected_clients.load()) {
-          if (session->session_id == ev->session_id) {
-            immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(peer)};
-            encrypt_and_send(plaintext, session->aes_key, enet_client);
-            return;
-          }
-        }
-        logs::log(logs::debug, "[ENET] Client not found for session: {}", ev->session_id);
-      });
+  auto current = [&](const events::StreamSession &session) {
+    auto sessions = running_sessions->load();
+    auto live = state::get_session_by_id(*sessions, session.session_id);
+    return live && same_control_generation(session, *live);
+  };
+  auto forget = [&](ENetPeer *peer) {
+    if (auto it = clients.find(peer); it != clients.end()) {
+      auto owner = owners.find(it->second.session.session_id);
+      if (owner != owners.end() && owner->second == peer)
+        owners.erase(owner);
+      clients.erase(it);
+    }
+  };
 
+  ENetEvent event{};
   while (true) {
-    if (enet_host_service(host.get(), &event, timeout.count()) > 0) {
-      auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);
-      auto client_session = get_current_session(connected_clients, running_sessions, client_ip, event);
-      if (client_session) {
-        switch (event.type) {
-        case ENET_EVENT_TYPE_NONE:
-          break;
-        case ENET_EVENT_TYPE_CONNECT:
-          logs::log(logs::debug, "[ENET] connected client: {}:{}", client_ip, client_port);
-          connected_clients.update([peer = event.peer, client_session](const enet_clients_map &m) {
-            return m.set(peer, client_session.value());
-          });
-          event_bus->fire_event(
-              immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = client_session->session_id}));
-          break;
-        case ENET_EVENT_TYPE_DISCONNECT:
-          logs::log(logs::debug, "[ENET] disconnected client: {}:{}", client_ip, client_port);
-          connected_clients.update([peer = event.peer](const enet_clients_map &m) { return m.erase(peer); });
-          event_bus->fire_event(
-              immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = client_session->session_id}));
-          break;
-        case ENET_EVENT_TYPE_RECEIVE:
-          enet_packet packet = {event.packet, enet_packet_destroy};
-
-          auto type = ((ControlPacket *)packet->data)->type;
-
-          logs::log(logs::trace,
-                    "[ENET] received {} of {} bytes from: {}:{} HEX: {}",
-                    packet_type_to_str(type),
-                    packet->dataLength,
-                    client_ip,
-                    client_port,
-                    crypto::str_to_hex({(char *)packet->data, packet->dataLength}));
-
-          if (type == ENCRYPTED) {
-            try {
-              auto enc_pkt = (ControlEncryptedPacket *)(packet->data);
-              auto decrypted = decrypt_packet(*enc_pkt, client_session->aes_key);
-              auto sub_type = ((ControlPacket *)decrypted.data())->type;
-
-              logs::log(logs::trace,
-                        "[ENET] decrypted sub_type: {} HEX: {}",
-                        packet_type_to_str(sub_type),
-                        crypto::str_to_hex(decrypted));
-
-              if (sub_type == TERMINATION) {
-                event_bus->fire_event(
-                    immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = client_session->session_id}));
-              } else if (sub_type == INPUT_DATA) {
-                immer::box<std::shared_ptr<ENetPeer>> enet_client = {to_shared_ptr(event.peer)};
-                handle_input(client_session.value(), enet_client, (INPUT_PKT *)decrypted.data());
-              } else if (sub_type == IDR_FRAME) {
-                auto ev = IDRRequestEvent{.session_id = client_session->session_id};
-                event_bus->fire_event(immer::box<IDRRequestEvent>{ev});
-              }
-            } catch (std::runtime_error &e) {
-              logs::log(logs::warning, "[ENET] Unable to decrypt incoming packet: {}", e.what());
-            }
-          } else {
-            logs::log(logs::warning,
-                      "[ENET] Received unencrypted message: {} - {}",
-                      packet_type_to_str(type),
-                      crypto::str_to_hex({(char *)packet->data, packet->dataLength}));
-          }
-          break;
+    std::deque<Outgoing> pending;
+    {
+      std::lock_guard lock(outbox->mutex);
+      pending.swap(outbox->pending);
+    }
+    for (const auto &request : pending) {
+      auto sender = request.sender.lock();
+      if (!sender)
+        continue;
+      for (auto &[peer, connection] : clients) {
+        auto owner = owners.find(connection.session.session_id);
+        if (connection.sender != sender || !connection.authenticated || !current(connection.session) ||
+            owner == owners.end() || owner->second != peer || !connection.key_state ||
+            connection.session.control_crypto->mode.load() != EncryptionMode::v2)
+          continue;
+        // Reserve before encryption/send; failures consume a nonce too.
+        auto seq = connection.key_state->reserve_sequence();
+        if (!seq)
+          break; // rekey required, never wrap
+        try {
+          auto encrypted =
+              encrypt_packet(connection.session.aes_key, *seq, request.plaintext, EncryptionMode::v2, Direction::host);
+          send_packet({reinterpret_cast<const char *>(encrypted.get()), encrypted->full_size()}, peer);
+        } catch (const std::runtime_error &e) {
+          logs::log(logs::warning, "[ENET] Outgoing encryption failed: {}", e.what());
         }
-      } else {
-        logs::log(logs::warning, "[ENET] Received packet from unrecognised client {}:{}", client_ip, client_port);
-        enet_peer_disconnect_now(event.peer, 0);
+        break;
       }
     }
-  }
+    if (enet_host_service(host.get(), &event, std::min<std::int64_t>(timeout.count(), 10)) <= 0)
+      continue;
+    // Own every received packet, including rejected/unassociated traffic.
+    enet_packet packet{event.type == ENET_EVENT_TYPE_RECEIVE ? event.packet : nullptr, enet_packet_destroy};
+    auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);
+    if (event.type == ENET_EVENT_TYPE_CONNECT) {
+      forget(event.peer); // a recycled ENet slot is a new, unauthenticated peer
+      auto session = match_control_session(running_sessions, client_ip, event.data);
+      if (!session) {
+        enet_peer_disconnect_now(event.peer, 0);
+        continue;
+      }
+      auto sender = std::make_shared<ControlPeer>();
+      sender->send =
+          [weak_outbox = std::weak_ptr<Outbox>(outbox),
+           weak_sender = std::weak_ptr<ControlPeer>(sender),
+           weak_crypto = std::weak_ptr<ControlCryptoState>(session->control_crypto)](std::string_view payload) {
+            auto crypto = weak_crypto.lock();
+            if (!crypto || crypto->mode.load() != EncryptionMode::v2)
+              return false;
+            auto queue = weak_outbox.lock();
+            if (!queue || payload.size() > MAX_PAYLOAD_SIZE)
+              return false;
+            std::lock_guard lock(queue->mutex);
+            if (queue->pending.size() >= 256)
+              return false;
+            queue->pending.push_back({weak_sender, std::string(payload)});
+            return true;
+          };
+      clients.emplace(event.peer, PeerState{.session = *session, .sender = sender});
+      // CONNECT (including possession of the 32-bit token) is not proof of key possession.
+      continue;
+    }
 
-  stop_ev.unregister();
+    auto it = clients.find(event.peer);
+    if (it == clients.end()) {
+      enet_peer_disconnect_now(event.peer, 0);
+      continue;
+    }
+    auto &peer_state = it->second;
+    auto &session = peer_state.session;
+    if (!current(session)) {
+      forget(event.peer);
+      enet_peer_disconnect_now(event.peer, 0);
+      continue;
+    }
+    auto owner = owners.find(session.session_id);
+    bool is_owner = owner != owners.end() && owner->second == event.peer;
+    if (event.type == ENET_EVENT_TYPE_DISCONNECT) {
+      // Transport disconnects are unauthenticated. In particular they must not
+      // pause a newer generation through the session-id-only event bus.
+      forget(event.peer);
+      continue;
+    }
+    if (event.type != ENET_EVENT_TYPE_RECEIVE)
+      continue;
+
+    try {
+      auto mode = session.control_crypto->mode.load();
+      auto bytes = std::string_view{reinterpret_cast<const char *>(packet->data), packet->dataLength};
+      auto decrypted = decrypt_packet(bytes, session.aes_key, mode, Direction::client);
+      if (!valid_control_packet(decrypted))
+        continue;
+      auto type = read_packet<ControlPacket>(decrypted).type;
+      if (type == INPUT_DATA && !valid_input_packet(decrypted))
+        continue;
+      if (type == TERMINATION && decrypted.size() != sizeof(ControlTerminatePacket))
+        continue;
+      if (type == IDR_FRAME && decrypted.size() != sizeof(ControlPacket) + 2)
+        continue;
+      // No takeover of a currently authenticated generation by a second peer.
+      if (!is_owner && owner != owners.end()) {
+        auto old = clients.find(owner->second);
+        if (old != clients.end() && current(old->second.session))
+          continue;
+      }
+      if (mode == EncryptionMode::v2) {
+        auto key_state = key_registry.find_or_insert(crypto::hex_to_str(session.aes_key, true));
+        if (!key_state || !key_state->received.accept(boost::endian::little_to_native(
+                              read_packet<std::uint32_t>(bytes.substr(sizeof(ControlPacket))))))
+          continue;
+        peer_state.key_state = key_state;
+      }
+      if (!peer_state.authenticated) {
+        peer_state.authenticated = true;
+        owners[session.session_id] = event.peer;
+        event_bus->fire_event(immer::box<ResumeStreamEvent>(ResumeStreamEvent{.session_id = session.session_id}));
+      }
+      // Recheck after synchronous event handlers; a resume may have revoked us.
+      if (!current(session))
+        continue;
+      if (type == TERMINATION) {
+        event_bus->fire_event(immer::box<PauseStreamEvent>(PauseStreamEvent{.session_id = session.session_id}));
+        forget(event.peer);
+        enet_peer_disconnect_now(event.peer, 0);
+      } else if (type == INPUT_DATA) {
+        handle_input(session, {peer_state.sender}, decrypted);
+      } else if (type == IDR_FRAME) {
+        event_bus->fire_event(immer::box<IDRRequestEvent>(IDRRequestEvent{.session_id = session.session_id}));
+      }
+    } catch (const std::runtime_error &e) {
+      logs::log(logs::warning, "[ENET] Invalid encrypted control packet: {}", e.what());
+    }
+  }
 }
 
 } // namespace control

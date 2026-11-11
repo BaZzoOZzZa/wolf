@@ -1,10 +1,13 @@
 #pragma once
 
 #include <chrono>
+#include <deque>
 #include <enet/enet.h>
 #include <events/events.hpp>
+#include <functional>
 #include <helpers/logger.hpp>
 #include <moonlight/control.hpp>
+#include <mutex>
 #include <range/v3/view.hpp>
 #include <state/data-structures.hpp>
 #include <thread>
@@ -21,13 +24,26 @@ void run_control(int port,
                  std::chrono::milliseconds timeout = 1000ms,
                  const std::string &host_ip = "0.0.0.0");
 
-using enet_clients_map = immer::map<ENetPeer *, immer::box<events::StreamSession>>;
+// Existing per-launch random transport secrets identify a generation. A stable
+// paired-client session_id alone must never authorize an old ENet connection.
+inline bool same_control_generation(const events::StreamSession &a, const events::StreamSession &b) {
+  return a.control_crypto == b.control_crypto && a.session_id == b.session_id &&
+         a.enet_secret_payload == b.enet_secret_payload && a.rtp_secret_payload == b.rtp_secret_payload &&
+         a.aes_key == b.aes_key && a.aes_iv == b.aes_iv;
+}
 
-std::shared_ptr<ENetPeer> to_shared_ptr(ENetPeer *peer);
+std::optional<events::StreamSession> match_control_session(const state::SessionsAtoms &running_sessions,
+                                                           std::string_view client_ip,
+                                                           std::uint32_t connect_token);
 
-bool encrypt_and_send(std::string_view payload,
-                      std::string_view aes_key,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client);
+// Device callbacks may outlive an ENet peer. They retain only this revocable
+// sender, never an ENet address/slot. All encryption and ENet calls stay on the
+// control thread.
+struct ControlPeer {
+  std::function<bool(std::string_view)> send;
+};
+
+bool queue_feedback(std::string_view payload, immer::box<std::shared_ptr<ControlPeer>> connected_client);
 
 bool init();
 

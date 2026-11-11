@@ -1,6 +1,8 @@
 #pragma once
 
 #include <api/http_server.hpp>
+#include <boost/asio/strand.hpp>
+#include <deque>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
 #include <moonlight/control.hpp>
@@ -177,7 +179,11 @@ struct DockerPullImageResponse {
 
 struct UnixSocket {
   boost::asio::local::stream_protocol::socket socket;
+  // Accessed only on UnixSocketState::strand, like the socket itself.
   bool is_alive = true;
+  bool close_when_drained = false;
+  std::deque<std::shared_ptr<const std::string>> writes;
+  size_t queued_bytes = 0;
 };
 
 class UnixSocketServer {
@@ -235,6 +241,7 @@ private:
                  const std::vector<std::string_view> &http_headers,
                  std::string_view body);
   void send_data(std::shared_ptr<UnixSocket> socket, std::string_view data);
+  void write_next(std::shared_ptr<UnixSocket> socket);
 
   void handle_request(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket);
   void start_connection(std::shared_ptr<UnixSocket> socket);
@@ -245,11 +252,12 @@ private:
 
   struct UnixSocketState {
     UnixSocketState(boost::asio::io_context &io_context, immer::box<state::AppState> app_state, std::string socket_path)
-        : io_context(io_context), app_state(app_state),
+        : io_context(io_context), strand(boost::asio::make_strand(io_context)), app_state(app_state),
           acceptor(io_context, boost::asio::local::stream_protocol::endpoint(socket_path)),
           http(HTTPServer<std::shared_ptr<UnixSocket>>{}), sse_keepalive_timer(boost::asio::steady_timer{io_context}) {}
 
     boost::asio::io_context &io_context;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand;
     immer::box<state::AppState> app_state;
     boost::asio::local::stream_protocol::acceptor acceptor;
     std::vector<std::shared_ptr<UnixSocket>> sockets;

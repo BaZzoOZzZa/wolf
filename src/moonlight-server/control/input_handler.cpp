@@ -18,22 +18,22 @@ using namespace std::string_literals;
 using namespace moonlight::control;
 
 std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSession &session,
-                                                       immer::box<std::shared_ptr<ENetPeer>> connected_client,
+                                                       immer::box<std::shared_ptr<ControlPeer>> connected_client,
                                                        int controller_number,
                                                        CONTROLLER_TYPE requested_type,
                                                        uint8_t capabilities) {
 
-  auto on_rumble_fn = ([connected_client, controller_number, aes_key = session.aes_key](int low_freq, int high_freq) {
+  auto on_rumble_fn = ([connected_client, controller_number](int low_freq, int high_freq) {
     auto rumble_pkt = ControlRumblePacket{
         .header = {.type = RUMBLE_DATA, .length = sizeof(ControlRumblePacket) - sizeof(ControlPacket)},
         .controller_number = boost::endian::native_to_little((uint16_t)controller_number),
         .low_freq = boost::endian::native_to_little((uint16_t)low_freq),
         .high_freq = boost::endian::native_to_little((uint16_t)high_freq)};
     std::string plaintext = {(char *)&rumble_pkt, sizeof(rumble_pkt)};
-    encrypt_and_send(plaintext, aes_key, connected_client);
+    queue_feedback(plaintext, connected_client);
   });
 
-  auto on_led_fn = ([connected_client, controller_number, aes_key = session.aes_key](int r, int g, int b) {
+  auto on_led_fn = ([connected_client, controller_number](int r, int g, int b) {
     auto led_pkt = ControlRGBLedPacket{
         .header{.type = RGB_LED_EVENT, .length = sizeof(ControlRGBLedPacket) - sizeof(ControlPacket)},
         .controller_number = boost::endian::native_to_little((uint16_t)controller_number),
@@ -41,17 +41,17 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
         .g = static_cast<uint8_t>(g),
         .b = static_cast<uint8_t>(b)};
     std::string plaintext = {(char *)&led_pkt, sizeof(led_pkt)};
-    encrypt_and_send(plaintext, aes_key, connected_client);
+    queue_feedback(plaintext, connected_client);
   });
 
-  auto on_adaptive_trigger_fn = ([connected_client, controller_number, aes_key = session.aes_key](
-                                     const inputtino::PS5Joypad::TriggerEffect &effect) {
+  auto on_adaptive_trigger_fn = ([connected_client,
+                                  controller_number](const inputtino::PS5Joypad::TriggerEffect &effect) {
     auto rumble_pkt = ControlAdaptiveTriggerPacket{
         .header{.type = ADAPTIVE_TRIGGER_EVENT, .length = sizeof(ControlAdaptiveTriggerPacket) - sizeof(ControlPacket)},
         .controller_number = boost::endian::native_to_little((uint16_t)controller_number),
         .effect = effect};
     std::string plaintext = {(char *)&rumble_pkt, sizeof(rumble_pkt)};
-    encrypt_and_send(plaintext, aes_key, connected_client);
+    queue_feedback(plaintext, connected_client);
   });
 
   std::shared_ptr<events::JoypadTypes> new_pad;
@@ -176,7 +176,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
         .reportrate = 100,
         .type = ACCELERATION};
     std::string plaintext = {(char *)&accelerometer_pkt, sizeof(accelerometer_pkt)};
-    encrypt_and_send(plaintext, session.aes_key, connected_client);
+    queue_feedback(plaintext, connected_client);
   }
 
   if (capabilities & GYRO && final_type == wolf::config::ControllerType::PS) {
@@ -188,7 +188,7 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
         .reportrate = 100,
         .type = GYROSCOPE};
     std::string plaintext = {(char *)&gyro_pkt, sizeof(gyro_pkt)};
-    encrypt_and_send(plaintext, session.aes_key, connected_client);
+    queue_feedback(plaintext, connected_client);
   }
 
   session.joypads->update([&](events::JoypadList joypads) {
@@ -462,6 +462,9 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
 }
 
 void utf8_text(const UTF8_TEXT_PACKET &pkt, events::StreamSession &session) {
+  auto data_size = boost::endian::big_to_native(pkt.data_size);
+  if (data_size <= sizeof(INPUT_TYPE) || data_size > sizeof(INPUT_TYPE) + UTF8_TEXT_MAX_LEN)
+    return;
   if (session.keyboard->has_value()) {
     /* Here we receive a single UTF-8 encoded char at a time,
      * the trick is to convert it to UTF-32 then send CTRL+SHIFT+U+<HEXCODE> in order to produce any
@@ -620,7 +623,7 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
-                        immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+                        immer::box<std::shared_ptr<ControlPeer>> connected_client) {
   auto joypads = session.joypads->load();
   if (joypads->find(pkt.controller_number)) {
     // TODO: should we replace it instead?
@@ -638,7 +641,9 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
-                      immer::box<std::shared_ptr<ENetPeer>> connected_client) {
+                      immer::box<std::shared_ptr<ControlPeer>> connected_client) {
+  if (pkt.controller_number < 0 || pkt.controller_number >= CONTROL_SLOT_COUNT)
+    return;
   auto joypads = session.joypads->load();
   std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
@@ -774,99 +779,66 @@ void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSess
   }
 }
 
-void handle_input(events::StreamSession &session,
-                  immer::box<std::shared_ptr<ENetPeer>> connected_client,
-                  INPUT_PKT *pkt) {
-  switch (pkt->type) {
-  case MOUSE_MOVE_REL: {
-    logs::log(logs::trace, "[INPUT] Received input of type: MOUSE_MOVE_REL");
-    auto move_pkt = static_cast<MOUSE_MOVE_REL_PACKET *>(pkt);
-    mouse_move_rel(*move_pkt, session);
-    break;
+bool handle_input(events::StreamSession &session,
+                  immer::box<std::shared_ptr<ControlPeer>> connected_client,
+                  std::string_view bytes) {
+  if (!valid_input_packet(bytes)) {
+    logs::log(logs::warning, "[INPUT] Invalid input packet ({} bytes)", bytes.size());
+    return false;
   }
-  case MOUSE_MOVE_ABS: {
-    logs::log(logs::trace, "[INPUT] Received input of type: MOUSE_MOVE_ABS");
-    auto move_pkt = static_cast<MOUSE_MOVE_ABS_PACKET *>(pkt);
-    mouse_move_abs(*move_pkt, session);
+  switch (read_packet<INPUT_PKT>(bytes).type) {
+  case MOUSE_MOVE_REL:
+    mouse_move_rel(read_packet<MOUSE_MOVE_REL_PACKET>(bytes), session);
     break;
-  }
+  case MOUSE_MOVE_ABS:
+    mouse_move_abs(read_packet<MOUSE_MOVE_ABS_PACKET>(bytes), session);
+    break;
   case MOUSE_BUTTON_PRESS:
-  case MOUSE_BUTTON_RELEASE: {
-    logs::log(logs::trace, "[INPUT] Received input of type: MOUSE_BUTTON_PACKET");
-    auto btn_pkt = static_cast<MOUSE_BUTTON_PACKET *>(pkt);
-    mouse_button(*btn_pkt, session);
+  case MOUSE_BUTTON_RELEASE:
+    mouse_button(read_packet<MOUSE_BUTTON_PACKET>(bytes), session);
     break;
-  }
-  case MOUSE_SCROLL: {
-    logs::log(logs::trace, "[INPUT] Received input of type: MOUSE_SCROLL_PACKET");
-    auto scroll_pkt = (static_cast<MOUSE_SCROLL_PACKET *>(pkt));
-    mouse_scroll(*scroll_pkt, session);
+  case MOUSE_SCROLL:
+    mouse_scroll(read_packet<MOUSE_SCROLL_PACKET>(bytes), session);
     break;
-  }
-  case MOUSE_HSCROLL: {
-    logs::log(logs::trace, "[INPUT] Received input of type: MOUSE_HSCROLL_PACKET");
-    auto scroll_pkt = (static_cast<MOUSE_HSCROLL_PACKET *>(pkt));
-    mouse_h_scroll(*scroll_pkt, session);
+  case MOUSE_HSCROLL:
+    mouse_h_scroll(read_packet<MOUSE_HSCROLL_PACKET>(bytes), session);
     break;
-  }
   case KEY_PRESS:
-  case KEY_RELEASE: {
-    logs::log(logs::trace, "[INPUT] Received input of type: KEYBOARD_PACKET");
-    auto key_pkt = static_cast<KEYBOARD_PACKET *>(pkt);
-    keyboard_key(*key_pkt, session);
+  case KEY_RELEASE:
+    keyboard_key(read_packet<KEYBOARD_PACKET>(bytes), session);
     break;
-  }
+  case TOUCH:
+    touch(read_packet<TOUCH_PACKET>(bytes), session);
+    break;
+  case PEN:
+    pen(read_packet<PEN_PACKET>(bytes), session);
+    break;
+  case CONTROLLER_ARRIVAL:
+    controller_arrival(read_packet<CONTROLLER_ARRIVAL_PACKET>(bytes), session, connected_client);
+    break;
+  case CONTROLLER_MULTI:
+    controller_multi(read_packet<CONTROLLER_MULTI_PACKET>(bytes), session, connected_client);
+    break;
+  case CONTROLLER_TOUCH:
+    controller_touch(read_packet<CONTROLLER_TOUCH_PACKET>(bytes), session);
+    break;
+  case CONTROLLER_MOTION:
+    controller_motion(read_packet<CONTROLLER_MOTION_PACKET>(bytes), session);
+    break;
+  case CONTROLLER_BATTERY:
+    controller_battery(read_packet<CONTROLLER_BATTERY_PACKET>(bytes), session);
+    break;
   case UTF8_TEXT: {
-    logs::log(logs::trace, "[INPUT] Received input of type: UTF8_TEXT");
-    auto txt_pkt = static_cast<UTF8_TEXT_PACKET *>(pkt);
-    utf8_text(*txt_pkt, session);
-    break;
-  }
-  case TOUCH: {
-    logs::log(logs::trace, "[INPUT] Received input of type: TOUCH");
-    auto touch_pkt = static_cast<TOUCH_PACKET *>(pkt);
-    touch(*touch_pkt, session);
-    break;
-  }
-  case PEN: {
-    logs::log(logs::trace, "[INPUT] Received input of type: PEN");
-    auto pen_pkt = static_cast<PEN_PACKET *>(pkt);
-    pen(*pen_pkt, session);
-    break;
-  }
-  case CONTROLLER_ARRIVAL: {
-    logs::log(logs::trace, "[INPUT] Received input of type: CONTROLLER_ARRIVAL");
-    auto new_controller = static_cast<CONTROLLER_ARRIVAL_PACKET *>(pkt);
-    controller_arrival(*new_controller, session, connected_client);
-    break;
-  }
-  case CONTROLLER_MULTI: {
-    logs::log(logs::trace, "[INPUT] Received input of type: CONTROLLER_MULTI");
-    auto controller_pkt = static_cast<CONTROLLER_MULTI_PACKET *>(pkt);
-    controller_multi(*controller_pkt, session, connected_client);
-    break;
-  }
-  case CONTROLLER_TOUCH: {
-    logs::log(logs::trace, "[INPUT] Received input of type: CONTROLLER_TOUCH");
-    auto touch_pkt = static_cast<CONTROLLER_TOUCH_PACKET *>(pkt);
-    controller_touch(*touch_pkt, session);
-    break;
-  }
-  case CONTROLLER_MOTION: {
-    logs::log(logs::trace, "[INPUT] Received input of type: CONTROLLER_MOTION");
-    auto motion_pkt = static_cast<CONTROLLER_MOTION_PACKET *>(pkt);
-    controller_motion(*motion_pkt, session);
-    break;
-  }
-  case CONTROLLER_BATTERY: {
-    logs::log(logs::trace, "[INPUT] Received input of type: CONTROLLER_BATTERY");
-    auto battery_pkt = static_cast<CONTROLLER_BATTERY_PACKET *>(pkt);
-    controller_battery(*battery_pkt, session);
+    UTF8_TEXT_PACKET text{};
+    std::memcpy(&text, bytes.data(), bytes.size());
+    utf8_text(text, session);
     break;
   }
   case HAPTICS:
-    logs::log(logs::trace, "[INPUT] Received input of type: HAPTICS");
     break;
+  default:
+    return false;
   }
+  return true;
 }
 } // namespace control

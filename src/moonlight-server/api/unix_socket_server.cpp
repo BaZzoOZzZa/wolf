@@ -330,33 +330,31 @@ UnixSocketServer::UnixSocketServer(boost::asio::io_context &io_context,
                       send_http(socket, 200, state_->http.openapi_schema());
                     }});
 
-  state_->sse_keepalive_timer.async_wait([this](auto e) { sse_keepalive(e); });
+  state_->sse_keepalive_timer.async_wait(
+      boost::asio::bind_executor(state_->strand, [this](auto e) { sse_keepalive(e); }));
   start_accept();
 }
 
 void UnixSocketServer::sse_keepalive(const boost::system::error_code &e) {
-  if (e && e.value() != boost::asio::error::operation_aborted) {
+  if (e == boost::asio::error::operation_aborted)
+    return;
+  if (e) {
     logs::log(logs::warning, "[API] Error in keepalive timer: {}", e.message());
     return;
   }
   cleanup_sockets();
   sse_broadcast(":keepalive\n\n");
   state_->sse_keepalive_timer.expires_after(SSE_KEEPALIVE_INTERVAL);
-  state_->sse_keepalive_timer.async_wait([this](auto e) { sse_keepalive(e); });
+  state_->sse_keepalive_timer.async_wait(
+      boost::asio::bind_executor(state_->strand, [this](auto e) { sse_keepalive(e); }));
 }
 
 void UnixSocketServer::sse_broadcast(const std::string &payload) {
-  for (auto &socket : state_->sockets) {
-    boost::asio::async_write(socket->socket,
-                             boost::asio::buffer(payload),
-                             [this, socket](const boost::system::error_code &ec, std::size_t /*length*/) {
-                               if (ec) {
-                                 logs::log(logs::debug, "[API] Error sending event: {}", ec.message());
-                                 close(*socket);
-                                 cleanup_sockets();
-                               }
-                             });
-  }
+  boost::asio::dispatch(state_->strand, [this, payload] {
+    cleanup_sockets();
+    for (auto &socket : state_->sockets)
+      send_data(socket, payload);
+  });
 }
 
 void UnixSocketServer::broadcast_event(const std::string &event_type, const std::string &event_data) {
@@ -371,7 +369,8 @@ void UnixSocketServer::cleanup_sockets() {
 }
 
 void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket, int status_code, std::string_view body) {
-  send_http(socket, status_code, {{"Content-Length: " + std::to_string(body.size())}}, body);
+  const auto length_header = "Content-Length: " + std::to_string(body.size());
+  send_http(socket, status_code, {length_header}, body);
 }
 
 void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket,
@@ -383,13 +382,41 @@ void UnixSocketServer::send_http(std::shared_ptr<UnixSocket> socket,
 }
 
 void UnixSocketServer::send_data(std::shared_ptr<UnixSocket> socket, std::string_view data) {
+  auto owned = std::make_shared<const std::string>(data);
+  boost::asio::dispatch(state_->strand, [this, socket, owned] {
+    if (!socket->is_alive)
+      return;
+    // A slow SSE reader must not retain an unbounded backlog.
+    constexpr size_t max_queued_bytes = 8 * 1024 * 1024;
+    if (owned->size() > max_queued_bytes - socket->queued_bytes) {
+      close(*socket);
+      return;
+    }
+    bool idle = socket->writes.empty();
+    socket->queued_bytes += owned->size();
+    socket->writes.push_back(owned);
+    if (idle)
+      write_next(socket);
+  });
+}
+
+void UnixSocketServer::write_next(std::shared_ptr<UnixSocket> socket) {
+  // Exactly one composed write at a time. Capture the actual buffer as well as
+  // the connection: close() may clear the pending queue before completion.
+  auto owned = socket->writes.front();
   boost::asio::async_write(socket->socket,
-                           boost::asio::buffer(data),
-                           [this, socket](const boost::system::error_code &ec, std::size_t /*length*/) {
-                             if (ec) {
-                               logs::log(logs::error, "[API] Error sending data: {}", ec.message());
+                           boost::asio::buffer(*owned),
+                           [this, socket, owned](const boost::system::error_code &ec, std::size_t) {
+                             if (ec || !socket->is_alive) {
                                close(*socket);
+                               return;
                              }
+                             socket->queued_bytes -= owned->size();
+                             socket->writes.pop_front();
+                             if (!socket->writes.empty())
+                               write_next(socket);
+                             else if (socket->close_when_drained)
+                               close(*socket);
                            });
 }
 
@@ -397,8 +424,8 @@ void UnixSocketServer::handle_request(const HTTPRequest &req, std::shared_ptr<Un
   logs::log(logs::debug, "[API] Received request: {} {} - {}", rfl::enum_to_string(req.method), req.path, req.body);
 
   if (!state_->http.handle_request(req, socket)) {
+    socket->close_when_drained = true;
     send_http(socket, 404, "");
-    close(*socket);
   }
 }
 
@@ -473,21 +500,26 @@ void UnixSocketServer::start_connection(std::shared_ptr<UnixSocket> socket) {
 }
 
 void UnixSocketServer::start_accept() {
-  auto socket = std::make_shared<UnixSocket>(
-      UnixSocket{.socket = boost::asio::local::stream_protocol::socket(state_->io_context)});
-  state_->acceptor.async_accept(socket->socket, [this, socket](const boost::system::error_code &ec) {
-    if (!ec) {
-      start_accept();           // Immediately start accepting a new connection
-      start_connection(socket); // Start reading the request from the new connection
-    } else {
-      logs::log(logs::error, "[API] Error accepting connection: {}", ec.message());
-      close(*socket);
-    }
-  });
+  auto socket =
+      std::make_shared<UnixSocket>(UnixSocket{.socket = boost::asio::local::stream_protocol::socket(state_->strand)});
+  state_->acceptor.async_accept(
+      socket->socket,
+      boost::asio::bind_executor(state_->strand, [this, socket](const boost::system::error_code &ec) {
+        if (!ec) {
+          start_accept();           // Immediately start accepting a new connection
+          start_connection(socket); // Start reading the request from the new connection
+        } else {
+          logs::log(logs::error, "[API] Error accepting connection: {}", ec.message());
+          close(*socket);
+        }
+      }));
 }
 
 void UnixSocketServer::close(UnixSocket &socket) {
-  socket.socket.close();
   socket.is_alive = false;
+  boost::system::error_code ignored;
+  socket.socket.close(ignored);
+  socket.writes.clear();
+  socket.queued_bytes = 0;
 }
 } // namespace wolf::api
