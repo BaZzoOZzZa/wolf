@@ -74,6 +74,9 @@ public:
   bool prepared_admission(const std::shared_ptr<const TransferHandle> &,
                           const control::ConnectionScope &,
                           const control::PeerToken &) const;
+  // before_cleanup is an optional INTERNAL test synchronization hook: called
+  // after actual Runtime result + gate unlock, before temporary owners retire.
+  // Throwing quarantines/refuses. The hook is not a completion acknowledgement.
   streaming::ConsumerAdmission admit_prepared(const std::shared_ptr<const TransferHandle> &,
                                               const control::ConnectionScope &,
                                               const control::PeerToken &,

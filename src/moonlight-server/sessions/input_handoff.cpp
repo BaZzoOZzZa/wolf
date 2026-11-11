@@ -3,6 +3,42 @@
 #include <stdexcept>
 namespace sessions {
 using namespace std::chrono_literals;
+namespace {
+class AdmissionRetirement {
+  std::shared_ptr<control::seat_detail::Gate> gate_;
+  control::GrantHandle owner_;
+
+public:
+  explicit AdmissionRetirement(std::shared_ptr<control::seat_detail::Gate> gate) : gate_(std::move(gate)) {}
+  AdmissionRetirement(const AdmissionRetirement &) = delete;
+  bool reserve(const control::GrantHandle &owner) { // gate held; never allocates
+    if (!owner || gate_->admission_cleanup_pending || gate_->admission_cleanup_owner) {
+      gate_->close(true);
+      return false;
+    }
+    owner_ = owner;
+    gate_->admission_cleanup_owner = owner;
+    gate_->admission_cleanup_pending = true;
+    return true;
+  }
+  ~AdmissionRetirement() {
+    if (!owner_)
+      return; // no actual Runtime admission was attempted
+    // Declared before EVERY temporary callable owner in admit_prepared: their
+    // destructors have actually returned before this acknowledgement can run.
+    std::lock_guard lock(gate_->mutex);
+    const auto &saved = gate_->admission_cleanup_owner;
+    if (!gate_->admission_cleanup_pending || !saved || !saved->token.matches(owner_->token) ||
+        !saved->owner.connection.matches(owner_->owner.connection) || !saved->owner.peer.matches(owner_->owner.peer)) {
+      gate_->close(true); // inconsistent accounting never acknowledges retirement
+    } else {
+      gate_->admission_cleanup_owner.reset();
+      gate_->admission_cleanup_pending = false;
+    }
+    gate_->wake.notify_all();
+  }
+};
+} // namespace
 TransferHandle::TransferHandle(std::shared_ptr<control::seat_detail::Gate> gate,
                                TransferToken token,
                                AuthorizedSelection selection,
@@ -132,6 +168,13 @@ void InputHandoff::poll() {
       quarantine_locked();
       return;
     }
+    if (g.admission_cleanup_pending || g.admission_cleanup_owner) {
+      const auto &owner = g.admission_cleanup_owner;
+      if (!g.admission_cleanup_pending || !owner || !owner->token.matches(pending_->old_grant->token) ||
+          !owner->owner.connection.matches(pending_->old_grant->owner.connection))
+        quarantine_locked();
+      return; // neutral remains independent; the single decision deadline above still applies
+    }
     if (g.writing || g.sends || g.neutral_running || g.neutral_requested)
       return;
     if (!g.neutral_done || !g.neutral || !g.device.matches(seat_->backend_->generation()) ||
@@ -190,6 +233,7 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                                                           streaming::ConsumerCorrelation correlation,
                                                           streaming::ConsumerRuntime::Work work,
                                                           std::function<void()> before_cleanup) {
+  AdmissionRetirement retirement(seat_->gate_);
   // These actual callable owners are prepared before the gate. Swap leaves the
   // function parameters empty, including on implementations retaining moved-from
   // std::function state. Parameters must not release payload after local cleanup.
@@ -214,6 +258,10 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
       if (status.failed || status.stop_requested || !handle->validate_(handle->prepared_grant->owner)) {
         quarantine_locked();
         return streaming::ConsumerAdmission::Revoked;
+      }
+      if (!retirement.reserve(handle->prepared_grant)) {
+        quarantine_locked();
+        return streaming::ConsumerAdmission::Capacity;
       }
       auto admitted = consumers_->admit(connection,
                                         handle->prepared_grant->owner.source,

@@ -158,3 +158,53 @@ handle replacement, and throwing transaction preparation. Original test bodies
 are preserved. Final GREEN/evidence are recorded separately in the F12 report.
 No ConsumerRuntime, dependency, public interface or ingress changes. Remaining
 Stage3/physical gates and the prohibition on launching WoW are unchanged.
+
+
+F12 completion refinement: Runtime's ticket proves retirement of Runtime-owned
+references; a fast worker return/cancel can precede retirement of the admission
+call's temporary owners. The seat now reserves **one** bounded cleanup slot,
+retaining the exact grant/connection, under the same gate immediately before
+actual Runtime admission. A second admission while occupied fails Capacity and
+quarantines, without calling Runtime or creating another worker. close/revoke do
+not clear this slot. An inconsistent pending/owner pair fails closed. The joint
+grant waits this fence in addition to the real saved ticket and existing fences;
+neutral does not wait it. The same5s decision deadline applies, and a late cleanup
+ack cannot reopen Quarantined.
+
+`AdmissionRetirement` is declared first, followed by retained Work, forwarded
+Work, and the owned optional hook. Work/hook function parameters are emptied with
+swap (no assumption about moved-from std::function ownership). Reverse local
+lifetime order destroys hook captures, forwarded references, and outer Work
+references outside the gate, then acknowledges under a short lock+notify. Runtime
+may keep its own Work reference longer, covered separately by the saved ticket.
+Rejected/throwing Runtime paths use the same RAII obligation. Pre-gate allocation
+failure has no published Runtime work/obligation and propagates without mutation.
+Early identity refusal publishes no consumer; cap overflow is terminal quarantine.
+
+Optional `before_cleanup` is an injected internal test synchronization seam,
+default empty, invoked only after actual Runtime result and unlock. It is neither
+a public/wire API nor a completion proof. A throwing hook quarantines/refuses;
+existing exact poll/revoke accounts for any real Runtime work. Hook invocation and
+its captures must retire before slot ack. No new executor/thread, detach, or
+ConsumerRuntime/ticket semantic change. Destructors must obey the normal C++
+nonthrowing destructor contract; no guarantee against physical hangs is invented.
+
+Validator boundary differs: bootstrap/previous-handle cleanup can finish after
+bootstrap publication or the next transaction has been installed. Validators are
+trusted authority predicates, not owners of this admission call's Work obligation.
+Their capture destruction is allowed to reenter gate methods after unlock; it is
+not an extra neutral/media completion proof. Arbitrary externally shared owners
+are not covered by the admission fence. Lifecycle notifications must still carry
+exact grant/peer identities; a destructor cannot infer authority from numeric IDs.
+The protected backend remains retained across transfers. No Stage3 enable or
+physical input delivery/isolation is claimed.
+
+Separate fence RED at b418b080b5a4bc514fc4f6d8ce4731d02c6faa8a: two cases,
+71assertions,19expected failures, normal exit42. Actual real joined ticket is true
+while hook invocation, hook capture destructor and sole outer Work destructor are
+separately gated. Healthy release must permit grant; cancel-before-ping plus fake
+deadline must quarantine and refuse late auto-grant. Additional overflow and
+throwing-hook paths exercise real Runtime cancellation. This second RED includes
+only a test-unwind declaration-order correction in the first F12 cases (atomics
+outlive joining threads); no original15case bodies/assertions were changed. Each
+RED/GREEN pair has its own exact test-byte hash in the evidence.

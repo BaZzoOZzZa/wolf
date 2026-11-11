@@ -94,6 +94,10 @@ struct Gate {
   bool writing = false, neutral_requested = true, neutral_running = false, neutral_done = false;
   size_t sends = 0, count = 0, bytes = 0, inflight_bytes = 0, head = 0;
   size_t feedback_count = 0, feedback_head = 0;
+  // One bounded admission-call cleanup obligation, independent of Runtime join.
+  // close() must preserve it; only the actual outside-gate owner retirement acks.
+  bool admission_cleanup_pending = false;
+  GrantHandle admission_cleanup_owner;
   std::array<std::optional<SeatCommand>, 256> queue;
   std::array<std::optional<SeatFeedback>, 256> feedback;
   std::optional<inputtino::checked::WriteReceipt> neutral;
