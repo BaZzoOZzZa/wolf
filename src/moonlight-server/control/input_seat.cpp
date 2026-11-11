@@ -1,5 +1,6 @@
 #include "input_seat.hpp"
 #ifdef __linux__
+#include <sessions/protected_authority.hpp>
 #include <stdexcept>
 namespace control {
 bool SeatCandidate::valid() const {
@@ -100,24 +101,33 @@ std::shared_ptr<InputSeat> InputSeat::create(SeatCandidate owner,
                                              SeatValidation validation,
                                              Factory factory,
                                              SeatPolicy policy,
-                                             SeatThreadFactory start) {
-  if (!owner.valid() || !inventory.valid() || !validation || !factory || !start || !policy.packets ||
-      policy.packets > 256 || policy.bytes < sizeof(SeatCommand) || policy.bytes > 65536)
+                                             SeatThreadFactory start,
+                                             std::shared_ptr<seat_detail::Gate> prepared_gate) {
+  if (!owner.valid() || !inventory.valid() || (!validation && !prepared_gate) || !factory || !start ||
+      !policy.packets || policy.packets > 256 || policy.bytes < sizeof(SeatCommand) || policy.bytes > 65536)
     throw std::invalid_argument("Protected seat requires explicit fresh inventory and retained authority");
   auto seat = std::shared_ptr<InputSeat>(new InputSeat);
-  seat->gate_ = std::make_shared<seat_detail::Gate>();
+  seat->gate_ = prepared_gate ? std::move(prepared_gate) : std::make_shared<seat_detail::Gate>();
   auto &g = *seat->gate_;
-  g.destination = owner.destination;
-  g.current = std::make_shared<const SeatGrant>(std::move(owner));
-  g.initial_validation = std::move(validation);
-  g.policy = policy;
+  auto initial = std::make_shared<const SeatGrant>(std::move(owner));
+  {
+    std::lock_guard lock(g.mutex);
+    g.destination = initial->owner.destination;
+    g.current = std::move(initial);
+    g.initial_validation.swap(validation);
+    g.policy = policy;
+  }
   seat->router_ = std::shared_ptr<SeatFeedbackRouter>(new SeatFeedbackRouter(seat->gate_));
   seat->backend_ = factory([router = seat->router_](int low, int high) { router->intake(low, high); });
   if (!seat->backend_)
     throw std::invalid_argument("Missing checked backend");
-  g.device = seat->backend_->generation();
-  if (!g.device.matches(g.device))
+  const auto device = seat->backend_->generation();
+  if (!device.matches(device))
     throw std::invalid_argument("Missing device generation");
+  {
+    std::lock_guard lock(g.mutex);
+    g.device = device;
+  }
   seat->worker_ = start([gate = seat->gate_, backend = seat->backend_] { work(gate, backend); });
   if (!seat->worker_.joinable())
     throw std::runtime_error("Seat launch returned no owned thread");
@@ -169,6 +179,32 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
     } catch (...) {
       receipt.outcome = inputtino::checked::WriteOutcome::Unknown;
     }
+    bool protected_valid = true;
+    std::shared_ptr<const sessions::protected_authority::Permit> protected_bootstrap;
+    if (gate->authority) {
+      // This complete scope retires actual validator captures before bootstrap
+      // publication. close/status remain available while invocation/cleanup waits.
+      sessions::protected_authority::Retirement retirement(gate);
+      SeatValidation validation;
+      bool bootstrap = false;
+      {
+        std::lock_guard lock(gate->mutex);
+        bootstrap = gate->bootstrap;
+        if (bootstrap && retirement.reserve_locked())
+          validation.swap(gate->initial_validation);
+        else if (bootstrap)
+          protected_valid = false;
+      }
+      if (bootstrap) {
+        try {
+          protected_bootstrap = gate->authority->prepare_bootstrap(backend->generation());
+          if (validation)
+            protected_valid = validation(gate->current->owner);
+        } catch (...) {
+          protected_valid = false;
+        }
+      }
+    }
     {
       std::lock_guard lock(gate->mutex);
       gate->writing = false;
@@ -185,7 +221,10 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
         if (gate->bootstrap) {
           bool valid = false;
           try {
-            valid = gate->initial_validation(gate->current->owner);
+            valid = gate->authority
+                        ? protected_valid &&
+                              gate->authority->bootstrap_locked(protected_bootstrap, gate->current->owner, gate->device)
+                        : gate->initial_validation(gate->current->owner);
           } catch (...) {
           }
           gate->bootstrap = false;

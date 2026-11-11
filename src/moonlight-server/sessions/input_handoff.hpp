@@ -23,6 +23,7 @@ struct AuthorizedSelection {
   control::GrantHandle expected_old;
   control::SeatCandidate candidate;
   control::SeatValidation validate;
+  std::shared_ptr<const protected_authority::Permit> authority;
 };
 class TransferHandle {
   friend class InputHandoff;
@@ -30,6 +31,7 @@ class TransferHandle {
   std::optional<streaming::ConsumerDrainTicket> ticket_;
   std::atomic<TransferStatus> status_{TransferStatus::Pending};
   control::SeatValidation validate_;
+  std::shared_ptr<const protected_authority::Permit> authority_;
   TransferHandle(std::shared_ptr<control::seat_detail::Gate>,
                  TransferToken,
                  AuthorizedSelection,

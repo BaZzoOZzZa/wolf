@@ -327,3 +327,22 @@ not established here. Remote process-stop UI is not needed: default deny; produc
 that capability is later requested. No new UI before Penpot. WoW must never launch without new
 explicit permission; current game/prefix untouched, future physical trials use local games after
 separate software/permission gates. No build, runtime, device or heavy slot was used for this plan.
+
+## 8. 3C1 implementation checkpoint (disabled; independent review pending)
+
+Manager's subsequent grant authorizes the nine scoped paths, not §3–6 ingress wiring.
+`protected_authority` now seals private 3A stores, mints internal typed permits and owns a cell on
+actual Seat gate. Operator updates close before versioned publication; publication cannot recover
+quarantine. The protected factory installs cell/bootstrap data before backend callbacks/worker start.
+Actual Handoff request/poll/admission and bootstrap require typed authority; default internal Seat
+behavior remains separate. Protected additional validators execute outside gate and are not authority.
+Retirement scopes cover actual replacement owners and accepted request/bootstrap validator temporaries;
+sealed historical evidence/permits carry no arbitrary resource callback. A provider RetirementResource
+is an optional trusted lifecycle seam: retirement/destruction outside locks, throwing retirement retains
+Unknown capacity. It is not a device delivery or TLS proof. No new worker or ingress is introduced.
+
+Code-level failure checks and native evidence will be recorded separately before this checkpoint is
+submitted. Initial implementation is not a PASS claim. Allocation failure before gate is source-audited,
+not globally fault-injected. Fact/update/permit APIs are trusted C++ capabilities, not unforgeable public
+network credentials. Retry/key policy, real TLS provider, provisioning/readiness and all subsequent
+orchestration/route work remain proposed only. WoW/game/prefix/device restrictions are unchanged.

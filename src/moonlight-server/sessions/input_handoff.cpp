@@ -1,5 +1,6 @@
 #include "input_handoff.hpp"
 #ifdef __linux__
+#include "protected_authority.hpp"
 #include <stdexcept>
 namespace sessions {
 using namespace std::chrono_literals;
@@ -43,8 +44,8 @@ TransferHandle::TransferHandle(std::shared_ptr<control::seat_detail::Gate> gate,
                                TransferToken token,
                                AuthorizedSelection selection,
                                std::chrono::steady_clock::time_point time)
-    : gate_(std::move(gate)), validate_(std::move(selection.validate)), identity(std::move(token)),
-      old_grant(std::move(selection.expected_old)),
+    : gate_(std::move(gate)), validate_(std::move(selection.validate)), authority_(std::move(selection.authority)),
+      identity(std::move(token)), old_grant(std::move(selection.expected_old)),
       prepared_grant(std::make_shared<const control::SeatGrant>(std::move(selection.candidate))), started(time) {}
 std::optional<streaming::ConsumerDrainTicket> TransferHandle::saved_ticket() const {
   std::lock_guard lock(gate_->mutex);
@@ -94,7 +95,21 @@ void InputHandoff::quarantine_locked() {
   if (pending_ && pending_->status() == TransferStatus::Pending)
     pending_->status_ = TransferStatus::Quarantined;
 }
-TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection selection) {
+TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection supplied) {
+  protected_authority::Retirement authority_retirement(seat_->gate_);
+  AuthorizedSelection selection{std::move(supplied.expected_old),
+                                std::move(supplied.candidate),
+                                {},
+                                std::move(supplied.authority)};
+  selection.validate.swap(supplied.validate); // parameter has no callback owner after local RAII ack
+  bool additional_valid = true;
+  if (seat_->gate_->authority && selection.validate) {
+    try {
+      additional_valid = selection.validate(selection.candidate);
+    } catch (...) {
+      additional_valid = false;
+    }
+  }
   // Retain the actual callable, not a potentially independent std::function copy.
   // Both allocations happen before the gate. Constructor rollback may destroy
   // its wrapper under the gate, but cannot retire this callable until unlock.
@@ -118,11 +133,18 @@ TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection
   if (!identity || !g.open || !g.matches(selection.expected_old) || !selection.candidate.valid() ||
       !selection.candidate.destination.matches(g.destination) ||
       selection.expected_old->owner.connection.matches(selection.candidate.connection) ||
-      selection.expected_old->owner.peer.matches(selection.candidate.peer) || !selection.validate)
+      selection.expected_old->owner.peer.matches(selection.candidate.peer) || (!selection.validate && !g.authority))
     return {TransferAdmission::Invalid, {}};
   try {
-    if (!selection.validate(selection.candidate))
+    if (g.authority &&
+        (!additional_valid || !g.authority->permits_locked(selection.authority, selection.candidate, g.device)))
       return {TransferAdmission::Invalid, {}};
+    if (!g.authority && !selection.validate(selection.candidate))
+      return {TransferAdmission::Invalid, {}};
+    if (g.authority && !authority_retirement.reserve_locked()) {
+      quarantine_locked();
+      return {TransferAdmission::Quarantined, {}};
+    }
     // Allocate complete strong transaction/prepared grant BEFORE revoking anything.
     auto transaction = std::shared_ptr<TransferHandle>(
         new TransferHandle(seat_->gate_, std::move(identity), std::move(selection), now_()));
@@ -131,6 +153,8 @@ TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection
     // inside the serial domain, including when a later revoke throws.
     retired_transaction = std::move(pending_);
     pending_ = std::move(transaction);
+    if (g.authority)
+      g.authority->pending_locked(pending_->authority_);
     g.close(false);
     // Exact old scope, still held/current here. No ID lookup or shadow registry.
     pending_->ticket_ = consumers_->revoke(pending_->old_grant->owner.connection);
@@ -148,6 +172,31 @@ bool InputHandoff::drain_complete(const std::optional<streaming::ConsumerDrainTi
   return ticket && ticket->connection.matches(scope) && ticket->complete();
 }
 void InputHandoff::poll() {
+  bool additional_valid = true, validation_ready = !seat_->gate_->authority;
+  TransferToken observed_identity;
+  if (seat_->gate_->authority) {
+    // Retain the ACTUAL validator owner while invoking outside the gate. This
+    // temporary owner retires before its own authority cleanup acknowledgement.
+    protected_authority::Retirement retirement(seat_->gate_);
+    std::shared_ptr<TransferHandle> observed;
+    {
+      std::lock_guard lock(seat_->gate_->mutex);
+      if (pending_ && pending_->status() == TransferStatus::Pending && !seat_->gate_->authority->cleanup_locked() &&
+          retirement.reserve_locked()) {
+        observed = pending_;
+        observed_identity = observed->identity;
+      }
+    }
+    if (observed) {
+      try {
+        if (observed->validate_)
+          additional_valid = observed->validate_(observed->prepared_grant->owner);
+      } catch (...) {
+        additional_valid = false;
+      }
+      validation_ready = true;
+    }
+  }
   std::lock_guard lock(seat_->gate_->mutex);
   auto &g = *seat_->gate_;
   try {
@@ -163,12 +212,18 @@ void InputHandoff::poll() {
     const auto now = now_();
     const auto elapsed_ticks = uint64_t(now.time_since_epoch().count()) -
                                uint64_t(pending_->started.time_since_epoch().count());
-    if (g.quarantined || now < pending_->started ||
+    const bool typed_valid =
+        !g.authority || g.authority->permits_locked(pending_->authority_, pending_->prepared_grant->owner, g.device);
+    if (g.quarantined || !typed_valid || now < pending_->started ||
         elapsed_ticks >= uint64_t(std::chrono::duration_cast<Clock::duration>(5s).count()) ||
-        !pending_->validate_(pending_->prepared_grant->owner)) {
+        (!g.authority && !pending_->validate_(pending_->prepared_grant->owner)) ||
+        (g.authority && validation_ready && observed_identity.matches(pending_->identity) && !additional_valid)) {
       quarantine_locked();
       return;
     }
+    if (g.authority &&
+        (g.authority->cleanup_locked() || !validation_ready || !observed_identity.matches(pending_->identity)))
+      return;
     if (g.admission_cleanup_pending || g.admission_cleanup_owner) {
       const auto &owner = g.admission_cleanup_owner;
       if (!g.admission_cleanup_pending || !owner || !owner->token.matches(pending_->old_grant->token) ||
@@ -194,10 +249,12 @@ void InputHandoff::poll() {
     }
     // All guards and publication share input/send reservation serial gate.
     if (!g.matches(pending_->old_grant) || !pending_->prepared_grant->owner.destination.matches(g.destination) ||
-        !pending_->validate_(pending_->prepared_grant->owner)) {
+        (!g.authority && !pending_->validate_(pending_->prepared_grant->owner))) {
       quarantine_locked();
       return;
     }
+    if (g.authority)
+      g.authority->commit_locked(pending_->authority_);
     g.current = pending_->prepared_grant;
     g.open = true;
     pending_->status_ = TransferStatus::Granted;
@@ -225,7 +282,11 @@ bool InputHandoff::prepared_admission(const std::shared_ptr<const TransferHandle
   return handle && handle->status() == TransferStatus::Granted && seat_->gate_->open && !seat_->gate_->quarantined &&
          seat_->gate_->matches(handle->prepared_grant) &&
          connection.matches(handle->prepared_grant->owner.connection) &&
-         peer.matches(handle->prepared_grant->owner.peer);
+         peer.matches(handle->prepared_grant->owner.peer) &&
+         (!seat_->gate_->authority || (!seat_->gate_->authority->cleanup_locked() &&
+                                       seat_->gate_->authority->permits_locked(handle->authority_,
+                                                                               handle->prepared_grant->owner,
+                                                                               seat_->gate_->device)));
 }
 streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<const TransferHandle> &handle,
                                                           const control::ConnectionScope &connection,
@@ -234,6 +295,14 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                                                           streaming::ConsumerCorrelation correlation,
                                                           streaming::ConsumerRuntime::Work work,
                                                           std::function<void()> before_cleanup) {
+  bool additional_valid = true;
+  if (seat_->gate_->authority && handle && handle->validate_) {
+    try {
+      additional_valid = handle->validate_(handle->prepared_grant->owner);
+    } catch (...) {
+      additional_valid = false;
+    }
+  }
   AdmissionRetirement retirement(seat_->gate_);
   // These actual callable owners are prepared before the gate. Swap leaves the
   // function parameters empty, including on implementations retaining moved-from
@@ -256,7 +325,10 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
       return streaming::ConsumerAdmission::Revoked;
     try {
       const auto status = seat_->backend_->listener_status();
-      if (status.failed || status.stop_requested || !handle->validate_(handle->prepared_grant->owner)) {
+      if (status.failed || status.stop_requested ||
+          (g.authority ? (!additional_valid || g.authority->cleanup_locked() ||
+                          !g.authority->permits_locked(handle->authority_, handle->prepared_grant->owner, g.device))
+                       : !handle->validate_(handle->prepared_grant->owner))) {
         quarantine_locked();
         return streaming::ConsumerAdmission::Revoked;
       }

@@ -9,7 +9,12 @@
 
 namespace sessions {
 class InputHandoff;
-}
+namespace protected_authority {
+class Cell;
+class ProtectedAuthorityDomain;
+class Permit;
+} // namespace protected_authority
+} // namespace sessions
 namespace control {
 using wolf::core::sessions::ConnectionScope;
 using wolf::core::sessions::RunScope;
@@ -88,6 +93,7 @@ struct Gate {
   DeviceGeneration device;
   GrantHandle current;
   SeatValidation initial_validation;
+  std::shared_ptr<sessions::protected_authority::Cell> authority; // installed before protected backend/worker start
   SeatPolicy policy;
   bool coordinator_reserved = false;
   bool open = false, bootstrap = true, quarantined = false, shutdown = false;
@@ -135,6 +141,7 @@ public:
 };
 class InputSeat {
   friend class sessions::InputHandoff;
+  friend class sessions::protected_authority::ProtectedAuthorityDomain;
   std::shared_ptr<seat_detail::Gate> gate_;
   std::shared_ptr<SeatFeedbackRouter> router_;
   std::shared_ptr<CheckedXboxBackend> backend_;
@@ -149,8 +156,13 @@ public:
 
 private:
   friend class InputSeatDomain;
-  static std::shared_ptr<InputSeat>
-      create(SeatCandidate, ProtectedInventory, SeatValidation, Factory, SeatPolicy, SeatThreadFactory);
+  static std::shared_ptr<InputSeat> create(SeatCandidate,
+                                           ProtectedInventory,
+                                           SeatValidation,
+                                           Factory,
+                                           SeatPolicy,
+                                           SeatThreadFactory,
+                                           std::shared_ptr<seat_detail::Gate> prepared_gate = {});
 
 public:
   SeatAdmission submit(SeatCommand);

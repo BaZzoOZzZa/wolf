@@ -273,3 +273,13 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-control-loop-tests COMMAND wolf-control-loop-tests)
     set_tests_properties(wolf-control-loop-tests PROPERTIES LABELS "control;isolated" TIMEOUT 90)
 endif ()
+
+# Disabled serial protected authority on actual Seat/Handoff/Runtime and sealed
+# AccessStore. Software-only injected checked IO; no ingress or device creation.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-protected-authority-tests testProtectedAuthority.cpp)
+    target_compile_features(wolf-protected-authority-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-protected-authority-tests PRIVATE wolf::runner Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-protected-authority-tests COMMAND wolf-protected-authority-tests)
+    set_tests_properties(wolf-protected-authority-tests PROPERTIES LABELS "authority;isolated" TIMEOUT 90)
+endif ()
