@@ -67,15 +67,16 @@ struct Fake : std::enable_shared_from_this<Fake> {
       before = s.before_callback;
       after = s.after_callback;
     }
-    if (before)
+    if (before && (p->flags & ENET_PACKET_FLAG_RELIABLE))
       before->wait();
     if (s.marker)
       s.marker(p);
-    if (after)
+    if (after && (p->flags & ENET_PACKET_FLAG_RELIABLE))
       after->wait();
   }
   void destroy_packet(ENetPacket *p) {
     affinity();
+    const bool gated = p->flags & ENET_PACKET_FLAG_RELIABLE;
     marker = p->freeCallback;
     auto *prev = freeing;
     freeing = this;
@@ -88,7 +89,7 @@ struct Fake : std::enable_shared_from_this<Fake> {
       std::lock_guard lock(mutex);
       after = after_free;
     }
-    if (after)
+    if (after && gated)
       after->wait();
   }
   void release(bool sent) {
@@ -476,4 +477,114 @@ TEST_CASE("Owned control legacy credit cap includes popped and ENet-owned packet
   f.finish();
   REQUIRE(f.fake->frees >= 257);
   REQUIRE_FALSE(peer.sender->send("closed"));
+}
+
+TEST_CASE("Owned actual loop optional feedback adapter fences real handoff across service stack", "[control-loop]") {
+  Fixture f;
+  auto before = std::make_shared<Gate>(), after = std::make_shared<Gate>(), freed = std::make_shared<Gate>();
+  f.fake->before_callback = before;
+  f.fake->after_callback = after;
+  f.fake->after_free = freed;
+  f.fake->hold = true;
+  f.start();
+  f.ready();
+  auto first = f.connect();
+  auto second_session = f.session;
+  second_session.session_id = 43;
+  second_session.enet_secret_payload = 456;
+  second_session.connection_scope = wolf::core::sessions::ConnectionScope::fresh(43);
+  second_session.run_scope = wolf::core::sessions::RunScope::fresh("43");
+  second_session.control_crypto = std::make_shared<ControlCryptoState>();
+  second_session.control_crypto->mode = EncryptionMode::v2;
+  f.sessions->store(immer::vector<wolf::core::events::StreamSession>{f.session, second_session});
+  f.fake->push(ENET_EVENT_TYPE_CONNECT, 1, 456);
+  REQUIRE(eventually([&] { return f.loop->peers().size() == 2; }));
+  f.fake->push(ENET_EVENT_TYPE_RECEIVE, 1, 0, f.encrypted(1));
+  REQUIRE(eventually([&] {
+    auto p = f.loop->peers();
+    return p.size() == 2 && p[0].authenticated && p[1].authenticated;
+  }));
+  PeerLease second;
+  for (auto &p : f.loop->peers())
+    if (p.connection.matches(second_session.connection_scope))
+      second = p;
+  REQUIRE(second.token);
+  REQUIRE_FALSE(second.token.matches(first.token));
+  InputSeatDomain seat_domain;
+  auto destination = wolf::core::sessions::RunScope::fresh("L");
+  SeatCandidate initial{f.session.run_scope,
+                        destination,
+                        f.session.connection_scope,
+                        first.token,
+                        BindingRevision::fresh(0),
+                        0};
+  auto writes = std::make_shared<std::atomic_size_t>(0);
+  auto seat = seat_domain.create(
+      initial,
+      {true, true, true},
+      [](const auto &) { return true; },
+      [writes](auto callback) {
+        inputtino::checked::detail::Io io{
+            [writes](int fd, const input_event &, size_t size) -> inputtino::checked::IoResult {
+              if (fd != 42 || size != sizeof(input_event))
+                throw std::runtime_error("unexpected IO");
+              ++*writes;
+              return {static_cast<std::ptrdiff_t>(size), 0};
+            },
+            [](int, int) {
+              std::this_thread::sleep_for(1ms);
+              return inputtino::checked::IoResult{0, 0};
+            },
+            [](int, input_event &, size_t) -> inputtino::checked::IoResult {
+              throw std::runtime_error("unexpected read");
+            },
+            [](int, unsigned long, void *) -> int { throw std::runtime_error("unexpected ioctl"); },
+            [] { return Clock::now(); }};
+        return std::make_shared<CheckedXboxBackend>(
+            inputtino::checked::Xbox::adopt({writes, 42}, std::move(io), std::move(callback), start_seat_thread));
+      });
+  REQUIRE(seat);
+  REQUIRE(eventually([&] { return bool(seat->current()); }));
+  auto backend = seat->backend_identity();
+  auto generation = seat->generation();
+  REQUIRE(f.loop->attach_feedback(seat));
+  REQUIRE_FALSE(f.loop->attach_feedback(seat));
+  seat->router()->intake(123, 456);
+  REQUIRE(eventually([&] { return f.fake->sends == 1; }));
+  auto runtime = std::make_shared<streaming::ConsumerRuntime>([](const auto &s) { return bool(s); });
+  ::sessions::InputHandoff handoff(seat, runtime);
+  SeatCandidate target{second_session.run_scope,
+                       destination,
+                       second_session.connection_scope,
+                       second.token,
+                       BindingRevision::fresh(0),
+                       15};
+  auto transfer = handoff.request(::sessions::TransferToken::fresh(0),
+                                  {seat->current(), target, [](const auto &) { return true; }});
+  REQUIRE(transfer.handle);
+  REQUIRE(transfer.handle->status() == ::sessions::TransferStatus::Pending);
+  f.fake->hold = false;
+  REQUIRE(eventually([&] { return before->entered.load(); }));
+  REQUIRE_FALSE(seat->neutral_complete());
+  REQUIRE(f.loop->status().calls > 0);
+  before->release();
+  REQUIRE(eventually([&] { return after->entered.load(); }));
+  REQUIRE_FALSE(seat->neutral_complete());
+  REQUIRE(transfer.handle->status() == ::sessions::TransferStatus::Pending);
+  after->release();
+  REQUIRE(eventually([&] { return freed->entered.load(); }));
+  REQUIRE_FALSE(seat->neutral_complete());
+  REQUIRE(transfer.handle->status() == ::sessions::TransferStatus::Pending);
+  freed->release();
+  REQUIRE(eventually([&] { return transfer.handle->status() == ::sessions::TransferStatus::Granted; }));
+  REQUIRE(seat->backend_identity() == backend);
+  REQUIRE(seat->generation().matches(generation));
+  seat->router()->intake(65535, 0);
+  REQUIRE(eventually([&] { return f.fake->sends == 2; }));
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.sent(1), key, EncryptionMode::v2, Direction::host)) ==
+          "0B010A00000000000F00FFFF0000");
+  REQUIRE(read_packet<uint32_t>(std::string_view(f.sent(1)).substr(sizeof(ControlPacket))) == 1);
+  f.finish();
+  REQUIRE(seat->quarantined());
+  REQUIRE(writes->load() >= 40);
 }

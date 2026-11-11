@@ -3,6 +3,7 @@
 #include "input_handler.hpp"
 #include <array>
 #include <map>
+#include <state/sessions.hpp>
 #include <sys/socket.h>
 
 namespace control {
