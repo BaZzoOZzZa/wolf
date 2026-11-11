@@ -326,10 +326,9 @@ struct State : std::enable_shared_from_this<State> {
     auto [client_ip, client_port] = get_ip((sockaddr *)&event.peer->address.address);
     if (event.type == ENET_EVENT_TYPE_CONNECT) {
       auto token = PeerToken::fresh(0); // EACH actual CONNECT allocation, not numeric authority
-      if (clients.contains(event.peer)) {
-        reset(event.peer); // actual old queue release before reused slot
-        forget(event.peer);
-      }
+      // ENet has already allocated this CONNECT lifetime. Reset here would
+      // tear down the NEW connection; retire only our stale association.
+      forget(event.peer);
       auto session = match_control_session(sessions, client_ip, event.data);
       if (!session || clients.size() >= config.peers) {
         disconnect(event.peer);
@@ -663,28 +662,34 @@ std::shared_ptr<ControlLoopOwner> ControlLoopDomain::start(Config config,
       config.decision_timeout.count() <= 0 || !ops.owner || !ops.create || !ops.service || !ops.packet || !ops.send ||
       !ops.destroy_packet || !ops.reset || !ops.disconnect || !ops.flush || !ops.destroy_host)
     return {};
-  auto state = std::make_shared<State>(std::move(config), std::move(sessions), std::move(bus), std::move(ops));
-  auto promise = std::make_shared<std::promise<void>>();
-  auto result = std::shared_ptr<ControlLoopOwner>(new ControlLoopOwner(state, promise->get_future().share()));
-  {
-    std::lock_guard lock(mutex_);
-    owner_ = result;
-  }
   try {
-    result->worker_ = factory([state, promise] {
-      state->run();
-      promise->set_value_at_thread_exit();
-    });
-    if (!result->worker_.joinable())
-      throw std::runtime_error("Thread factory returned no worker");
+    auto state = std::make_shared<State>(std::move(config), std::move(sessions), std::move(bus), std::move(ops));
+    auto promise = std::make_shared<std::promise<void>>();
+    auto result = std::shared_ptr<ControlLoopOwner>(new ControlLoopOwner(state, promise->get_future().share()));
+    {
+      std::lock_guard lock(mutex_);
+      owner_ = result;
+    }
+    try {
+      result->worker_ = factory([state, promise] {
+        state->run();
+        promise->set_value_at_thread_exit();
+      });
+      if (!result->worker_.joinable())
+        throw std::runtime_error("Thread factory returned no worker");
+    } catch (...) {
+      state->failed = true;
+      state->request_stop();
+      // Trusted factory: no escaped worker on throw/nonjoinable, parameter captures
+      // already retired outside all locks. No resource was published by a worker.
+      promise->set_value();
+    }
+    return result;
   } catch (...) {
-    state->failed = true;
-    state->request_stop();
-    // Trusted factory: no escaped worker on throw/nonjoinable, parameter captures
-    // already retired outside all locks. No resource was published by a worker.
-    promise->set_value();
+    // Allocation/constructor failure before a worker exists. The reserved slot
+    // stays consumed; temporary dependencies retire here, outside domain locks.
+    return {};
   }
-  return result;
 }
 ControlLoopDomain::~ControlLoopDomain() {
   auto owner = std::move(owner_);

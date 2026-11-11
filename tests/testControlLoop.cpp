@@ -606,3 +606,32 @@ TEST_CASE("Owned control stop during service discards late ingress and preserves
   REQUIRE(f.loop->peers().empty());
   REQUIRE(f.fake->sends == 0);
 }
+
+TEST_CASE("Owned control constructor refusal retains start slot without host publication", "[control-loop]") {
+  Fixture f;
+  f.config.now = []() -> Clock::time_point { throw std::runtime_error("constructor clock"); };
+  REQUIRE_FALSE(f.domain.start(f.config, f.sessions, f.bus, f.fake->ops()));
+  REQUIRE(f.fake->creates == 0);
+  f.config.now = [] { return Clock::now(); };
+  REQUIRE_FALSE(f.domain.start(f.config, f.sessions, f.bus, f.fake->ops()));
+}
+TEST_CASE("Owned control CONNECT reuse retires old association without resetting new allocation", "[control-loop]") {
+  Fixture f;
+  f.start();
+  f.ready();
+  auto first = f.connect();
+  f.fake->push(ENET_EVENT_TYPE_CONNECT, 0, 123);
+  REQUIRE(eventually([&] {
+    auto p = f.loop->peers();
+    return p.size() == 1 && !p[0].token.matches(first.token);
+  }));
+  REQUIRE_FALSE(first.sender->send("stale"));
+  REQUIRE_FALSE(f.loop->peers()[0].authenticated);
+  REQUIRE(f.fake->resets == 0);
+  f.fake->push(ENET_EVENT_TYPE_RECEIVE, 0, 0, f.encrypted(1));
+  REQUIRE(eventually([&] { return f.loop->peers()[0].authenticated; }));
+  REQUIRE(f.loop->peers()[0].sender->send("new allocation"));
+  REQUIRE(eventually([&] { return f.fake->sends == 1; }));
+  REQUIRE(decrypt_packet(f.sent(0), key, EncryptionMode::v2, Direction::host) == "new allocation");
+  f.finish();
+}
