@@ -295,14 +295,12 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
                                                           streaming::ConsumerCorrelation correlation,
                                                           streaming::ConsumerRuntime::Work work,
                                                           std::function<void()> before_cleanup) {
+  // Same bounded slot as protected poll: reserve before invoking the actual
+  // retained callable. Keep it through Work/validator owner destruction, outside
+  // all locks. No extra executor, copied callback or caller serialization needed.
+  protected_authority::Retirement invocation(seat_->gate_);
+  const auto retained_handle = handle;
   bool additional_valid = true;
-  if (seat_->gate_->authority && handle && handle->validate_) {
-    try {
-      additional_valid = handle->validate_(handle->prepared_grant->owner);
-    } catch (...) {
-      additional_valid = false;
-    }
-  }
   AdmissionRetirement retirement(seat_->gate_);
   // These actual callable owners are prepared before the gate. Swap leaves the
   // function parameters empty, including on implementations retaining moved-from
@@ -315,6 +313,29 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
   };
   std::function<void()> cleanup_hook;
   cleanup_hook.swap(before_cleanup);
+  if (seat_->gate_->authority) {
+    {
+      std::lock_guard lock(seat_->gate_->mutex);
+      auto &g = *seat_->gate_;
+      if (!retained_handle || retained_handle->status() != TransferStatus::Granted || !g.open || g.quarantined ||
+          !g.matches(retained_handle->prepared_grant) ||
+          !connection.matches(retained_handle->prepared_grant->owner.connection) ||
+          !peer.matches(retained_handle->prepared_grant->owner.peer) ||
+          !g.authority->permits_locked(retained_handle->authority_, retained_handle->prepared_grant->owner, g.device))
+        return streaming::ConsumerAdmission::Revoked;
+      // Ordinary overlap is refusal, not a fault on the healthy current grant.
+      if (g.authority->cleanup_locked())
+        return streaming::ConsumerAdmission::Capacity;
+      if (!invocation.reserve_locked())
+        return streaming::ConsumerAdmission::Capacity;
+    }
+    try {
+      if (retained_handle->validate_)
+        additional_valid = retained_handle->validate_(retained_handle->prepared_grant->owner);
+    } catch (...) {
+      additional_valid = false;
+    }
+  }
   bool runtime_returned = false;
   auto result = [&] {
     std::lock_guard lock(seat_->gate_->mutex);
@@ -326,7 +347,7 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
     try {
       const auto status = seat_->backend_->listener_status();
       if (status.failed || status.stop_requested ||
-          (g.authority ? (!additional_valid || g.authority->cleanup_locked() ||
+          (g.authority ? (!additional_valid ||
                           !g.authority->permits_locked(handle->authority_, handle->prepared_grant->owner, g.device))
                        : !handle->validate_(handle->prepared_grant->owner))) {
         quarantine_locked();
