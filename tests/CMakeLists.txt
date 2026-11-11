@@ -203,3 +203,11 @@ target_link_libraries(wolf-connection-scope-tests PRIVATE wolf::runner Catch2::C
 target_compile_features(wolf-connection-scope-tests PRIVATE cxx_std_20)
 add_test(NAME wolf-connection-scope-tests COMMAND wolf-connection-scope-tests)
 set_tests_properties(wolf-connection-scope-tests PROPERTIES LABELS "scope;isolated" TIMEOUT 30)
+
+# Consumer ownership: real registry/event adapters and private-context software
+# Gst only. No upstream main, Wolf streaming init, device or network listener.
+add_executable(wolf-consumer-runtime-tests testConsumerRuntime.cpp)
+target_link_libraries(wolf-consumer-runtime-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+target_compile_features(wolf-consumer-runtime-tests PRIVATE cxx_std_20)
+add_test(NAME wolf-consumer-runtime-tests COMMAND wolf-consumer-runtime-tests)
+set_tests_properties(wolf-consumer-runtime-tests PROPERTIES LABELS "consumer;isolated" TIMEOUT 45)

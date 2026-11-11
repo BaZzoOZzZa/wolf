@@ -256,3 +256,58 @@ effects. Consumer cancellation/drain, serial InputSeat and neutral delivery, fee
 rebinding, bounded device executor and retained-member reconciliation stay deferred.
 The tests use committed membership records and input-object identity markers; actual
 Wayland input redirection and audio/video transport are not exercised here.
+
+## Consumer ownership interface checkpoint (2026-11-11, before implementation)
+
+Ownership: `streaming/consumer_runtime.{hpp,cpp}` owns a bounded registry of
+connection records and audio/video jobs; one supervisor reaps joinable workers.
+`admit(scope, run, kind, correlation, work)` reserves before launching a worker.
+A trusted current-scope predicate is checked inside admission and again before
+activation. `revoke(scope)` is a nonblocking cancellation request, including a
+retained tombstone for stop-before-admission. Ping is only a correlator delivered
+to an already admitted job, never an authority to resolve a session by ID.
+Duplicate admission for a connection/kind cannot start another worker.
+
+`ConsumerJob` retains connection/run scopes, ping/socket, cancellation state and
+coalesced typed commands (IDR / selected producer scope). It has no raw pipeline
+pointer. Event-bus callbacks only update this state. The consumer pipeline worker
+owns a private GMainContext and applies commands there. Producer pipelines keep
+the existing runner and lifecycle behavior. Consumers publish no GameStop or
+RunEnded. Setup/drain/callback state belongs to the worker until NULL state,
+callback removal/drain, pipeline destruction and thread join are confirmed.
+
+Policy proposal: RTP wait 5 s, drain decision 5 s, supervisor/context polling
+10 ms; at most 16 unreaped jobs, 64 retained connection records and 4 Unknown
+jobs before global admission denial. These are resource/deadline policies, not
+measured latency guarantees. Same numeric ID cannot acquire replacement consumer
+resources while an earlier scope is unreaped. Unknown retains resources and
+worker ownership; late actual completion may release quarantine. Shutdown joins
+owned workers and can wait indefinitely for a stuck external driver: bounded
+classification is explicitly not bounded physical termination. No detach, forced
+kill or EOS-as-completion. Retired noncurrent, fully joined records may be pruned;
+current revoked records remain so delayed ANNOUNCE cannot reopen them.
+
+Next input/device stages consume the scoped cancellation/completion status; this
+stage does not implement neutral input, delivery proof or device executor fencing.
+
+Implementation checkpoint: `ConsumerRuntime::{admit,revoke,ping,command,status}`,
+`ConsumerJob::{cancelled,take_commands,begin_drain}` and
+`run_consumer_pipeline(description, job, hooks)` now form the production seams.
+`consumer_event_handlers` installs lifetime registrations once (no per-waiter
+registration race). The two Moonlight ANNOUNCE receivers reserve through
+`admit_consumer`, and re-run F6/F7 preparation after ping. Streaming consumer entry
+points now return a cleanup result and require an owned `ConsumerJob&`; their only
+production callers are the two Moonlight receivers. Wire/events schemas and
+RunScope/ConnectionScope interfaces are unchanged. Producer `run_pipeline` and
+both producer callers are unchanged. No common core helper changes.
+
+The new isolated fixture covers cancellation, timeout, concurrent duplicate
+admission, reused IDs, stop tombstones/capacity, Unknown/replacement denial,
+private-context command execution, EOS-before-drain, and an in-flight real Gst
+fakesink callback. Native configure/build/test qualification is pending at this
+code checkpoint. Existing assertions/targets remain intact.
+
+Frozen build commits applied in the authorized order, stable patch IDs identical:
+869e1a0 -> 21683d9 (UUID), d2c6212 -> a480299 (ENet PIC),
+a10e7e8 -> ffa5388 (test-only Beast). Their production CMake is not rewritten;
+only the new isolated consumer test target is appended to tests/CMakeLists.txt.

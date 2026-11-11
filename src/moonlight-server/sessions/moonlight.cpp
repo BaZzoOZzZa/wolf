@@ -5,6 +5,7 @@
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
 #include <state/sessions.hpp>
+#include <streaming/consumer_events.hpp>
 #include <streaming/streaming.hpp>
 
 namespace wolf::core::sessions {
@@ -14,40 +15,6 @@ struct OwnedDeviceQueue {
   std::shared_ptr<events::devices_atom_queue> queue;
 };
 using session_devices = immer::map<std::string, OwnedDeviceQueue>;
-
-/**
- * Will stop the execution until an event of type RTPPingType is triggered
- * and the signature is matching the input `sess`.
- * Returns the RTPPingType event
- */
-template <typename RTPPingType>
-immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
-  auto ping_promise = std::make_shared<std::promise<RTPPingType>>();
-  auto ping_future = ping_promise->get_future();
-  auto resolved = std::make_shared<std::atomic_bool>(false);
-
-  auto handler = ev_bus->register_handler<immer::box<RTPPingType>>(
-      [sess, ping_promise, resolved](const immer::box<RTPPingType> &ping_ev) {
-        // Check if this ping is for our session
-        if (sess->rtp_secret_payload == ping_ev->payload || // Secret payload matching
-            (!ping_ev->payload.has_value() && ping_ev->client_ip == sess->client_ip &&
-             ping_ev->client_port == sess->port)) { // Legacy IP+port matching when no payload has been passed
-          bool expected = false;
-          if (resolved->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            // Resolve the promise with the ping event data
-            ping_promise->set_value(*ping_ev);
-          }
-        }
-      });
-
-  // Wait for the promise to be fulfilled
-  auto ping_ev = ping_future.get();
-
-  // Unregister the handler since we only need it once
-  handler.unregister();
-
-  return ping_ev;
-}
 
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
@@ -271,55 +238,65 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
         }).detach();
       }));
 
+  // The registry outlives all owned workers. Captures deliberately exclude
+  // AppState/EventBus from work functions to avoid a bus -> runtime -> bus cycle.
+  auto running = app_state->running_sessions;
+  auto lobbies = app_state->lobbies;
+  auto consumers = std::make_shared<streaming::ConsumerRuntime>([running](const ConnectionScope &scope) {
+    return state::get_session_by_scope(running->load(), scope).has_value();
+  });
+  for (const auto &handler : streaming::consumer_event_handlers(app_state->event_bus, consumers))
+    handlers.push_back(handler);
+
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::VideoSession>>(
-      [app_state, ev_bus = app_state->event_bus, gst_context = app_state->gst_context](
+      [consumers, running, lobbies, gst_context = app_state->gst_context](
           const immer::box<events::VideoSession> &sess) {
-        if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+        if (!state::prepare_stream_consumer(*sess, running->load(), lobbies->load()))
           return;
-        // Start a thread that will wait for the RTP ping event
-        std::thread([app_state, sess, ev_bus, gst_context]() {
-          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
-
-          auto prepared =
-              state::prepare_stream_consumer(*sess, app_state->running_sessions->load(), app_state->lobbies->load());
-          if (!prepared)
-            return;
-          // Start streaming
-          streaming::start_streaming_video(immer::box<events::VideoSession>{*prepared},
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           gst_context,
-                                           ping_ev->video_socket.get());
-        }).detach();
+        auto admission = streaming::admit_consumer(
+            *consumers,
+            *sess,
+            streaming::ConsumerKind::Video,
+            [running, lobbies, sess, gst_context](streaming::ConsumerJob &job, const streaming::ConsumerPing &ping) {
+              auto prepared = state::prepare_stream_consumer(*sess, running->load(), lobbies->load());
+              if (!prepared || job.cancelled())
+                return true;
+              return streaming::start_streaming_video(
+                  immer::box<events::VideoSession>{*prepared},
+                  job,
+                  ping.ip,
+                  ping.port,
+                  gst_context,
+                  std::static_pointer_cast<boost::asio::ip::udp::socket>(ping.socket));
+            });
+        if (admission != streaming::ConsumerAdmission::Accepted && admission != streaming::ConsumerAdmission::Duplicate)
+          logs::log(logs::warning, "[CONSUMER] Video admission denied: {}", static_cast<int>(admission));
       }));
-
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::AudioSession>>(
-      [app_state, ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
-        if (!state::get_session_by_scope(app_state->running_sessions->load(), sess->connection_scope.get()))
+      [consumers, running, lobbies, audio_server](const immer::box<events::AudioSession> &sess) {
+        if (!state::prepare_stream_consumer(*sess, running->load(), lobbies->load()))
           return;
-        // Start a thread that will wait for the RTP ping event
-        std::thread([app_state, sess, ev_bus, audio_server]() {
-          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
-
-          auto prepared =
-              state::prepare_stream_consumer(*sess, app_state->running_sessions->load(), app_state->lobbies->load());
-          if (!prepared)
-            return;
-          // Start streaming
-          auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
-                                                : std::optional<std::string>();
-          auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
-          auto server_name = audio_server_name ? audio_server_name.value() : "";
-
-          streaming::start_streaming_audio(immer::box<events::AudioSession>{*prepared},
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           ping_ev->audio_socket.get(),
-                                           sink_name,
-                                           server_name);
-        }).detach();
+        auto admission = streaming::admit_consumer(
+            *consumers,
+            *sess,
+            streaming::ConsumerKind::Audio,
+            [running, lobbies, sess, audio_server](streaming::ConsumerJob &job, const streaming::ConsumerPing &ping) {
+              auto prepared = state::prepare_stream_consumer(*sess, running->load(), lobbies->load());
+              if (!prepared || job.cancelled())
+                return true;
+              auto server = audio_server ? audio::get_server_name(audio_server->server) : std::optional<std::string>();
+              auto sink = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
+              return streaming::start_streaming_audio(
+                  immer::box<events::AudioSession>{*prepared},
+                  job,
+                  ping.ip,
+                  ping.port,
+                  std::static_pointer_cast<boost::asio::ip::udp::socket>(ping.socket),
+                  sink,
+                  server.value_or(""));
+            });
+        if (admission != streaming::ConsumerAdmission::Accepted && admission != streaming::ConsumerAdmission::Duplicate)
+          logs::log(logs::warning, "[CONSUMER] Audio admission denied: {}", static_cast<int>(admission));
       }));
 
   return handlers.persistent();

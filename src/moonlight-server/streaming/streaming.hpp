@@ -1,4 +1,5 @@
 #pragma once
+#include "consumer_runtime.hpp"
 #include <boost/asio.hpp>
 #include <core/gstreamer.hpp>
 #include <core/virtual-display.hpp>
@@ -44,15 +45,15 @@ void start_audio_producer(const wolf::core::sessions::RunScope &run_scope,
                           const std::string &sink_name,
                           const std::string &server_name);
 
-void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
+bool start_streaming_video(immer::box<events::VideoSession> video_session,
+                           ConsumerJob &job,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                            std::shared_ptr<udp::socket> video_socket);
 
-void start_streaming_audio(immer::box<events::AudioSession> audio_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
+bool start_streaming_audio(immer::box<events::AudioSession> audio_session,
+                           ConsumerJob &job,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
