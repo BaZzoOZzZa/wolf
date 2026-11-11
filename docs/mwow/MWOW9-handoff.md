@@ -334,3 +334,13 @@ The consumer streaming entry points additionally require job/request exact
 ConnectionScope+RunScope, matching public ID and kind. Regression checks now also
 observe actual pipeline destruction via GObject weak notify and cancel in the
 after-ping/before-Gst-setup gap. No EOS send or ticket issuance counts as release.
+
+Runtime fixture isolation: the consumer executable disables plugin search and
+registry updates before `gst_init_check`, explicitly loads only the installed
+`coreelements` shared library discovered through pkg-config, and checks that no
+other dynamic plugin is loaded. The CTest registry path is inside its binary
+folder. It does not call `streaming::init`, start Wolf or scan GPU/device plugins.
+System GStreamer used here is 1.28.7; older-version/runtime matrix is unverified.
+The callback holder strategy uses Gst destroy-notify lifetime and explicit drain;
+see [GstBus callback contract](https://gstreamer.freedesktop.org/documentation/gstreamer/gstbus.html#gst_bus_set_sync_handler)
+and [installed-version appsink implementation](https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gst-plugins-base/gst-libs/gst/app/gstappsink.c).

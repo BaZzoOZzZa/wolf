@@ -209,5 +209,10 @@ set_tests_properties(wolf-connection-scope-tests PROPERTIES LABELS "scope;isolat
 add_executable(wolf-consumer-runtime-tests testConsumerRuntime.cpp)
 target_link_libraries(wolf-consumer-runtime-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
 target_compile_features(wolf-consumer-runtime-tests PRIVATE cxx_std_20)
+pkg_get_variable(CONSUMER_GST_PLUGIN_DIR gstreamer-1.0 pluginsdir)
+target_compile_definitions(wolf-consumer-runtime-tests PRIVATE
+        WOLF_TEST_GST_CORE_PLUGIN="${CONSUMER_GST_PLUGIN_DIR}/libgstcoreelements${CMAKE_SHARED_LIBRARY_SUFFIX}")
 add_test(NAME wolf-consumer-runtime-tests COMMAND wolf-consumer-runtime-tests)
-set_tests_properties(wolf-consumer-runtime-tests PROPERTIES LABELS "consumer;isolated" TIMEOUT 45)
+set_tests_properties(wolf-consumer-runtime-tests PROPERTIES
+        LABELS "consumer;isolated" TIMEOUT 45
+        ENVIRONMENT "GST_REGISTRY_1_0=${CMAKE_CURRENT_BINARY_DIR}/consumer-registry.bin;GST_REGISTRY_UPDATE=no")

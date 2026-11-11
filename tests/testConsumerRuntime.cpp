@@ -100,7 +100,26 @@ ConsumerPolicy fast_policy() {
 }
 void software_gst() {
   static std::once_flag once;
-  std::call_once(once, [] { gst_init(nullptr, nullptr); }); // deliberately NOT streaming::init()
+  std::call_once(once, [] {
+    // No registry scan/plugin scanner and no GPU/VAAPI/Pulse/Wayland plugin
+    // initialization. Only the installed software coreelements plugin is loaded.
+    g_setenv("GST_PLUGIN_SYSTEM_PATH_1_0", "", TRUE);
+    g_setenv("GST_PLUGIN_PATH_1_0", "", TRUE);
+    g_setenv("GST_REGISTRY_UPDATE", "no", TRUE);
+    REQUIRE(gst_init_check(nullptr, nullptr, nullptr)); // NOT streaming::init()
+    auto core = gst_plugin_load_file(WOLF_TEST_GST_CORE_PLUGIN, nullptr);
+    REQUIRE(core != nullptr);
+    gst_object_unref(core);
+    auto plugins = gst_registry_get_plugin_list(gst_registry_get());
+    for (auto item = plugins; item; item = item->next) {
+      auto plugin = GST_PLUGIN(item->data);
+      if (gst_plugin_is_loaded(plugin)) {
+        const std::string name = gst_plugin_get_name(plugin);
+        CHECK((name == "coreelements" || name == "staticelements"));
+      }
+    }
+    gst_plugin_list_free(plugins);
+  });
 }
 } // namespace
 
