@@ -384,3 +384,31 @@ bus→queued-message→bus cycle after NULL. Its source is now nullable nullptr;
 the actual Gst posting/holder-retention schedule and every assertion are unchanged.
 The original RED log/LSan failure remains archived. The corrected RED fixture is
 the version frozen for the subsequent unchanged RED/GREEN comparison.
+
+## F8/F9 GREEN contract
+
+Corrected RED0e0ba14: native build exit0; actual regression run exit42,
+2 cases / 68 assertions with exactly9 semantic failures; no sanitizer diagnostic.
+GREEN keeps that test source unchanged.
+
+`ConsumerCallbackBarrier::close_and_wait` now requires BOTH active entries ==0
+and published holder obligations ==0. Each real appsink/bus registration increments
+an obligation before transferring data to Gst. Gst's final destroy-notify deletes
+the entire owned holder (including callback captures) before acknowledging retirement.
+The tiny shared barrier is synchronization/fence state, not a retained UDP/context
+payload. Late callback/notify/payload destruction therefore retains the worker and
+stays Unknown; unregister or entry into notify cannot publish a successful ticket.
+No wait is added to event-bus/control callbacks.
+
+Every transfer-full media sink, bus and source reference is immediately held by
+`GstOwned` (unique_ptr + gst_object_unref), including the drain lookup. Holder data
+is constructed under unique_ptr before registration; failed construction/copy/
+retain unwinds the unpublished holder and all acquired Gst refs. After registration,
+Gst destroy-notify owns deletion/ack. Partial setup failure still goes through
+confirmed NULL, unregister and holder/entry drain before Failed+joined can release.
+No core helper, producer lifecycle, scope/registry protocol or public wire change.
+
+This fixes the reviewed media adapter release boundary, not all-process exception
+safety: GLib fatal allocation, inherited eventbus noexcept/EAGAIN and supervisor
+allocation recovery remain outside this correction. Physical GPU/driver shutdown
+is still not bounded; an unretired holder remains owned/quarantined.

@@ -4,6 +4,9 @@
 
 namespace streaming::detail {
 namespace {
+// Adopt every transfer-full reference before any C++ allocation/callback/string
+// work. C functions below receive borrowed pointers; these guards own the refs.
+template <class T> using GstOwned = std::unique_ptr<T, decltype(&gst_object_unref)>;
 void checkpoint(const std::shared_ptr<const ConsumerMediaProbe> &probe,
                 MediaCallback kind,
                 MediaPhase phase,
@@ -56,16 +59,16 @@ void configure_appsink(GstElement *sink,
     return result;
   };
   before_allocation(probe, MediaAllocation::SinkHolder, GST_OBJECT(sink));
-  auto data = new SinkData{callbacks.sample, barrier, probe, MediaCallback::Sink};
+  auto data = std::make_unique<SinkData>(SinkData{callbacks.sample, barrier, probe, MediaCallback::Sink});
   barrier->retain_holder();
-  gst_app_sink_set_callbacks(GST_APP_SINK(sink), &gst_callbacks, data, retire<SinkData>);
+  gst_app_sink_set_callbacks(GST_APP_SINK(sink), &gst_callbacks, data.release(), retire<SinkData>);
 }
 void configure_context(GstBus *bus,
                        const ConsumerMediaCallbacks &callbacks,
                        const std::shared_ptr<ConsumerCallbackBarrier> &barrier,
                        const std::shared_ptr<const ConsumerMediaProbe> &probe) {
   before_allocation(probe, MediaAllocation::ContextHolder, GST_OBJECT(bus));
-  auto data = new ContextData{callbacks.context, barrier, probe, MediaCallback::Context};
+  auto data = std::make_unique<ContextData>(ContextData{callbacks.context, barrier, probe, MediaCallback::Context});
   barrier->retain_holder();
   gst_bus_set_sync_handler(
       bus,
@@ -86,7 +89,7 @@ void configure_context(GstBus *bus,
         checkpoint(data.probe, MediaCallback::Context, MediaPhase::AfterEntry, message);
         return result;
       },
-      data,
+      data.release(),
       retire<ContextData>);
 }
 } // namespace
@@ -103,11 +106,10 @@ bool run_media_consumer(const std::string &description,
   wolf::core::sessions::ProducerBinding binding(producer);
   auto select = [&](GstElement *pipeline, const RunScope &selected) {
     binding.select(selected, [&](const std::string &key) {
-      if (auto src = gst_bin_get_by_name(GST_BIN(pipeline), src_name.c_str())) {
-        before_allocation(probe, MediaAllocation::ProducerTarget, GST_OBJECT(src));
+      if (GstOwned<GstElement> src{gst_bin_get_by_name(GST_BIN(pipeline), src_name.c_str()), gst_object_unref}) {
+        before_allocation(probe, MediaAllocation::ProducerTarget, GST_OBJECT(src.get()));
         auto target = key + "_" + kind;
-        g_object_set(src, "listen-to", target.c_str(), nullptr);
-        gst_object_unref(src);
+        g_object_set(src.get(), "listen-to", target.c_str(), nullptr);
         return true;
       }
       return false;
@@ -118,18 +120,15 @@ bool run_media_consumer(const std::string &description,
       job,
       {.setup =
            [&](GstElement *pipeline) {
-             if (auto sink = gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink")) {
-               if (!GST_IS_APP_SINK(sink)) {
-                 gst_object_unref(sink);
+             if (GstOwned<GstElement> sink{gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink"), gst_object_unref}) {
+               if (!GST_IS_APP_SINK(sink.get())) {
                  throw std::runtime_error("wolf_udp_sink is not an appsink");
                }
-               configure_appsink(sink, callbacks, barrier, probe);
-               gst_object_unref(sink);
+               configure_appsink(sink.get(), callbacks, barrier, probe);
              }
              if (callbacks.context) {
-               auto bus = gst_element_get_bus(pipeline);
-               configure_context(bus, callbacks, barrier, probe);
-               gst_object_unref(bus);
+               GstOwned<GstBus> bus{gst_element_get_bus(pipeline), gst_object_unref};
+               configure_context(bus.get(), callbacks, barrier, probe);
              }
              select(pipeline, producer);
              if (probe && probe->ready)
@@ -146,12 +145,11 @@ bool run_media_consumer(const std::string &description,
            },
        .drain =
            [&](GstElement *pipeline) {
-             if (auto sink = gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink")) {
-               if (GST_IS_APP_SINK(sink)) {
+             if (GstOwned<GstElement> sink{gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink"), gst_object_unref}) {
+               if (GST_IS_APP_SINK(sink.get())) {
                  GstAppSinkCallbacks empty = {};
-                 gst_app_sink_set_callbacks(GST_APP_SINK(sink), &empty, nullptr, nullptr);
+                 gst_app_sink_set_callbacks(GST_APP_SINK(sink.get()), &empty, nullptr, nullptr);
                }
-               gst_object_unref(sink);
              }
              if (probe && probe->draining)
                probe->draining();

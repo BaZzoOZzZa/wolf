@@ -4,7 +4,9 @@
 
 namespace streaming {
 // User data stays owned by the worker and by Gst's destroy-notify holder.
-// After callbacks are disconnected, close_and_wait proves all entries exited.
+// Unregistration alone does not retire Gst's borrowed callback records. Drain
+// requires both entered callbacks and all published holders to be retired.
+// Retirement is acknowledged only AFTER deleting a holder and its captures.
 class ConsumerCallbackBarrier {
   std::mutex mutex_;
   std::condition_variable wake_;
@@ -50,7 +52,7 @@ public:
   void close_and_wait() {
     std::unique_lock lock(mutex_);
     closed_ = true;
-    wake_.wait(lock, [&] { return active_ == 0; });
+    wake_.wait(lock, [&] { return active_ == 0 && holders_ == 0; });
   }
 };
 
