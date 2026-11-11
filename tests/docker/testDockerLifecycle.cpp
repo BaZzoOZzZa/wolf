@@ -1,5 +1,6 @@
 // Uses only a scripted temporary Unix HTTP socket, never a Docker daemon.
 #include <core/docker.hpp>
+#include <sessions/lifecycle.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -247,6 +248,74 @@ void exec_reuses_a_handle_without_reusing_post_state() {
   mock.finish();
 }
 
+void failed_stop_stays_addressable_until_explicit_retry() {
+  using namespace wolf::core::sessions;
+  MockDocker mock({{"POST /v1.40/containers/known-id/stop?t=2 ", 500, "stop not accepted"},
+                   {"GET /v1.40/containers/known-id/json ", 200, inspect_body("running")},
+                   {"GET /v1.40/containers/known-id/json ", 200, inspect_body("running")},
+                   {"POST /v1.40/containers/known-id/stop?t=2 ", 204, ""},
+                   {"GET /v1.40/containers/known-id/json ", 200, inspect_body("exited")}});
+  DockerAPI api(mock.path);
+  ContainerSupervision worker(true);
+  ContainerStopRequests stops;
+  LobbyLifecycle gate;
+  auto ticket = gate.create("lobby", "prefix", "payload").ticket;
+  CHECK(gate.launch(ticket));
+  CHECK(gate.ready(ticket));
+  bool public_record = true;
+  int removals = 0;
+  int stop_notifications = 0;
+  auto cleanup = [&] {
+    handle_lobby_stop(
+        gate,
+        ticket,
+        [] { return true; },
+        [&] {
+          public_record = false;
+          ++removals;
+        });
+  };
+  auto public_stop = [&] {
+    if (!public_record) {
+      return false; // The real endpoint also resolves the public ID/PIN first.
+    }
+    ++stop_notifications;
+    stops.request(); // The exact RunDocker stop callback control object.
+    cleanup();       // The exact policy called by the lobby StopLobby callback.
+    return true;
+  };
+  CHECK(public_stop());
+  CHECK(public_record);
+  const auto now = ContainerMonitor::Clock::time_point{};
+  auto failed = worker.poll(api, "known-id", stops, now);
+  CHECK(failed.stop_result == false);
+  CHECK(failed.decision == ContainerMonitor::Decision::live);
+  CHECK(stops.state() == ContainerStopRequests::State::failed);
+  CHECK(public_record);
+  gate.producer_finished(ticket); // Video may end after the original stop request.
+  notify_lobby_completion(gate, ticket, [&] { CHECK(public_stop()); }, cleanup);
+  CHECK(stop_notifications == 1); // No automatic second Docker stop on completion.
+  auto still_running = worker.poll(api, "known-id", stops, now + 1s);
+  CHECK(!still_running.stop_result.has_value());
+  CHECK(still_running.decision == ContainerMonitor::Decision::live);
+  CHECK(removals == 0);
+  CHECK(gate.create("another", "prefix", "payload").result == LobbyLifecycle::Create::conflict);
+  CHECK(public_stop()); // ID is still public and therefore the API retry is possible.
+  auto stopped = worker.poll(api, "known-id", stops, now + 2s);
+  CHECK(stopped.stop_result == true);
+  CHECK(stopped.decision == ContainerMonitor::Decision::terminal);
+  CHECK(stops.state() == ContainerStopRequests::State::none);
+  CHECK(public_record); // Terminal runner acknowledgement is still required.
+  gate.runner_finished(ticket);
+  cleanup();
+  CHECK(!public_record);
+  CHECK(removals == 1);
+  CHECK(stop_notifications == 2);
+  CHECK(!public_stop());
+  CHECK(gate.create("another", "prefix", "payload").result == LobbyLifecycle::Create::admitted);
+  mock.finish();
+}
+
 void slow_engine_has_a_request_deadline() {
   MockDocker mock({{"GET /v1.40/containers/known-id/json ", 200, inspect_body("running"), false, 11s}});
   DockerAPI api(mock.path);
@@ -269,8 +338,9 @@ int main() {
     rejected_create_and_bounded_pull_retry();
     malformed_create_response_retains_uncertainty();
     exec_reuses_a_handle_without_reusing_post_state();
+    failed_stop_stays_addressable_until_explicit_retry();
     slow_engine_has_a_request_deadline();
-    std::cout << "8 Docker lifecycle mock scenarios passed\n";
+    std::cout << "9 Docker lifecycle mock scenarios passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;

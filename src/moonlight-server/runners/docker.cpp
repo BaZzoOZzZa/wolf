@@ -190,22 +190,22 @@ void RunDocker::run(std::string_view session_id,
                              .devices = devices,
                              .env = full_env};
 
-  auto stop_requested = std::make_shared<std::atomic_bool>(false);
+  auto stop_requested = std::make_shared<ContainerStopRequests>();
   const std::string owned_session_id(session_id);
   auto terminate_handler = this->ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
       [owned_session_id, stop_requested](const immer::box<events::StopStreamEvent> &ev) {
         if (std::to_string(ev->session_id) == owned_session_id) {
-          stop_requested->store(true);
+          stop_requested->request();
         }
       });
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<events::StopLobbyEvent>>(
       [owned_session_id, stop_requested](const immer::box<events::StopLobbyEvent> &ev) {
         if (ev->lobby_id == owned_session_id) {
-          stop_requested->store(true);
+          stop_requested->request();
         }
       });
 
-  if (stop_requested->load()) {
+  if (stop_requested->pending()) {
     return;
   }
   auto creation = docker_api.create_with_outcome(new_container, final_json_opts, {}, false);
@@ -258,15 +258,16 @@ void RunDocker::run(std::string_view session_id,
         });
 
     InspectResult last_inspect;
-    ContainerMonitor monitor(start_confirmed);
+    ContainerSupervision supervision(start_confirmed);
     for (;;) {
-      if (stop_requested->exchange(false)) {
-        // One attempt per explicit request. A timeout is reconciled by inspect,
-        // never translated into a speculative remove or a repeated mutation.
-        docker_api.stop_by_id(container_id);
+      auto observation = supervision.poll(docker_api, container_id, *stop_requested, ContainerMonitor::Clock::now());
+      if (observation.stop_result && !*observation.stop_result) {
+        logs::log(logs::warning,
+                  "[DOCKER] Stop for {} failed or is uncertain; lobby remains addressable for explicit retry",
+                  container_id);
       }
-      last_inspect = docker_api.inspect_by_id(container_id);
-      auto decision = monitor.observe(last_inspect, ContainerMonitor::Clock::now());
+      last_inspect = std::move(observation.inspect);
+      auto decision = observation.decision;
       if (decision == ContainerMonitor::Decision::terminal) {
         break;
       }

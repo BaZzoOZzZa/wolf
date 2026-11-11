@@ -86,7 +86,7 @@ RunnerOutcome start_runner(std::shared_ptr<events::Runner> runner,
     return {RunnerOutcome::State::unknown, e.identity};
   }
 
-  if (args->audio_server && args->audio_sink) {
+  if (args->cleanup_audio_sink && args->audio_server && args->audio_sink) {
     logs::log(logs::debug, "[STREAM_SESSION] Remove virtual audio sink");
     audio::delete_virtual_sink(args->audio_server->server, args->audio_sink);
   }

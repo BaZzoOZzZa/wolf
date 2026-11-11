@@ -41,14 +41,21 @@ stop-on-empty, видео, аудио и client settings).
 Stop до допуска runner блокирует поздний ready callback. Stop, соревнующийся с уже допущенным запуском,
 может пересечь начало create/start; резервация остаётся занятой, а `DockerContainerCreated` повторно
 публикует stop для уже зарегистрированного runner handler. Stop handlers только выставляют atomic request;
-синхронный Docker stop выполняет supervision worker. Это не connection epoch и не защита от stale disconnect.
+синхронный Docker stop выполняет supervision worker. Неуспешная попытка остаётся состоянием failed,
+а запись lobby с прежними ID/PIN сохраняется в `/lobbies` до подтверждения terminal всех actual workers.
+Поэтому `/lobbies/stop` можно вызвать ещё раз явно. Producer/deferred completion не публикует второй stop:
+он выполняет только membership/finalization bookkeeping. Это не connection epoch и не защита от stale disconnect.
 
 Ресурс освобождается после membership cleanup и завершения всех стартовавших audio/video producers,
-а если runner был допущен — ещё и после его подтверждённого завершения. Позднее завершение старого ticket
+а если runner был допущен — ещё и после его подтверждённого завершения. Публичная запись удаляется только
+на этой terminal границе, а не после одного лишь membership cleanup. Позднее завершение старого ticket
 не освобождает слот нового. Закрытый ticket хранит только ключ/малую метаинформацию; fingerprint/resource
 освобождаются. История ограничена 1024 ключами на экземпляр handlers, ID <=128, resource <=4096,
 fingerprint <=65536 bytes. При исчерпании — fail-closed отказ; автоматического eviction нет.
-Members/session ownership ограничиваются существующими server sessions и очищаются при завершённом leave.
+`members/session_owners_` не имеют собственного численного cap и очищаются только при завершённом leave.
+Если session удалена раньше leave, stale memberships могут удерживаться и накапливаться; они **не** строго
+ограничены текущим числом server sessions. Перенос этого ownership/retention в согласованный connection lifecycle
+остаётся работой MWOW-9; лимит 1024 launch entries не доказывает bounded всех maps.
 
 ## Неопределённый исход и recovery
 
@@ -96,11 +103,39 @@ Unknown не публикует DockerContainerStopped, не запускает 
 * Changed default recreation может потребовать явного административного восстановления stale sidecar/test containers.
   Fixtures реального Docker suite обновлены для explicit opt-in; сам этот suite не запускался.
 
+## Доработка после независимого MWOW-8 review
+
+F1 (failed stop при продолжающемся Running) исправляется совместно в runner и lobby handler:
+`ContainerStopRequests` отделяет одноразовую notification от сохраняющегося failed/awaiting-terminal intent;
+`ContainerSupervision::poll` исполняет одну мутацию на новую notification и сохраняет её результат.
+`handle_lobby_stop` оставляет ID/PIN в публичном состоянии до terminal acknowledgement, поэтому повторный
+публичный stop может сформировать новую notification. `notify_lobby_completion` не превращает окончание
+producer в автоматическую повторную мутацию. Failed stop + Running не создаёт ложный ContainerStopped.
+
+F2 (определённый отказ std::thread constructor) исправляется production seam
+`run_lobby_startup` / `ProducerHandoffs`, через который реально идёт create handler. Reservation получает
+handoff только после возврата actual worker от factory; при исключении отменяются только ещё не созданные
+audio/video workers. Completion уже созданного worker исполняет общий wrapper, а не тестовая копия счётчиков.
+Setup completion barrier не позволяет callback освободить ресурс, пока setup ещё конструирует workers.
+
+Lobby теперь владеет final sink cleanup: `RunnerArgs::cleanup_audio_sink=false` для lobby, normal Moonlight
+caller сохраняет прежний default true. После закрытия всех actual workers и membership finalizer однократно
+забирает sink из lobby и удаляет его, включая audio-thread failure после создания sink и video-thread failure
+после audio handoff. Sink живого/Unknown runner не удаляется. Изменение не перекладывает F1/F2 в residuals.
+
+Deterministic fixtures используют те же production seams: отказ factory при audio и video handoff,
+реально исполненный completion wrapper handed-off audio, sink cleanup ровно один раз, новый ID после recovery,
+старый key как tombstone; и реальный DockerAPI/mock HTTP stop500 → Running → completion без повтора → Running
+→ явный retry stop204 → Exited. Проверяются доступность записи, reservation и terminal boundary.
+Это callback/launch-policy harness без реального GStreamer/RunDocker environment, не live system test.
+
 ## Проверки и план сборки
 
 Выполнены `git diff --check`, targeted clang-format, C++20 syntax checks state-only тестов и production
 `core/.../docker.cpp` с настоящими logger/Boost/range headers. ASan/UBSan: standalone gate/monitor scenarios
-и mock Docker HTTP scenarios: **10 state-only scenarios + 8 mock HTTP scenarios PASS**. SHA фиксируется в итоговом отчёте.
+и mock Docker HTTP scenarios: **10 state-only scenarios + 8 mock HTTP scenarios PASS** на исходном candidate; доработка добавляет
+2 deterministic startup-failure fixtures, 1 stop-intent/Unknown fixture и 1 stop/retry HTTP fixture;
+финальный suite содержит 13 state-only + 9 mock HTTP scenarios, результаты приведены в raw evidence. SHA фиксируется в итоговом отчёте.
 Mock tests используют только временный Unix socket, не Docker daemon. Проверяются 404/500/malformed responses,
 неизвестный status, конфликт без recreation, потерянный create response, сохранение ID после 201,
 ограниченный pull retry, reuse curl handle после POST и реальный 10 s timeout медленного mock engine.
@@ -123,8 +158,17 @@ host Boost.Log 1.92 не соответствует доступным headers 1
 length-bearing MWOW-6 handler и SSE subscribe на MWOW-6 strand. Он требует security patch MWOW-6
 (`api.hpp`, input handler и сопутствующие изменения). Lifecycle commit строится поверх adapter, поэтому
 полная проверка endpoints требует combined candidate. Этот worktree сам не содержит security-owned файлов.
-Остальные server TUs и full server build требуют проверки с полным набором dependencies, не подменяются
-state-only результатами. До этой проверки и независимого review/приёмки задача остаётся review.
+Доработка проверена последовательным production `-fsyntax-only` для core Docker, runner Docker и
+sessions/common.cpp, sessions/lobbies.cpp, sessions/moonlight.cpp с настоящими dependency headers из
+подготовленного MWOW-6 compile_commands; это не полный link. Combined endpoints/полный server build,
+static/shared link и независимое повторное review/приёмка ещё требуются; задача остаётся review.
 
 Tracker lease/status ведёт Manager `thr_yw564ieyms`, project MWOW, task MWOW-7. Точные usage token counts
 неизвестны; report_usage с выдуманными числами не отправлялся.
+
+Сырые свидетельства доработки сохраняются в
+`/home/bazzoozza/.bb/thread-storage/thr_7rjh7u5mnu/MWOW-7-review-fixes/`:
+`verify.py`, `*/manifest.json`, `*.command.json`, отдельные raw `*.stdout` / `*.stderr`.
+Manifest фиксирует точные argv/cwd, revision/status, SHA256 исходников и бинарников, exit codes и duration;
+кандидат с dirty source hashes и финальный clean commit различаются label. Список непроверенных/непрошедших
+production TUs определяется этими логами, а не успешностью state-only suite.

@@ -40,6 +40,9 @@ public:
     bool operation = false;
     bool cleaning = false;
     bool cleaned = false;
+    bool setup_complete = true;
+    bool forget_claimed = false;
+    bool stop_notified = false;
     std::set<std::size_t> members;
     std::set<std::size_t> deferred_leaves;
 
@@ -101,6 +104,48 @@ public:
     entries_.emplace(entry->id, entry);
     resources_.emplace(entry->resource, entry->id);
     return {Create::admitted, entry};
+  }
+
+  void begin_setup(const Ticket &entry) {
+    std::lock_guard lock(mutex_);
+    entry->setup_complete = false;
+  }
+
+  void finish_setup(const Ticket &entry) {
+    std::lock_guard lock(mutex_);
+    entry->setup_complete = true;
+    close_if_finished(entry);
+  }
+
+  bool setup_complete(const Ticket &entry) const {
+    std::lock_guard lock(mutex_);
+    return entry->setup_complete;
+  }
+
+  // Internal completion notifications must not reissue a mutating Docker stop.
+  // Public StopLobby requests still reach the runner's request callback directly.
+  bool request_stop_once(const Ticket &entry) {
+    std::lock_guard lock(mutex_);
+    if (entry->stop_notified || entry->phase == Phase::closed) {
+      return false;
+    }
+    entry->stop_notified = true;
+    entry->phase = Phase::stopping;
+    return true;
+  }
+
+  bool claim_forget(const Ticket &entry) {
+    std::lock_guard lock(mutex_);
+    if (entry->phase != Phase::closed || entry->forget_claimed) {
+      return false;
+    }
+    entry->forget_claimed = true;
+    return true;
+  }
+
+  void retry_forget(const Ticket &entry) {
+    std::lock_guard lock(mutex_);
+    entry->forget_claimed = false;
   }
 
   bool launch(const Ticket &entry) {
@@ -170,6 +215,7 @@ public:
   // defer membership cleanup until that operation has left its critical phase.
   bool stop(const Ticket &entry) {
     std::lock_guard lock(mutex_);
+    entry->stop_notified = true;
     if (entry->phase != Phase::closed) {
       entry->phase = Phase::stopping;
     }
@@ -242,7 +288,7 @@ public:
 private:
   void close_if_finished(const Ticket &entry) {
     if (entry->phase != Phase::closed && entry->producers == 0 && (!entry->launched || entry->runner_done) &&
-        entry->cleaned && !entry->operation && entry->members.empty()) {
+        entry->cleaned && entry->setup_complete && !entry->operation && entry->members.empty()) {
       entry->phase = Phase::closed;
       resources_.erase(entry->resource);
       // Closed keys remain as small tombstones; release request/config payloads.
@@ -257,5 +303,137 @@ private:
   std::map<std::string, std::string> resources_;
   std::map<std::size_t, std::string> session_owners_;
 };
+
+// The actual StopLobby handler policy, shared with the callback fixtures. A
+// cleaned lobby remains addressable until its producers AND runner are terminal.
+template <typename Cleanup, typename Forget>
+void handle_lobby_stop(LobbyLifecycle &lifecycle,
+                       const LobbyLifecycle::Ticket &ticket,
+                       Cleanup &&cleanup_membership,
+                       Forget &&forget_record) {
+  if (lifecycle.stop(ticket)) {
+    if (cleanup_membership()) {
+      lifecycle.stopped(ticket);
+    } else {
+      lifecycle.retry_stop(ticket);
+    }
+  }
+  if (lifecycle.claim_forget(ticket)) {
+    try {
+      forget_record();
+    } catch (...) {
+      lifecycle.retry_forget(ticket);
+      throw;
+    }
+  }
+}
+
+// Producer/deferred completion is distinct from a new explicit stop request.
+template <typename EmitStop, typename Cleanup>
+void notify_lobby_completion(LobbyLifecycle &lifecycle,
+                             const LobbyLifecycle::Ticket &ticket,
+                             EmitStop &&emit_stop,
+                             Cleanup &&cleanup) {
+  if (lifecycle.request_stop_once(ticket)) {
+    emit_stop();
+  } else {
+    cleanup();
+  }
+}
+
+// Factory must either return an actual worker or throw before creating one.
+// Successful construction transfers the reservation BEFORE detach; a detach
+// failure must never be treated as proof that the worker was not started.
+class ProducerHandoffs {
+public:
+  ProducerHandoffs(LobbyLifecycle &lifecycle, LobbyLifecycle::Ticket ticket)
+      : lifecycle_(lifecycle), ticket_(std::move(ticket)) {}
+  ProducerHandoffs(const ProducerHandoffs &) = delete;
+  ProducerHandoffs &operator=(const ProducerHandoffs &) = delete;
+
+  template <typename Factory, typename Work, typename Completion>
+  bool audio(Factory &&factory, Work work, Completion completion) {
+    if (!lifecycle_.add_audio_producer(ticket_)) {
+      return false;
+    }
+    start(LobbyLifecycle::Producer::audio,
+          audio_handed_off_,
+          std::forward<Factory>(factory),
+          std::move(work),
+          std::move(completion));
+    return true;
+  }
+
+  template <typename Factory, typename Work, typename Completion>
+  bool video(Factory &&factory, Work work, Completion completion) {
+    if (lifecycle_.stopping(ticket_)) {
+      return false;
+    }
+    start(LobbyLifecycle::Producer::video,
+          video_handed_off_,
+          std::forward<Factory>(factory),
+          std::move(work),
+          std::move(completion));
+    return true;
+  }
+
+  void cancel_unstarted() {
+    if (!audio_handed_off_) {
+      lifecycle_.producer_finished(ticket_, LobbyLifecycle::Producer::audio);
+    }
+    if (!video_handed_off_) {
+      lifecycle_.producer_finished(ticket_, LobbyLifecycle::Producer::video);
+    }
+  }
+
+private:
+  template <typename Factory, typename Work, typename Completion>
+  void start(LobbyLifecycle::Producer producer, bool &handed_off, Factory &&factory, Work work, Completion completion) {
+    auto worker = factory([lifecycle = &lifecycle_,
+                           ticket = ticket_,
+                           producer,
+                           work = std::move(work),
+                           completion = std::move(completion)]() mutable {
+      try {
+        work();
+      } catch (...) {
+        lifecycle->producer_finished(ticket, producer);
+        completion();
+        throw;
+      }
+      lifecycle->producer_finished(ticket, producer);
+      completion();
+    });
+    handed_off = true;
+    worker.detach();
+  }
+
+  LobbyLifecycle &lifecycle_;
+  LobbyLifecycle::Ticket ticket_;
+  bool audio_handed_off_ = false;
+  bool video_handed_off_ = false;
+};
+
+// This seam is used by the production create handler, not a test copy of its
+// counters. Both successful and failed setup settle exactly the uncreated workers.
+template <typename Setup, typename Finalize>
+void run_lobby_startup(LobbyLifecycle &lifecycle,
+                       const LobbyLifecycle::Ticket &ticket,
+                       Setup &&setup,
+                       Finalize &&finalize) {
+  lifecycle.begin_setup(ticket);
+  ProducerHandoffs handoffs(lifecycle, ticket);
+  try {
+    setup(handoffs);
+  } catch (...) {
+    handoffs.cancel_unstarted();
+    lifecycle.finish_setup(ticket);
+    finalize();
+    throw;
+  }
+  handoffs.cancel_unstarted();
+  lifecycle.finish_setup(ticket);
+  finalize();
+}
 
 } // namespace wolf::core::sessions

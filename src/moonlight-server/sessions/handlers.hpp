@@ -41,6 +41,8 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+  // Lobby finalization owns its sink, including failures before a runner exists.
+  bool cleanup_audio_sink = true;
 };
 
 struct RunnerOutcome {

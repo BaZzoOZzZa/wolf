@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <functional>
@@ -146,6 +147,73 @@ public:
 private:
   bool start_observed_;
   std::optional<Clock::time_point> uncertain_since_;
+};
+
+// A notification is consumed once, while failed/awaiting-terminal stop intent
+// remains observable. Only a NEW explicit request permits another mutation.
+class ContainerStopRequests {
+public:
+  enum class State {
+    none,
+    requested,
+    awaiting_terminal,
+    failed
+  };
+
+  void request() {
+    pending_.store(true);
+  }
+  bool pending() const {
+    return pending_.load();
+  }
+  State state() const {
+    return pending() ? State::requested : state_.load();
+  }
+
+  template <typename Stop> std::optional<bool> attempt(Stop &&stop) {
+    if (!pending_.exchange(false)) {
+      return {};
+    }
+    state_.store(State::awaiting_terminal);
+    const bool success = stop();
+    state_.store(success ? State::awaiting_terminal : State::failed);
+    return success;
+  }
+
+  void terminal() {
+    state_.store(State::none);
+  }
+
+private:
+  std::atomic_bool pending_{false};
+  std::atomic<State> state_{State::none};
+};
+
+// RunDocker and the scripted HTTP callback harness execute this same step.
+class ContainerSupervision {
+public:
+  struct Observation {
+    InspectResult inspect;
+    ContainerMonitor::Decision decision;
+    std::optional<bool> stop_result;
+  };
+
+  explicit ContainerSupervision(bool start_confirmed) : monitor_(start_confirmed) {}
+
+  template <typename API>
+  Observation
+  poll(API &api, std::string_view id, ContainerStopRequests &stops, ContainerMonitor::Clock::time_point now) {
+    auto stop_result = stops.attempt([&] { return api.stop_by_id(id); });
+    auto inspect = api.inspect_by_id(id);
+    auto decision = monitor_.observe(inspect, now);
+    if (decision == ContainerMonitor::Decision::terminal) {
+      stops.terminal();
+    }
+    return {std::move(inspect), decision, stop_result};
+  }
+
+private:
+  ContainerMonitor monitor_;
 };
 
 class DockerAPI {

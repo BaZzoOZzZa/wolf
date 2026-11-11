@@ -4,8 +4,10 @@
 
 #include <atomic>
 #include <barrier>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <system_error>
 #include <thread>
 
 using wolf::core::sessions::LobbyLifecycle;
@@ -221,6 +223,118 @@ void all_producers_must_finish() {
   CHECK(gate.create("b", "prefix", "request").result == LobbyLifecycle::Create::admitted);
 }
 
+// Deterministic factory seam used by the real create handler. Completion is
+// wrapped by ProducerHandoffs itself; the fixture never fabricates completions.
+struct FixtureWorker {
+  std::vector<std::function<void()>> &jobs;
+  std::function<void()> work;
+  void detach() {
+    jobs.push_back(std::move(work));
+  }
+};
+
+void failed_producer_handoff(bool fail_audio) {
+  using namespace wolf::core::sessions;
+  LobbyLifecycle gate;
+  auto entry = gate.create("failed-start", "prefix", "request").ticket;
+  bool record = true;
+  bool sink = false;
+  int sink_deletes = 0;
+  int stop_notifications = 0;
+  int audio_work = 0;
+  std::vector<std::function<void()>> jobs;
+  auto cleanup = [&] {
+    handle_lobby_stop(
+        gate,
+        entry,
+        [] { return true; },
+        [&] {
+          CHECK(sink);
+          sink = false;
+          ++sink_deletes;
+          record = false;
+        });
+  };
+  auto notify = [&] {
+    notify_lobby_completion(
+        gate,
+        entry,
+        [&] {
+          ++stop_notifications;
+          cleanup();
+        },
+        cleanup);
+  };
+  bool failed = false;
+  try {
+    run_lobby_startup(
+        gate,
+        entry,
+        [&](auto &handoffs) {
+          CHECK(handoffs.audio(
+              [&](auto work) -> FixtureWorker {
+                sink = true; // Sink exists before the actual std::thread constructor.
+                if (fail_audio) {
+                  throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+                }
+                return {jobs, std::move(work)};
+              },
+              [&] { ++audio_work; },
+              notify));
+          handoffs.video(
+              [](auto) -> FixtureWorker {
+                throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+              },
+              [] {},
+              notify);
+        },
+        [&] {
+          if (gate.stopping(entry)) {
+            cleanup();
+          }
+        });
+  } catch (const std::system_error &) {
+    failed = true;
+    notify(); // Same outer setup-error path as the create handler.
+  }
+  CHECK(failed);
+  CHECK(gate.setup_complete(entry));
+  if (!fail_audio) {
+    CHECK(record);
+    CHECK(sink);
+    CHECK(jobs.size() == 1);
+    CHECK(gate.create("retry", "prefix", "request").result == LobbyLifecycle::Create::conflict);
+    jobs.front()(); // Execute the handed-off worker and its REAL completion wrapper.
+    CHECK(audio_work == 1);
+  } else {
+    CHECK(jobs.empty());
+    CHECK(audio_work == 0);
+  }
+  CHECK(!record);
+  CHECK(!sink);
+  CHECK(sink_deletes == 1);
+  CHECK(stop_notifications == 1); // Worker completion did not blindly reissue stop.
+  CHECK(gate.create("retry", "prefix", "request").result == LobbyLifecycle::Create::admitted);
+  CHECK(gate.create("failed-start", "prefix", "request").result == LobbyLifecycle::Create::conflict);
+  cleanup();
+  CHECK(sink_deletes == 1);
+}
+
+void unknown_completion_does_not_reissue_a_stop() {
+  using namespace wolf::core::sessions;
+  LobbyLifecycle gate;
+  auto entry = ready(gate, "lobby", "prefix");
+  int mutations = 0;
+  int cleanup = 0;
+  auto notify = [&] { notify_lobby_completion(gate, entry, [&] { ++mutations; }, [&] { ++cleanup; }); };
+  notify();
+  CHECK(mutations == 1);
+  gate.quarantine(entry); // Another failure must not erase an already sent intent.
+  notify();
+  CHECK(mutations == 1);
+  CHECK(cleanup == 1);
+}
+
 void bounded_history() {
   LobbyLifecycle gate(2);
   for (auto id : {"a", "b"}) {
@@ -251,7 +365,10 @@ int main() {
     launch_stop_race();
     bounded_history();
     all_producers_must_finish();
-    std::cout << "10 lifecycle scenarios passed\n";
+    failed_producer_handoff(true);
+    failed_producer_handoff(false);
+    unknown_completion_does_not_reissue_a_stop();
+    std::cout << "13 lifecycle scenarios passed\n";
   } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;
