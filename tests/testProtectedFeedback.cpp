@@ -332,6 +332,11 @@ TEST_CASE("Protected feedback uses actual crypto and retires only after real pac
   REQUIRE(f.seat->backend_identity() == backend);
   // Fresh connection AND fresh token, same ENet pointer and SAME actual key registry.
   auto fresh = f.seat->current();
+  // Old view reuses the exact raw address: it must neither send nor revoke fresh.
+  REQUIRE(f.executor->pump_one(view) == PumpResult::Refused);
+  REQUIRE_FALSE(f.seat->quarantined());
+  REQUIRE(f.seat->current()->token.matches(fresh->token));
+  REQUIRE(f.key->next_sequence == 1);
   f.live_token = f.target.peer;
   f.associated.connection_scope = f.target.connection;
   f.associated.run_scope = f.target.source;
@@ -353,6 +358,7 @@ TEST_CASE("Protected feedback refuses stale owner fields without sending", "[fee
   auto token = grant->owner.peer;
   auto sender = f.sender;
   auto device = f.seat->generation();
+  bool foreign_grant = false;
   SECTION("fresh token at identical raw peer") {
     token = PeerToken::fresh(0);
   }
@@ -375,11 +381,13 @@ TEST_CASE("Protected feedback refuses stale owner fields without sending", "[fee
     f.current.run_scope = RunScope::fresh("42");
   }
   SECTION("new binding") {
+    foreign_grant = true;
     auto c = grant->owner;
     c.binding = BindingRevision::fresh(0);
     grant = std::make_shared<SeatGrant>(c);
   }
   SECTION("other destination") {
+    foreign_grant = true;
     auto c = grant->owner;
     c.destination = RunScope::fresh("other");
     grant = std::make_shared<SeatGrant>(c);
@@ -396,7 +404,13 @@ TEST_CASE("Protected feedback refuses stale owner fields without sending", "[fee
   REQUIRE(f.executor->pump_one(view) == PumpResult::Refused);
   REQUIRE(f.transport->creates == 0);
   REQUIRE(f.transport->sends == 0);
-  REQUIRE(f.seat->quarantined());
+  REQUIRE(f.key->next_sequence == 0);
+  if (foreign_grant) {
+    REQUIRE_FALSE(f.seat->quarantined());
+    REQUIRE(f.seat->current()->token.matches(f.old->token));
+  } else {
+    REQUIRE(f.seat->quarantined());
+  }
 }
 
 TEST_CASE("Protected feedback validates ranges and spends failed attempt nonces", "[feedback]") {
@@ -784,4 +798,96 @@ TEST_CASE("Quarantine racing healthy reset and reentrant hook cleanup cannot gra
   REQUIRE(handle->status() == TransferStatus::Quarantined);
   REQUIRE(f.seat->quarantined());
   REQUIRE_FALSE(f.seat->current());
+}
+
+TEST_CASE("Feedback release waits for real consumer holder retirement and preserves unrelated Work", "[feedback]") {
+  Fixture f;
+  auto holder_gate = std::make_shared<Gate>();
+  // Declared after fixture, before any assertion that could fail with a live
+  // worker. Always opens the actual holder destructor gate before Runtime joins.
+  struct Release {
+    std::shared_ptr<Gate> gate;
+    ~Release() {
+      gate->release();
+    }
+  } release{holder_gate};
+  struct Holder {
+    std::shared_ptr<Gate> gate;
+    ~Holder() {
+      gate->wait();
+    }
+  };
+  auto holder = std::make_shared<Holder>();
+  holder->gate = holder_gate;
+  auto began = std::make_shared<std::atomic_bool>(false);
+  auto unrelated_started = std::make_shared<std::atomic_bool>(false);
+  auto unrelated_stopped = std::make_shared<std::atomic_bool>(false);
+  auto other_connection = ConnectionScope::fresh(42);
+  auto other_run = RunScope::fresh("unrelated producer stand-in");
+  REQUIRE(f.runtime->admit(other_connection,
+                           other_run,
+                           ConsumerKind::Audio,
+                           {"other", 1235, {}},
+                           [unrelated_started, unrelated_stopped](ConsumerJob &job, const ConsumerPing &) {
+                             *unrelated_started = true;
+                             while (!job.cancelled())
+                               std::this_thread::sleep_for(1ms);
+                             *unrelated_stopped = true;
+                             return true;
+                           }) == ConsumerAdmission::Accepted);
+  f.runtime->ping(ConsumerKind::Audio, {"other", 1235, std::array<char, 16>{}, {}});
+  REQUIRE(eventually([&] { return unrelated_started->load(); }));
+  REQUIRE(f.runtime->admit(f.initial.connection,
+                           f.initial.source,
+                           ConsumerKind::Video,
+                           {"old", 1234, {}},
+                           [h = std::move(holder), began](ConsumerJob &job, const ConsumerPing &) {
+                             job.begin_drain(); // actual EOS decision; holder retirement is later
+                             *began = true;
+                             return true;
+                           }) == ConsumerAdmission::Accepted);
+  f.runtime->ping(ConsumerKind::Video, {"old", 1234, std::array<char, 16>{}, {}});
+  REQUIRE(eventually([&] { return began->load() && holder_gate->entered.load(); }));
+  auto backend = f.seat->backend_identity();
+  f.effect();
+  auto view = f.view();
+  REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+  auto transfer = f.transfer();
+  REQUIRE(transfer.handle);
+  REQUIRE(f.executor->service());
+  REQUIRE(f.executor->status().outcome == Outcome::SentReleased);
+  REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
+  REQUIRE_FALSE(InputHandoff::drain_complete(transfer.handle->saved_ticket(), f.initial.connection));
+  REQUIRE(transfer.handle->status() == TransferStatus::Pending);
+  REQUIRE_FALSE(unrelated_stopped->load());
+  holder_gate->release();
+  REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
+  REQUIRE(f.seat->backend_identity() == backend);
+  REQUIRE_FALSE(unrelated_stopped->load());
+  auto other_ticket = f.runtime->revoke(other_connection);
+  REQUIRE(other_ticket);
+  REQUIRE(eventually([&] { return other_ticket->complete(); }));
+  REQUIRE(unrelated_stopped->load());
+}
+
+TEST_CASE("Feedback cleanup reentry cannot publish a healthy release after revoke", "[feedback]") {
+  Fixture f;
+  struct Capture {
+    std::shared_ptr<InputSeat> seat;
+    GrantHandle grant;
+    ~Capture() {
+      seat->revoke(grant, grant->owner.peer);
+    }
+  };
+  auto capture = std::make_shared<Capture>();
+  capture->seat = f.seat;
+  capture->grant = f.old;
+  f.effect();
+  auto view = f.view();
+  REQUIRE(f.executor->pump_one(view, [capture = std::move(capture)](HookPoint) {}) == PumpResult::Queued);
+  REQUIRE(f.executor->service());
+  REQUIRE(f.seat->quarantined());
+  REQUIRE(f.executor->status().outcome == Outcome::Unknown);
+  REQUIRE(f.executor->status().sealed);
+  REQUIRE_FALSE(f.executor->status().packet_live);
 }

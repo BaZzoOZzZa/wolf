@@ -148,6 +148,10 @@ struct State {
     AttemptHook retired;
     retired.swap(cell.hook);
     retired = {}; // actual sole owned capture destruction outside ALL locks
+    // Cleanup itself can reenter revoke; never relabel that terminal fault as a
+    // successful local release merely because the earlier snapshot was healthy.
+    if (seat->quarantined() && !cell.failed)
+      unknown();
     if (cell.reservation) {
       bool success = !sealed && !closing && !cell.failed && cell.release_seen &&
                      (cell.cancelling || (cell.flags.load() & ENET_PACKET_FLAG_SENT));
@@ -242,6 +246,10 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     return PumpResult::Refused;
   try {
     auto current = s.seat->current();
+    // A stale/foreign capability cannot poison the new current grant. Only an
+    // inconsistent observation of the exact current grant seals this domain.
+    if (!current || !view.grant_ || !current->token.matches(view.grant_->token))
+      return PumpResult::Refused;
     if (!s.identities(view, current)) {
       s.unknown();
       return PumpResult::Refused;
