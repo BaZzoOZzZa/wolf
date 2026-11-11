@@ -6,6 +6,9 @@ CheckedXboxBackend::CheckedXboxBackend(std::unique_ptr<inputtino::checked::Xbox>
   if (!xbox_)
     throw std::invalid_argument("CheckedXboxBackend requires an owned backend");
 }
+inputtino::checked::ListenerStatus CheckedXboxBackend::listener_status() const {
+  return xbox_->listener_status();
+}
 DeviceGeneration CheckedXboxBackend::generation() const {
   return xbox_->generation();
 }

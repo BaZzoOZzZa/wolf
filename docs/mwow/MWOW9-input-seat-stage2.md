@@ -54,3 +54,28 @@ sessions/input_handoff.{hpp,cpp}, tests/testInputSeat.cpp, minimal isolated targ
 this document. Existing backend/scope/ticket interfaces stay unchanged. Tests use
 real checked backend with injected IO and real ConsumerRuntime Work resources.
 Stage3 all-route wiring/auth/ENet executor and separate device executor remain gates.
+
+User restriction received during Stage2: WoW must not be launched without a new
+explicit permission. Existing game and Wine prefix remain untouched. Future
+physical checks should prefer local games, but this assignment authorizes only
+software injected IO and no devices/games/daemons/system changes.
+
+## Resolved interface decisions
+
+Manager confirmed: joint handoff requires BOTH fresh ConnectionScope and fresh
+PeerToken. Same-Connection request is rejected before old revoke or neutral;
+a new peer token alone cannot reopen ConsumerRuntime's revoked scope. Numeric
+ID reuse is allowed only with fresh retained allocation identities. ConsumerRuntime
+is unchanged. Peer-only notifications must identify the exact admitted grant/peer.
+
+Manager authorized only one additive CheckedXboxBackend forwarding method:
+listener_status() const -> Xbox::listener_status(). Commit revalidates failed/stop
+snapshot; supervisor quarantines subsequently observed terminal failure. This is
+not an atomic guarantee against an async failure immediately after observation.
+The wrapper header/cpp are the only additional owned paths; dependency unchanged.
+
+`admit_prepared` is the execution gate: validation plus actual ConsumerRuntime
+admission run in the seat serial domain. `prepared_admission` is inspection only,
+not a reusable permission to start a consumer outside the gate. Runtime Current
+and authority callbacks must not reenter the seat; no gate is held across drain
+waiting or device IO. Command budget includes the one reserved in-flight command.

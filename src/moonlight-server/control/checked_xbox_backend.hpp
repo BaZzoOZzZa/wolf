@@ -12,6 +12,7 @@ class CheckedXboxBackend {
 public:
   explicit CheckedXboxBackend(std::unique_ptr<inputtino::checked::Xbox> xbox);
   DeviceGeneration generation() const;
+  inputtino::checked::ListenerStatus listener_status() const;
   inputtino::checked::WriteReceipt apply(const DeviceGeneration &, const inputtino::checked::Frame &);
   inputtino::checked::WriteReceipt neutral(const DeviceGeneration &);
   void request_stop() noexcept;

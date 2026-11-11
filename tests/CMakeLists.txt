@@ -229,3 +229,18 @@ if (TARGET inputtino::libinputtino)
     add_test(NAME wolf-checked-xbox-tests COMMAND wolf-checked-xbox-tests)
     set_tests_properties(wolf-checked-xbox-tests PROPERTIES LABELS "input;isolated" TIMEOUT 45)
 endif ()
+
+# Disabled Stage2 production seat/coordinator with injected checked IO and real
+# ConsumerRuntime. Catch main only; no Wolf/Gst/device/network initialization.
+if (TARGET inputtino::libinputtino)
+    add_executable(wolf-input-seat-tests testInputSeat.cpp
+            ../src/moonlight-server/control/input_seat.cpp
+            ../src/moonlight-server/control/checked_xbox_backend.cpp
+            ../src/moonlight-server/sessions/input_handoff.cpp
+            ../src/moonlight-server/streaming/consumer_runtime.cpp)
+    target_compile_features(wolf-input-seat-tests PRIVATE cxx_std_20)
+    target_include_directories(wolf-input-seat-tests PRIVATE ../src/moonlight-server)
+    target_link_libraries(wolf-input-seat-tests PRIVATE inputtino::libinputtino Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-input-seat-tests COMMAND wolf-input-seat-tests)
+    set_tests_properties(wolf-input-seat-tests PROPERTIES LABELS "input;isolated" TIMEOUT 45)
+endif ()
