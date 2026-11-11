@@ -1,9 +1,12 @@
 #include "control_loop.hpp"
+#include <state/sessions.hpp>
+
+#include "protected_feedback.hpp"
+
 #include "control.hpp"
 #include "input_handler.hpp"
 #include <array>
 #include <map>
-#include <state/sessions.hpp>
 #include <sys/socket.h>
 
 namespace control {

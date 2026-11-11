@@ -1,8 +1,16 @@
 #pragma once
-#include "protected_feedback.hpp"
+#include <enet/enet.h>
 #include <future>
+#include <sessions/connection_scope.hpp>
 #include <state/data-structures.hpp>
+#include <thread>
 
+namespace control {
+struct PeerIdentity;
+using PeerToken = wolf::core::sessions::Scope<size_t, PeerIdentity>;
+struct ControlPeer;
+class InputSeat;
+} // namespace control
 namespace control::loop {
 using Clock = std::chrono::steady_clock;
 using ThreadFactory = std::function<std::thread(std::function<void()>)>;

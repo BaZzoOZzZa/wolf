@@ -1,9 +1,11 @@
 #include <control/control_loop.hpp>
+#include <state/sessions.hpp>
+
+#include <control/protected_feedback.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <control/control.hpp>
 #include <deque>
-#include <state/sessions.hpp>
 using namespace control;
 using namespace control::loop;
 using namespace moonlight::control;
