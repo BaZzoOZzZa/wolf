@@ -1,5 +1,6 @@
 #include "protected_feedback.hpp"
 #ifdef __linux__
+#include "control.hpp"
 #include <limits>
 #include <utility>
 
@@ -327,13 +328,13 @@ bool ProtectedFeedbackExecutor::service() {
   }
 }
 bool ProtectedFeedbackExecutor::cancel_for_transfer(const OwnerPeerView &view,
-                                                    std::shared_ptr<const sessions::TransferHandle> transfer) {
+                                                    std::shared_ptr<const ::sessions::TransferHandle> transfer) {
   State::Frame frame(state_);
-  std::shared_ptr<const sessions::TransferHandle> retained;
+  std::shared_ptr<const ::sessions::TransferHandle> retained;
   retained.swap(transfer); // parameter emptied; owned validator refs retire BEFORE frame ack
   auto &s = *state_;
   if (!frame.entered || s.sealed || !s.cell.reservation || !s.live || !retained ||
-      retained->status() != sessions::TransferStatus::Pending)
+      retained->status() != ::sessions::TransferStatus::Pending)
     return false;
   try {
     const auto &feedback = s.cell.reservation->feedback;
@@ -350,7 +351,7 @@ bool ProtectedFeedbackExecutor::cancel_for_transfer(const OwnerPeerView &view,
     s.cell.cancelling = true;
     s.ops.reset_peer(s.ops.owner.get(), &view.raw_);
     // Quarantine racing reset cannot be reopened by a local cleanup ack.
-    if (retained->status() != sessions::TransferStatus::Pending)
+    if (retained->status() != ::sessions::TransferStatus::Pending)
       s.cell.failed = true;
     return true;
   } catch (...) {

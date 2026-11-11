@@ -1,11 +1,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <control/protected_feedback.hpp>
+
+#include <control/control.hpp>
 #include <cstring>
+#include <events/events.hpp>
 #include <future>
+#include <moonlight/control.hpp>
 
 using namespace control;
 using namespace control::protected_feedback;
-using namespace sessions;
+using namespace ::sessions;
 using namespace streaming;
 using namespace moonlight::control;
 using namespace std::chrono_literals;
@@ -172,7 +176,7 @@ struct LiveOwnerFacts {
   ENetPeer *raw;
   PeerToken token;
   std::shared_ptr<ControlPeer> sender;
-  events::StreamSession session;
+  wolf::core::events::StreamSession session;
   std::shared_ptr<ControlKeyRegistry> registry;
   ControlKeyState *key;
 };
@@ -198,7 +202,7 @@ struct Fixture {
                        BindingRevision::fresh(0),
                        15};
   GrantHandle old;
-  events::StreamSession associated{}, current{};
+  wolf::core::events::StreamSession associated{}, current{};
   ENetPeer raw{}; // never given to real send/reset (injected only), no ENet host
   std::shared_ptr<ControlPeer> sender = std::make_shared<ControlPeer>();
   std::shared_ptr<ControlKeyRegistry> keys = std::make_shared<ControlKeyRegistry>();
@@ -269,7 +273,7 @@ struct Fixture {
                ENetPeer &raw,
                const PeerToken &token,
                const std::shared_ptr<ControlPeer> &sender,
-               const events::StreamSession &session,
+               const wolf::core::events::StreamSession &session,
                ControlKeyState &key) {
               const auto &live = *static_cast<LiveOwnerFacts *>(p);
               return live.raw == &raw && live.token.matches(token) && live.sender == sender && live.key == &key &&

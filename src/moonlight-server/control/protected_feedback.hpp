@@ -1,11 +1,18 @@
 #pragma once
 #ifdef __linux__
-#include "control.hpp"
 #include "input_seat.hpp"
 #include <atomic>
 #include <condition_variable>
+#include <enet/enet.h>
+#include <moonlight/control_crypto.hpp>
 #include <sessions/input_handoff.hpp>
 
+namespace wolf::core::events {
+struct StreamSession;
+}
+namespace control {
+struct ControlPeer;
+}
 namespace control::protected_feedback {
 // Internal trusted owner view, not a TLS/GameACL proof. Referents must be stable
 // through the owner call; no copy/raw peer export into an asynchronous queue.
@@ -17,7 +24,7 @@ struct CurrentOwnerSource {
                   ENetPeer &,
                   const PeerToken &,
                   const std::shared_ptr<ControlPeer> &,
-                  const events::StreamSession &,
+                  const wolf::core::events::StreamSession &,
                   moonlight::control::ControlKeyState &) = nullptr;
 };
 class OwnerPeerView {
@@ -25,7 +32,7 @@ class OwnerPeerView {
   friend class ProtectedFeedbackExecutor;
   ENetPeer &raw_;
   const std::thread::id thread_ = std::this_thread::get_id();
-  const events::StreamSession &associated_, &current_;
+  const wolf::core::events::StreamSession &associated_, &current_;
   const PeerToken token_;
   const std::shared_ptr<ControlPeer> sender_, current_sender_;
   const std::shared_ptr<moonlight::control::ControlKeyRegistry> registry_;
@@ -36,15 +43,16 @@ class OwnerPeerView {
 
 public:
   OwnerPeerView(ENetPeer &,
-                const events::StreamSession &associated,
-                const events::StreamSession &current,
+                const wolf::core::events::StreamSession &associated,
+                const wolf::core::events::StreamSession &current,
                 PeerToken,
                 std::shared_ptr<ControlPeer> sender,
                 std::shared_ptr<ControlPeer> current_sender,
                 std::shared_ptr<moonlight::control::ControlKeyRegistry>,
                 moonlight::control::ControlKeyState &,
                 GrantHandle,
-                DeviceGeneration);
+                DeviceGeneration,
+                CurrentOwnerSource);
   OwnerPeerView(const OwnerPeerView &) = delete;
 };
 // Immutable table after publication. Context is owned, not a borrowed callback
@@ -114,7 +122,7 @@ class ProtectedFeedbackExecutor {
 public:
   bool bind_current_thread(); // once; no new thread, cannot rebind after owner loss
   PumpResult pump_one(const OwnerPeerView &, AttemptHook = {});
-  bool cancel_for_transfer(const OwnerPeerView &, std::shared_ptr<const sessions::TransferHandle>);
+  bool cancel_for_transfer(const OwnerPeerView &, std::shared_ptr<const ::sessions::TransferHandle>);
   bool service(); // owner-only wrapped operation, supports nested frames
   Status status() const;
   void request_close(); // no IO/wait; exact current seat revoke, never healthy cancellation
