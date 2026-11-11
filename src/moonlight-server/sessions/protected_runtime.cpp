@@ -132,8 +132,12 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
   auto receipt = std::make_shared<RuntimeReceipt>();
   receipt->identity = RuntimeJobIdentity::fresh(unsigned(job->cell));
   std::shared_ptr<RuntimeReceipt> retired;
+  std::shared_ptr<const TransferHandle> observed;
   {
     std::lock_guard lock(s.mutex);
+    observed = s.transfer.lock();
+    if (observed && observed->status() == TransferStatus::Quarantined)
+      s.unknown = true;
     if (!s.started || s.stop || s.unknown)
       return {RuntimeSubmission::Closed, {}};
     // A preparation cannot retain old media owners across Handoff replacement.
@@ -276,11 +280,18 @@ void ProtectedRuntimeOwner::run() {
 }
 RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
   auto &s = *state_;
-  std::lock_guard lock(s.mutex);
-  size_t occupied = 0;
-  for (const auto &c : s.cells)
-    occupied += c.occupied;
-  return {s.started, s.stop, s.unknown, joined_, occupied, s.bytes};
+  std::shared_ptr<const TransferHandle> observed;
+  RuntimeOwnerStatus result{};
+  {
+    std::lock_guard lock(s.mutex);
+    observed = s.transfer.lock();
+    size_t occupied = 0;
+    for (const auto &c : s.cells)
+      occupied += c.occupied;
+    result = {s.started, s.stop, s.unknown, joined_, occupied, s.bytes};
+  }
+  result.unknown = result.unknown || (observed && observed->status() == TransferStatus::Quarantined);
+  return result;
 }
 std::shared_ptr<const TransferHandle> ProtectedRuntimeOwner::transfer() const {
   std::lock_guard lock(state_->mutex);

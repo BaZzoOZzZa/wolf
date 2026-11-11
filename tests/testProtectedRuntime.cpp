@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <cerrno>
 #include <future>
+#include <sessions/handlers.hpp>
 #include <sessions/protected_access.hpp>
 #include <sessions/protected_authority.hpp>
 #include <sessions/protected_runtime.hpp>
@@ -233,7 +234,9 @@ TEST_CASE("Protected worker counts popped cell and bytes while reserved close pr
   REQUIRE(eventually([&] { return f.owner->join_when_exited() == RuntimeJoin::Joined; }));
   CHECK_FALSE(f.owner->current());
   CHECK(r.receipt->state == RuntimeJobState::Refused);
-  CHECK(f.owner->status().occupied == 0);
+  CHECK(f.owner->status().occupied == 1);
+  CHECK(f.owner->status().unknown);
+  CHECK(submitted.receipt->state == RuntimeJobState::Unknown); // actual request observed concurrent authority close
 }
 
 TEST_CASE("Protected worker payload retirement is outside queue and precedes cell reuse", "[protected-runtime]") {
@@ -427,4 +430,55 @@ TEST_CASE("Protected failure retirement remains charged and independent stop is 
   CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Closed);
   REQUIRE(eventually([&] { return f.owner->join_when_exited() == RuntimeJoin::Joined; }));
   CHECK(f.owner->status().unknown); // join is not Unknown-resource recovery
+}
+
+TEST_CASE("Moonlight registration uses exact orchestration Runtime without starting services", "[protected-runtime]") {
+  Fixture f;
+  auto bus = std::make_shared<wolf::core::events::EventBusType>();
+  auto app = immer::box<state::AppState>{
+      state::AppState{.event_bus = bus,
+                      .lobbies = std::make_shared<immer::atom<immer::vector<wolf::core::events::Lobby>>>(),
+                      .running_sessions = f.running}};
+  auto handlers = wolf::core::sessions::setup_moonlight_handlers(app, "", {}, f.owner->runtime());
+  REQUIRE_FALSE(handlers.empty());
+  auto h = f.transfer();
+  auto audio = f.owner->submit(f.media(h, RuntimeCell::Audio));
+  REQUIRE(audio.receipt);
+  REQUIRE(eventually([&] { return audio.receipt->state == RuntimeJobState::Complete; }));
+  bus->fire_event(immer::box<wolf::core::events::StopStreamEvent>{
+      wolf::core::events::StopStreamEvent{.session_id = f.next.connection.id(),
+                                          .connection_scope = f.next.connection}});
+  REQUIRE(eventually([&] {
+    auto status = f.owner->runtime()->status(f.next.connection, ConsumerKind::Audio);
+    return status && status->joined;
+  }));
+  CHECK(f.owner->current()); // consumer Stop is not GameStop or protected authority handoff
+}
+
+TEST_CASE("Protected queue rejects oversized inputs and retirement can coexist with A and V", "[protected-runtime]") {
+  Fixture f;
+  auto h = f.transfer();
+  auto gate = f.gate();
+  auto hold = std::make_unique<RuntimeJob>();
+  hold->cell = RuntimeCell::Retirement;
+  hold->retire = [gate] { gate->wait(); };
+  auto r = f.owner->submit(std::move(hold));
+  REQUIRE(r.receipt);
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  auto big = f.media(h, RuntimeCell::Audio);
+  big->payload.resize(65536);
+  CHECK(f.owner->submit(std::move(big)).result == RuntimeSubmission::Capacity);
+  auto a = f.owner->submit(f.media(h, RuntimeCell::Audio));
+  auto v = f.owner->submit(f.media(h, RuntimeCell::Video));
+  REQUIRE(a.receipt);
+  REQUIRE(v.receipt);
+  CHECK(f.owner->status().occupied == 3);
+  CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Busy);
+  CHECK(f.owner->submit(f.media(h, RuntimeCell::Audio)).result == RuntimeSubmission::Busy);
+  CHECK(f.owner->submit({}).result == RuntimeSubmission::Invalid);
+  gate->release();
+  REQUIRE(eventually([&] { return v.receipt->state == RuntimeJobState::Complete; }));
+  CHECK(a.receipt->state == RuntimeJobState::Complete);
+  CHECK(a.receipt->media == ConsumerAdmission::Accepted);
+  CHECK(v.receipt->media == ConsumerAdmission::Accepted);
 }
