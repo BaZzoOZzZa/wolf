@@ -56,6 +56,7 @@ if (UNIX AND NOT APPLE)
         endif ()
     endfunction()
     set(INPUTTINO_CHECKED_XBOX_DRIVER "${PROJECT_SOURCE_DIR}/cmake/PatchInputtinoCheckedXbox.cmake")
+    file(SHA256 "${PROJECT_SOURCE_DIR}/patches/inputtino-checked-xbox.patch" INPUTTINO_CHECKED_XBOX_PATCH_SHA256)
     function(wolf_verify_inputtino_checked_xbox source_dir)
         execute_process(COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=${source_dir}"
                         -DINPUTTINO_VERIFY_ONLY=ON -P "${INPUTTINO_CHECKED_XBOX_DRIVER}"
@@ -76,6 +77,7 @@ if (UNIX AND NOT APPLE)
                 PATCH_COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=<SOURCE_DIR>"
                               -P "${INPUTTINO_MOTION_PATCH_DRIVER}"
                       COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=<SOURCE_DIR>"
+                              "-DINPUTTINO_CHECKED_PATCH_REVISION=${INPUTTINO_CHECKED_XBOX_PATCH_SHA256}"
                               -P "${INPUTTINO_CHECKED_XBOX_DRIVER}")
         # FETCHCONTENT_SOURCE_DIR_INPUTTINO skips the FetchContent patch step.
         # Fail closed instead of silently modifying a caller-owned source tree.
