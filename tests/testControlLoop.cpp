@@ -709,3 +709,117 @@ TEST_CASE("Owned control lifecycle dependency destruction follows actual join ou
   REQUIRE(retired);
   REQUIRE(weak.expired());
 }
+
+TEST_CASE("F14 unresolved received identity blocks subsequent service until actual owner cleanup",
+          "[control-loop][f14]") {
+  struct Fault : Fake {
+    ENetPacket *withheld = nullptr; // execution owner only; never freed from test thread
+    bool inject_foreign_marker = false;
+    std::atomic_bool held{false}, second_service{false}, reset_entered{false}, late_freed{false};
+    std::atomic_size_t service_calls{0}, later_received{0};
+    std::atomic_uintptr_t first_identity{0}, first_cell{0};
+    std::atomic_bool reused_cell{false};
+    std::shared_ptr<Gate> second_gate = std::make_shared<Gate>();
+    std::shared_ptr<Gate> cleanup_gate = std::make_shared<Gate>();
+    std::shared_ptr<Gate> after_late_free = std::make_shared<Gate>();
+    Operations table() {
+      auto ops = Fake::ops();
+      ops.service = [](void *p, ENetHost *h, ENetEvent *e, uint32_t timeout) {
+        auto &s = *static_cast<Fault *>(static_cast<Fake *>(p));
+        if (++s.service_calls > 1) {
+          s.second_service = true;
+          s.second_gate->wait();
+        }
+        return s.Fake::ops().service(p, h, e, timeout);
+      };
+      ops.destroy_packet = [](void *p, ENetPacket *packet) {
+        auto &s = *static_cast<Fault *>(static_cast<Fake *>(p));
+        s.affinity();
+        if (!s.held) {
+          s.withheld = packet;
+          s.first_identity = reinterpret_cast<uintptr_t>(packet);
+          s.first_cell = reinterpret_cast<uintptr_t>(packet->userData);
+          if (s.inject_foreign_marker) {
+            // A distinct REAL packet cannot discharge P1's identity. P1 is
+            // still allocated, so pointer reuse cannot explain this callback.
+            auto *foreign = enet_packet_create("foreign", 7, 0);
+            foreign->userData = packet->userData;
+            foreign->freeCallback = packet->freeCallback;
+            enet_packet_destroy(foreign);
+          }
+          s.held = true;
+          return; // deliberately no P1 callback/data free
+        }
+        ++s.later_received;
+        s.reused_cell = reinterpret_cast<uintptr_t>(packet->userData) == s.first_cell;
+        s.destroy_packet(packet);
+      };
+      ops.reset = [](void *p, ENetPeer *peer) {
+        auto &s = *static_cast<Fault *>(static_cast<Fake *>(p));
+        s.affinity();
+        if (s.withheld) {
+          s.reset_entered = true;
+          s.cleanup_gate->wait();
+          auto *held = std::exchange(s.withheld, nullptr);
+          s.destroy_packet(held); // trusted fixture-owned release, NOT State retry
+          s.late_freed = true;
+          s.after_late_free->wait(); // actual callback/free finished, enclosing call has not
+        }
+        s.Fake::ops().reset(p, peer);
+      };
+      return ops;
+    }
+  };
+  Fixture f;
+  auto fault = std::make_shared<Fault>();
+  f.fake = fault;
+  SECTION("missing marker retains original obligation") {}
+  SECTION("different packet callback is not original retirement") {
+    fault->inject_foreign_marker = true;
+  }
+  struct Open {
+    std::shared_ptr<Fault> fault;
+    ~Open() {
+      fault->second_gate->release();
+      fault->cleanup_gate->release();
+      fault->after_late_free->release();
+    }
+  } open{fault}; // opens on every assertion unwind BEFORE Fixture joins
+  fault->hold = true;
+  fault->push(ENET_EVENT_TYPE_RECEIVE, 0, 0, "P1");
+  fault->push(ENET_EVENT_TYPE_RECEIVE, 0, 0, "P2");
+  f.loop = f.domain.start(f.config, f.sessions, f.bus, fault->table());
+  REQUIRE(f.loop);
+  REQUIRE(eventually([&] { return fault->held && (fault->second_service || fault->reset_entered); }));
+  CHECK(fault->first_identity != 0);
+  CHECK(fault->first_cell != 0);
+  CHECK(fault->service_calls == 1);
+  CHECK_FALSE(fault->second_service);
+  CHECK(f.loop->status().unknown);
+  CHECK(f.loop->status().stop_requested);
+  CHECK_FALSE(f.loop->status().exited);
+  CHECK(f.loop->join_when_exited() != JoinResult::Joined);
+  CHECK_FALSE(f.domain.start(f.config, f.sessions, f.bus, fault->ops()));
+  f.loop->request_stop(); // bounded RED teardown also requests the real owner stop
+  fault->second_gate->release();
+  REQUIRE(eventually([&] { return fault->reset_entered.load(); }));
+  CHECK(fault->later_received == 0);
+  CHECK_FALSE(fault->reused_cell);
+  CHECK_FALSE(fault->late_freed);
+  CHECK_FALSE(f.loop->status().exited);
+  fault->cleanup_gate->release();
+  REQUIRE(eventually([&] { return fault->after_late_free->entered.load(); }));
+  CHECK(fault->late_freed);
+  CHECK_FALSE(f.loop->status().exited);
+  CHECK(f.loop->join_when_exited() != JoinResult::Joined);
+  fault->after_late_free->release();
+  f.finish();
+  CHECK(f.loop->status().unknown); // late true cleanup NEVER clears Unknown/reopens slot
+  CHECK(fault->service_calls == 1);
+  CHECK(fault->destroys == 1);
+  CHECK_FALSE(fault->bad_thread);
+  {
+    std::lock_guard lock(fault->mutex);
+    CHECK(fault->events.size() == 1); // queued P2 was never dequeued/acquired
+  }
+}
