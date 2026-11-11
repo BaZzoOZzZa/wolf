@@ -375,3 +375,12 @@ version asserted. Tests are intended to stay byte-identical in RED and GREEN.
 Inherited eventbus noexcept/EAGAIN and general supervisor allocation failure remain
 separate residuals; this correction does not claim exception-safe ingress or fix
 InputSeat/device executor/all-route/live handoff.
+
+First RED execution on ed12475 built successfully and reached the intended
+2 cases / 9 failed assertions (six premature-release/Unknown checks, three weak
+Gst object release checks). It also exposed an independent fixture cleanup bug:
+the synthetic late application message used its own bus as source, creating a
+bus→queued-message→bus cycle after NULL. Its source is now nullable nullptr;
+the actual Gst posting/holder-retention schedule and every assertion are unchanged.
+The original RED log/LSan failure remains archived. The corrected RED fixture is
+the version frozen for the subsequent unchanged RED/GREEN comparison.

@@ -570,8 +570,7 @@ TEST_CASE("Media holder retirement precedes successful consumer release", "[cons
   auto bus = bus_ready.get();
   REQUIRE(eventually([&] { return schedule->posting_ready.load(); }));
   cleanup.poster = std::thread([bus] {
-    gst_bus_post(bus.get(),
-                 gst_message_new_application(GST_OBJECT(bus.get()), gst_structure_new_empty("wolf.retirement")));
+    gst_bus_post(bus.get(), gst_message_new_application(nullptr, gst_structure_new_empty("wolf.retirement")));
   });
   REQUIRE(eventually([&] { return schedule->before_entry.entered.load(); }));
   auto ticket = f.runtime->revoke(f.scope);
