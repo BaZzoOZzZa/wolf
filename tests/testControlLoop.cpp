@@ -205,8 +205,8 @@ struct Fixture {
   std::shared_ptr<wolf::core::events::EventBusType> bus = std::make_shared<wolf::core::events::EventBusType>();
   wolf::core::events::StreamSession session{.aes_key = key,
                                             .aes_iv = "iv",
-                                            .session_id = 42,
                                             .enet_secret_payload = 123,
+                                            .session_id = 42,
                                             .connection_scope = wolf::core::sessions::ConnectionScope::fresh(42),
                                             .run_scope = wolf::core::sessions::RunScope::fresh("42")};
   std::shared_ptr<std::atomic<int64_t>> now = std::make_shared<std::atomic<int64_t>>(10000);
