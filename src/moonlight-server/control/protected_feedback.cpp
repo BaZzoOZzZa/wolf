@@ -250,10 +250,6 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     // inconsistent observation of the exact current grant seals this domain.
     if (!current || !view.grant_ || !current->token.matches(view.grant_->token))
       return PumpResult::Refused;
-    if (!s.identities(view, current)) {
-      s.unknown();
-      return PumpResult::Refused;
-    }
     if (owned)
       owned(HookPoint::BeforeReserve);
     s.cell.reservation = s.router->reserve_send(view.grant_);
@@ -268,6 +264,12 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     s.cell.packet = nullptr;
     s.cell.hook.swap(owned);
     const auto &feedback = s.cell.reservation->feedback;
+    // Validate fresh owner facts only once the exact grant reservation fences
+    // replacement. A failed pre-reservation probe must not revoke a later grant.
+    if (!s.identities(view, feedback.grant)) {
+      s.cell.failed = true;
+      return PumpResult::Refused;
+    }
     s.hook(HookPoint::AfterReserve);
     if (!s.identities(view, feedback.grant) || !feedback.device.matches(view.device_) ||
         feedback.grant->owner.slot >= 16 || feedback.low < 0 || feedback.low > 65535 || feedback.high < 0 ||

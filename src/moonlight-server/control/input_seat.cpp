@@ -71,8 +71,8 @@ std::shared_ptr<FeedbackReservation> SeatFeedbackRouter::reserve_send() {
 }
 std::shared_ptr<FeedbackReservation> SeatFeedbackRouter::reserve_send(const GrantHandle &expected) {
   std::lock_guard lock(gate_->mutex);
-  // RED seam: preserve old unscoped reservation decision until regression recorded.
-  (void)expected;
+  if (!gate_->matches(expected))
+    return {};
   return reserve_send_locked();
 }
 std::shared_ptr<FeedbackReservation> SeatFeedbackRouter::reserve_send_locked() {

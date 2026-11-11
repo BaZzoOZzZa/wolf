@@ -363,3 +363,28 @@ raw argv/log/exit hashes are in
 `/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-3B1.md` and
 `checks/3B1/native-evidence.json` in that thread storage. Independent review remains
 required; this disabled checkpoint does not authorize 3B2 or runtime enablement.
+
+
+### Local finding 3B1-R1 — atomic expected-grant reservation
+
+The f98 checkpoint/earlier PASS remain historical, not proof of the correction.
+Final audit found a current-check/dequeue TOCTOU: a handoff could grant T between
+old view validation and unscoped reserve_send, and old pump then consumed T's
+queued effect and quarantined T. Manager approved exactly two additional paths,
+control/input_seat.hpp/.cpp: additive reserve_send(expected) checks the retained
+grant using existing Gate::matches under SAME gate before consuming; private
+reserve_send_locked holds the unchanged original body. Existing noarg method and
+ABI retain their behavior; null expected is never wildcard. No coordinator,
+ConsumerRuntime, dependency or ingress changes.
+
+Protected pump uses the scoped overload. Fresh owner validation is performed while
+holding that grant's reservation (not a mutex across IO); therefore an invalid
+old observation cannot revoke a replacement before reservation. Absence yields
+Idle/no operation, never permission or retirement evidence. Invalid facts after
+reservation still fail closed. Actual BeforeReserve seam completes a real handoff,
+enqueues T, and resumes old pump; old pump must leave T/current queue/nonce intact,
+then the fresh view sends the exact effect. Null and same-fields fresh allocation
+are separately rejected on the actual queue. RED a440f6e25c4d211db99abbe8fb4fab460128db69
+compiled and deterministically failed 2 cases / 7 of 34 assertions (exit42), without
+hang/sanitizer failure. Same test bytes are retained for GREEN; separate R1 raw
+proofs/results and f98 immutable snapshot are listed in the final report.
