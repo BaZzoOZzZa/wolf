@@ -256,7 +256,7 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     }
     if (owned)
       owned(HookPoint::BeforeReserve);
-    s.cell.reservation = s.router->reserve_send();
+    s.cell.reservation = s.router->reserve_send(view.grant_);
     if (!s.cell.reservation)
       return PumpResult::Idle;
     s.occupied = true;

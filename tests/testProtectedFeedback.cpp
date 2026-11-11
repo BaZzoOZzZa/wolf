@@ -891,3 +891,64 @@ TEST_CASE("Feedback cleanup reentry cannot publish a healthy release after revok
   REQUIRE(f.executor->status().sealed);
   REQUIRE_FALSE(f.executor->status().packet_live);
 }
+
+TEST_CASE("3B1-R1 old pump cannot dequeue feedback after real handoff grants fresh owner", "[feedback][3B1-r1]") {
+  Fixture f;
+  auto old_view = f.view();
+  f.effect(1, 2);
+  TransferResult transfer;
+  bool granted_inside_boundary = false;
+  auto result = f.executor->pump_one(old_view, [&](HookPoint point) {
+    if (point == HookPoint::BeforeReserve) {
+      transfer = f.transfer();
+      granted_inside_boundary = transfer.handle &&
+                                eventually([&] { return transfer.handle->status() == TransferStatus::Granted; });
+      if (granted_inside_boundary)
+        f.effect(123, 456);
+    }
+  });
+  REQUIRE(granted_inside_boundary);
+  CHECK(result == PumpResult::Idle); // no operation, not authority/release proof
+  CHECK_FALSE(f.seat->quarantined());
+  CHECK(f.key->next_sequence == 0);
+  CHECK(f.transport->creates == 0);
+  auto fresh = f.seat->current();
+  REQUIRE(fresh);
+  REQUIRE(fresh->owner.connection.matches(f.target.connection));
+  f.live_token = f.target.peer;
+  f.associated.connection_scope = f.target.connection;
+  f.associated.run_scope = f.target.source;
+  f.current = f.associated;
+  auto fresh_view = f.view(fresh);
+  REQUIRE(f.executor->pump_one(fresh_view) == PumpResult::Queued);
+  REQUIRE(f.key->next_sequence == 1);
+  REQUIRE(f.transport->wire.size() == 1);
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.transport->wire[0], key_hex, EncryptionMode::v2, Direction::host)) ==
+          "0B010A00000000000F007B00C801");
+  REQUIRE(f.executor->service());
+  REQUIRE_FALSE(f.seat->quarantined());
+}
+
+TEST_CASE("3B1-R1 null or stale expected reservation preserves actual current queue", "[feedback][3B1-r1]") {
+  Fixture f;
+  GrantHandle expected;
+  SECTION("null is not wildcard") {}
+  SECTION("same fields fresh grant allocation is stale") {
+    expected = std::make_shared<SeatGrant>(f.old->owner);
+  }
+  f.effect(123, 456);
+  auto rejected = f.seat->router()->reserve_send(expected);
+  CHECK_FALSE(rejected);
+  // RED teardown only: test owns any accidentally issued reservation; there are
+  // no packet/IO resources. This is not an executor completion shortcut.
+  if (rejected)
+    rejected->retire(true);
+  CHECK_FALSE(f.seat->quarantined());
+  REQUIRE(f.seat->current()->token.matches(f.old->token));
+  REQUIRE(f.key->next_sequence == 0);
+  auto view = f.view();
+  REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.transport->wire[0], key_hex, EncryptionMode::v2, Direction::host)) ==
+          "0B010A000000000000007B00C801");
+  REQUIRE(f.executor->service());
+}

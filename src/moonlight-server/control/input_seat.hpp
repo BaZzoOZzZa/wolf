@@ -120,6 +120,7 @@ public:
 };
 class SeatFeedbackRouter {
   std::shared_ptr<seat_detail::Gate> gate_;
+  std::shared_ptr<FeedbackReservation> reserve_send_locked();
   friend class InputSeat;
   explicit SeatFeedbackRouter(std::shared_ptr<seat_detail::Gate> gate) : gate_(std::move(gate)) {}
 
@@ -128,6 +129,9 @@ public:
   bool enqueue(SeatFeedback);
   void intake(int low, int high) noexcept;
   std::shared_ptr<FeedbackReservation> reserve_send();
+  // Exact retained grant checked under the same gate BEFORE consuming a record.
+  // Null/stale expected never acts as wildcard or revokes the current grant.
+  std::shared_ptr<FeedbackReservation> reserve_send(const GrantHandle &expected);
 };
 class InputSeat {
   friend class sessions::InputHandoff;
