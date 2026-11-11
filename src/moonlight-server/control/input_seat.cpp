@@ -187,19 +187,21 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
       sessions::protected_authority::Retirement retirement(gate);
       SeatValidation validation;
       bool bootstrap = false;
+      SeatCandidate bootstrap_candidate;
       {
         std::lock_guard lock(gate->mutex);
         bootstrap = gate->bootstrap;
-        if (bootstrap && retirement.reserve_locked())
+        if (bootstrap && retirement.reserve_locked()) {
           validation.swap(gate->initial_validation);
-        else if (bootstrap)
+          bootstrap_candidate = gate->current->owner;
+        } else if (bootstrap)
           protected_valid = false;
       }
       if (bootstrap) {
         try {
           protected_bootstrap = gate->authority->prepare_bootstrap(backend->generation());
           if (validation)
-            protected_valid = validation(gate->current->owner);
+            protected_valid = validation(bootstrap_candidate);
         } catch (...) {
           protected_valid = false;
         }
@@ -230,6 +232,8 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
           gate->bootstrap = false;
           const auto status = backend->listener_status();
           gate->open = accepted && valid && !gate->quarantined && !status.failed && !status.stop_requested;
+          if (gate->open && gate->authority)
+            gate->authority->commit_locked(protected_bootstrap);
           if (!gate->open)
             gate->quarantined = true;
           retired_validation.swap(gate->initial_validation);

@@ -346,3 +346,23 @@ submitted. Initial implementation is not a PASS claim. Allocation failure before
 not globally fault-injected. Fact/update/permit APIs are trusted C++ capabilities, not unforgeable public
 network credentials. Retry/key policy, real TLS provider, provisioning/readiness and all subsequent
 orchestration/route work remain proposed only. WoW/game/prefix/device restrictions are unchanged.
+
+3C1 concrete ownership/limits: sealed Facts use a private const AccessStore behind implementation
+storage, so standalone Seat fixtures acquire no new crypto link dependency. Gate retains current,
+bootstrap and pending sealed permits; provider resource/callback ownership is separate and never
+enters historical Evidence/route handles. One authority cleanup slot includes Unknown; no cleaner
+thread. `RetirementResource::retire()` may fail; its actual owner stays retained in the domain, with
+no retry/replacement or healthy ack. Final lifecycle destruction must itself safely own any external
+resource completion; this interface does not prove bounded physical teardown. Facade destruction
+closes retained Seat before releasing members outside gate. Active callers must retain their facade;
+concurrent destruction of an object being called is outside the C++ ownership contract.
+
+Operator counter exhaustion is sticky and denies late publication even when its last pending token
+has the same maximal sequence; the occupied update remains retained. Bootstrap route publication
+occurs only with successful checked neutral, typed validation and listener health. Additional protected
+validators may inspect Seat outside gate but must keep their existing nonblocking invocation contract;
+blocking destructor retirement is accounted independently. Invalid/refused unpublished inputs release
+outside locks but do not acquire permission or an effectful admission cleanup obligation. No full
+allocation-fault injection claim: pre-gate allocation rollback and sealed-data releases are source proof.
+Detailed commands, failures, preservation and final validation are recorded in
+[3C1 report](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-stage3C1.md).

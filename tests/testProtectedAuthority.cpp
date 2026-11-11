@@ -3,10 +3,11 @@
 #include <cerrno>
 #include <future>
 #include <sessions/input_handoff.hpp>
+#include <sessions/protected_access.hpp>
 #include <sessions/protected_authority.hpp>
 
 namespace pa = sessions::protected_authority;
-namespace access = sessions::protected_access;
+namespace facts_api = sessions::protected_access;
 using namespace control;
 using namespace sessions;
 using namespace streaming;
@@ -35,10 +36,10 @@ struct TestGate {
     cv.notify_all();
   }
 };
-struct Source : access::VerifiedIdentitySource {
+struct Source : facts_api::VerifiedIdentitySource {
   x509::x509_ptr cert;
   explicit Source(x509::x509_ptr cert) : cert(std::move(cert)) {}
-  access::VerifiedLeafSnapshot verified_leaf() const override {
+  facts_api::VerifiedLeafSnapshot verified_leaf() const override {
     return {cert, cert, 7};
   }
 };
@@ -46,20 +47,20 @@ const x509::x509_ptr &certificate() {
   static const auto cert = x509::generate_x509(x509::generate_key());
   return cert;
 }
-access::Principal principal() {
-  auto p = access::Principal::capture(Source(certificate()));
+facts_api::Principal principal() {
+  auto p = facts_api::Principal::capture(Source(certificate()));
   if (!p)
     throw std::runtime_error("certificate capture failed");
   return *p;
 }
 pa::FactHandle facts(const RunScope &run, std::string_view app = "42", bool allowed = true) {
-  auto leaf = access::Leaf::from_x509(certificate());
+  auto leaf = facts_api::Leaf::from_x509(certificate());
   if (!leaf)
     throw std::runtime_error("DER failed");
-  std::array<access::PinView, 1> pins{{{*leaf, 7}}};
-  const std::span<const access::PinView> acl = allowed ? std::span<const access::PinView>(pins)
-                                                       : std::span<const access::PinView>{};
-  std::array<access::RuleView, 1> rules{{{"game", app, acl}}};
+  std::array<facts_api::PinView, 1> pins{{{*leaf, 7}}};
+  const std::span<const facts_api::PinView> acl = allowed ? std::span<const facts_api::PinView>(pins)
+                                                          : std::span<const facts_api::PinView>{};
+  std::array<facts_api::RuleView, 1> rules{{{"game", app, acl}}};
   return pa::Facts::prepare(rules, "game", app, run, pa::PairingRevision::fresh(0));
 }
 struct IO {
@@ -288,7 +289,7 @@ TEST_CASE(
   CHECK(f.handoff->request(TransferToken::fresh(0), std::move(s)).admission == TransferAdmission::Invalid);
   CHECK(f.seat->current()->token.matches(f.old->token));
   auto changed = x509::generate_x509(x509::generate_key());
-  auto p = access::Principal::capture(Source(changed));
+  auto p = facts_api::Principal::capture(Source(changed));
   REQUIRE(p);
   CHECK_FALSE(f.authority->capture_selection(f.next, *p));
 }
@@ -298,7 +299,9 @@ TEST_CASE("Protected real joint ticket precedes old registry removal and exact r
   auto blocked = f.consumer();
   auto backend = f.seat->backend_identity();
   auto generation = f.seat->generation();
-  auto transfer = f.transfer();
+  auto expected_selection = f.selection();
+  auto expected_route = expected_selection.authority;
+  auto transfer = f.handoff->request(TransferToken::fresh(0), std::move(expected_selection));
   REQUIRE(transfer.admission == TransferAdmission::Accepted);
   REQUIRE(transfer.handle->saved_ticket());
   CHECK_FALSE(transfer.handle->saved_ticket()->complete());
@@ -310,6 +313,7 @@ TEST_CASE("Protected real joint ticket precedes old registry removal and exact r
   CHECK(transfer.handle->status() == TransferStatus::Pending);
   blocked->release();
   REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
+  CHECK(f.authority->route() == expected_route);
   CHECK(f.seat->backend_identity() == backend);
   CHECK(f.seat->generation().matches(generation));
   CHECK_FALSE(f.authority->close_exact(f.initial.connection, f.initial.peer));
@@ -492,4 +496,122 @@ TEST_CASE("Protected optional validation runs outside gate and cannot escape cur
   REQUIRE(eventually([&] { return result.handle->status() == TransferStatus::Granted; }));
   REQUIRE(f.authority->close_exact(f.op, f.original));
   CHECK_FALSE(f.handoff->prepared_admission(result.handle, f.next.connection, f.next.peer));
+}
+
+TEST_CASE("Protected facade loss closes retained seat without recreating backend", "[protected-authority]") {
+  Fixture f;
+  const auto backend = f.seat->backend_identity();
+  f.authority.reset();
+  CHECK(f.seat->quarantined());
+  CHECK_FALSE(f.seat->current());
+  CHECK(f.seat->submit(f.command(f.old)) == SeatAdmission::Quarantined);
+  CHECK(f.seat->backend_identity() == backend);
+}
+TEST_CASE("Protected bootstrap validator actual capture retirement precedes initial grant", "[protected-authority]") {
+  auto gate = std::make_shared<TestGate>();
+  auto holder = std::make_shared<Capture>();
+  holder->gate = gate;
+  std::atomic_bool reentered = false;
+  Fixture f(true, [holder](const auto &) { return true; });
+  f.gates.push_back(gate);
+  holder->after = [&] {
+    (void)f.seat->current();
+    (void)f.authority->status();
+    reentered = true;
+  };
+  holder.reset();
+  REQUIRE(eventually([&] { return f.io->gate.entered.load(); }));
+  f.io->gate.release();
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  CHECK(f.authority->status().cleanup_pending);
+  CHECK_FALSE(f.seat->current());
+  f.handoff->poll();
+  gate->release();
+  REQUIRE(eventually([&] { return reentered.load(); }));
+  REQUIRE(eventually([&] { return bool(f.seat->current()); }));
+}
+
+TEST_CASE("Protected failed bootstrap never publishes a route even with historical allowed evidence",
+          "[protected-authority]") {
+  for (bool failed_io : {true, false}) {
+    Fixture f(true, [failed_io](const auto &) { return failed_io; });
+    REQUIRE(eventually([&] { return f.io->gate.entered.load(); }));
+    f.io->failed = failed_io;
+    f.io->gate.release();
+    REQUIRE(eventually([&] { return f.seat->quarantined(); }));
+    CHECK_FALSE(f.seat->current());
+    CHECK_FALSE(f.authority->route());
+    CHECK(f.original->evaluate(principal()).result == facts_api::Result::Allowed);
+  }
+}
+
+TEST_CASE("Protected absent principal and empty ACL refuse before backend publication", "[protected-authority]") {
+  const auto run = RunScope::fresh("L");
+  const auto cap = pa::OperatorCapability::fresh(0);
+  SeatCandidate c{RunScope::fresh("42"),
+                  run,
+                  ConnectionScope::fresh(42),
+                  PeerToken::fresh(0),
+                  BindingRevision::fresh(0),
+                  0};
+  auto empty = facts(run, "42", false);
+  CHECK_FALSE(empty); // actual 3A refuses this policy before any factory exists
+  CHECK_THROWS_AS((pa::ProtectedAuthorityDomain(pa::PreparedFacts{empty, {}}, cap)), std::invalid_argument);
+  pa::ProtectedAuthorityDomain domain({facts(run), {}}, cap);
+  bool called = false;
+  CHECK_THROWS_AS(domain.create_seat(c,
+                                     facts_api::Principal{},
+                                     {true, true, true},
+                                     [&](auto) -> std::shared_ptr<CheckedXboxBackend> {
+                                       called = true;
+                                       return {};
+                                     }),
+                  std::invalid_argument);
+  CHECK_FALSE(called);
+  CHECK_FALSE(domain.status().installed);
+}
+TEST_CASE("Protected launch rollback consumes domain and never falls back to plain seat", "[protected-authority]") {
+  const auto run = RunScope::fresh("L");
+  pa::ProtectedAuthorityDomain domain({facts(run), {}}, pa::OperatorCapability::fresh(0));
+  SeatCandidate c{RunScope::fresh("42"),
+                  run,
+                  ConnectionScope::fresh(42),
+                  PeerToken::fresh(0),
+                  BindingRevision::fresh(0),
+                  0};
+  auto io = std::make_shared<IO>();
+  size_t calls = 0;
+  auto factory = [&](auto callback) {
+    ++calls;
+    auto xbox = inputtino::checked::Xbox::adopt({io, 42}, io->ops(), std::move(callback), [](auto work) {
+      return std::thread(std::move(work));
+    });
+    return std::make_shared<CheckedXboxBackend>(std::move(xbox));
+  };
+  CHECK_THROWS_AS(
+      domain.create_seat(c, principal(), {true, true, true}, factory, {}, {}, [](auto) { return std::thread{}; }),
+      std::runtime_error);
+  CHECK(domain.status().quarantined);
+  CHECK(domain.status().closed);
+  CHECK_FALSE(domain.route());
+  CHECK_THROWS_AS(domain.create_seat(c, principal(), {true, true, true}, factory), std::invalid_argument);
+  CHECK(calls == 1);
+}
+
+TEST_CASE("Protected exhausted close invalidates the last pending update without counter wrap",
+          "[protected-authority]") {
+  for (bool begin_again : {true, false}) {
+    Fixture f(false, {}, {}, 1);
+    auto token = f.authority->begin_update(f.op, f.original);
+    REQUIRE(token.result == pa::Result::Accepted);
+    if (begin_again)
+      CHECK(f.authority->begin_update(f.op, f.original).result == pa::Result::Unknown);
+    else
+      CHECK(f.authority->close_exact(f.op, f.original));
+    CHECK(f.authority->publish_prepared(token.token, {facts(f.destination), {}}) == pa::Result::Stale);
+    CHECK(f.authority->facts() == f.original);
+    CHECK(f.authority->status().sequence == 1);
+    CHECK(f.authority->status().update_pending); // retained exhausted/Unknown obligation
+    CHECK_FALSE(f.seat->current());
+  }
 }

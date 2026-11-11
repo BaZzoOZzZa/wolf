@@ -1,14 +1,16 @@
 #include "protected_authority.hpp"
+#include "protected_access.hpp"
 #ifdef __linux__
 #include <stdexcept>
 namespace sessions::protected_authority {
-Facts::Facts(std::unique_ptr<const access::AccessStore> store,
-             std::string game,
-             std::string app,
-             access::TargetFact target,
-             PairingRevision pairing)
-    : store_(std::move(store)), game_(std::move(game)), app_(std::move(app)), target(std::move(target)),
-      pairing(std::move(pairing)) {}
+struct Facts::Data {
+  std::unique_ptr<const access::AccessStore> store;
+  std::string game, app;
+  access::TargetFact target;
+};
+Facts::Facts(std::unique_ptr<const Data> data, control::RunScope run, PairingRevision pairing)
+    : data_(std::move(data)), target_run(std::move(run)), pairing(std::move(pairing)) {}
+Facts::~Facts() = default;
 std::shared_ptr<const Facts> Facts::prepare(std::span<const access::RuleView> rules,
                                             std::string_view game,
                                             std::string_view app,
@@ -23,20 +25,27 @@ std::shared_ptr<const Facts> Facts::prepare(std::span<const access::RuleView> ru
   if (!target)
     return {};
   // Mutable store is consumed here: no caller has ever received an alias.
-  return std::shared_ptr<const Facts>(
-      new Facts(std::move(store), std::string(game), std::string(app), *target, std::move(pairing)));
+  auto data = std::make_unique<Data>(Data{std::move(store), std::string(game), std::string(app), *target});
+  return std::shared_ptr<const Facts>(new Facts(std::move(data), std::move(run), std::move(pairing)));
 }
 access::Evaluation Facts::evaluate(const access::Principal &principal) const {
-  return store_->evaluate(principal, game_, app_);
+  return data_->store->evaluate(principal, data_->game, data_->app);
 }
 bool Facts::locally_current(const access::Evidence &evidence) const {
-  return store_->is_current(evidence);
+  return data_->store->is_current(evidence);
 }
 ProtectedAuthorityDomain::ProtectedAuthorityDomain(PreparedFacts prepared, OperatorCapability cap, uint64_t limit)
     : gate_(std::make_shared<control::seat_detail::Gate>()) {
   if (!prepared.facts || !cap || !limit)
     throw std::invalid_argument("Missing protected authority facts/capacity");
   gate_->authority = std::make_shared<Cell>(std::move(prepared), std::move(cap), limit);
+}
+ProtectedAuthorityDomain::~ProtectedAuthorityDomain() {
+  // Facade loss is not permission to keep using a retained Seat. Actual Seat
+  // worker join/member retirement follows this scope, outside the gate.
+  std::lock_guard lock(gate_->mutex);
+  gate_->authority->closed_ = true;
+  gate_->close(true);
 }
 std::shared_ptr<control::InputSeat> ProtectedAuthorityDomain::create_seat(control::SeatCandidate candidate,
                                                                           const access::Principal &principal,
@@ -47,7 +56,7 @@ std::shared_ptr<control::InputSeat> ProtectedAuthorityDomain::create_seat(contro
                                                                           control::SeatThreadFactory start) {
   auto captured = facts();
   auto evaluation = captured->evaluate(principal); // parsing/store lock outside gate
-  if (!candidate.valid() || !candidate.destination.matches(captured->target.run()) ||
+  if (!candidate.valid() || !candidate.destination.matches(captured->target_run) ||
       evaluation.result != access::Result::Allowed)
     throw std::invalid_argument("Bootstrap identity not allowed for exact destination");
   auto &c = *gate_->authority;
@@ -59,7 +68,12 @@ std::shared_ptr<control::InputSeat> ProtectedAuthorityDomain::create_seat(contro
   }
   // All allocations/callback owners prepared before publication and backend start.
   try {
-    auto bootstrap = PermitHandle(new Permit(c.domain_, captured, 0, evaluation.evidence, candidate, {}));
+    auto bootstrap = PermitHandle(new Permit(c.domain_,
+                                             captured,
+                                             0,
+                                             std::make_shared<const access::Evidence>(evaluation.evidence),
+                                             candidate,
+                                             {}));
     {
       std::lock_guard lock(gate_->mutex);
       if (c.closed_ || c.sequence_ != 0)
@@ -85,6 +99,10 @@ FactHandle ProtectedAuthorityDomain::facts() const {
   std::lock_guard lock(gate_->mutex);
   return gate_->authority->facts_;
 }
+PermitHandle ProtectedAuthorityDomain::route() const {
+  std::lock_guard lock(gate_->mutex);
+  return gate_->authority->route_;
+}
 Status ProtectedAuthorityDomain::status() const {
   std::lock_guard lock(gate_->mutex);
   const auto &c = *gate_->authority;
@@ -98,18 +116,23 @@ PermitHandle ProtectedAuthorityDomain::capture_selection(const control::SeatCand
   const auto &c = *gate_->authority;
   {
     std::lock_guard lock(gate_->mutex);
-    if (c.closed_ || gate_->quarantined || !gate_->device)
+    if (c.closed_ || gate_->quarantined || !gate_->device.matches(gate_->device))
       return {};
     captured = c.facts_;
     device = gate_->device;
     seq = c.sequence_;
   }
-  if (!candidate.valid() || !candidate.destination.matches(captured->target.run()))
+  if (!candidate.valid() || !candidate.destination.matches(captured->target_run))
     return {};
   auto evaluated = captured->evaluate(principal);
   if (evaluated.result != access::Result::Allowed)
     return {};
-  auto permit = PermitHandle(new Permit(c.domain_, captured, seq, evaluated.evidence, candidate, device));
+  auto permit = PermitHandle(new Permit(c.domain_,
+                                        captured,
+                                        seq,
+                                        std::make_shared<const access::Evidence>(evaluated.evidence),
+                                        candidate,
+                                        device));
   std::lock_guard lock(gate_->mutex);
   return !gate_->quarantined && c.permits_locked(permit, candidate, gate_->device) ? permit : nullptr;
 }
@@ -122,6 +145,7 @@ UpdateResult ProtectedAuthorityDomain::begin_update(const OperatorCapability &ca
   if (!cap.matches(c.operator_) || !expected || c.facts_ != expected)
     return {Result::Stale, {}};
   if (c.sequence_ == c.sequence_limit_) {
+    c.sequence_exhausted_ = true;
     c.closed_ = true;
     gate_->close(true);
     return {Result::Unknown, {}};
@@ -146,6 +170,8 @@ bool ProtectedAuthorityDomain::close_exact(const OperatorCapability &cap, const 
   c.closed_ = true;
   if (c.sequence_ < c.sequence_limit_)
     ++c.sequence_;
+  else
+    c.sequence_exhausted_ = true;
   gate_->close(true);
   return true;
 }
@@ -161,6 +187,8 @@ bool ProtectedAuthorityDomain::close_exact(const control::ConnectionScope &conne
   c.closed_ = true;
   if (c.sequence_ < c.sequence_limit_)
     ++c.sequence_;
+  else
+    c.sequence_exhausted_ = true;
   gate_->close(true);
   return true;
 }
@@ -174,8 +202,8 @@ Result ProtectedAuthorityDomain::publish_prepared(const std::shared_ptr<const Up
   {
     std::lock_guard lock(gate_->mutex);
     auto &c = *gate_->authority;
-    if (!token || token != c.update_ || !token->domain_.matches(c.domain_) || token->sequence_ != c.sequence_ ||
-        token->expected_ != c.facts_)
+    if (c.sequence_exhausted_ || !token || token != c.update_ || !token->domain_.matches(c.domain_) ||
+        token->sequence_ != c.sequence_ || token->expected_ != c.facts_)
       return Result::Stale;
     if (!incoming.facts)
       return Result::Denied; // closed, pending cap retained

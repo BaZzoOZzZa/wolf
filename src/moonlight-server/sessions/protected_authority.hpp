@@ -2,7 +2,13 @@
 #ifdef __linux__
 #include <control/input_seat.hpp>
 #include <limits>
-#include <sessions/protected_access.hpp>
+#include <span>
+namespace sessions::protected_access {
+class Principal;
+class Evidence;
+struct Evaluation;
+struct RuleView;
+} // namespace sessions::protected_access
 
 namespace sessions::protected_authority {
 namespace access = protected_access;
@@ -17,12 +23,13 @@ using UpdateIdentity = wolf::core::sessions::Scope<unsigned, UpdateTag>;
 
 // Sealed 3A data only: diagnostic handles never retain arbitrary callbacks.
 class Facts {
-  const std::unique_ptr<const access::AccessStore> store_;
-  const std::string game_, app_;
-  Facts(std::unique_ptr<const access::AccessStore>, std::string, std::string, access::TargetFact, PairingRevision);
+  struct Data;
+  const std::unique_ptr<const Data> data_;
+  Facts(std::unique_ptr<const Data>, control::RunScope, PairingRevision);
 
 public:
-  const access::TargetFact target;
+  ~Facts();
+  const control::RunScope target_run;
   const PairingRevision pairing;
   static std::shared_ptr<const Facts> prepare(std::span<const access::RuleView>,
                                               std::string_view game,
@@ -50,11 +57,11 @@ class Permit {
   const DomainIdentity domain_;
   const FactHandle facts_;
   const uint64_t sequence_;
-  const access::Evidence evidence_;
+  const std::shared_ptr<const access::Evidence> evidence_;
   Permit(DomainIdentity domain,
          FactHandle facts,
          uint64_t sequence,
-         access::Evidence evidence,
+         std::shared_ptr<const access::Evidence> evidence,
          control::SeatCandidate candidate,
          control::DeviceGeneration device)
       : domain_(std::move(domain)), facts_(std::move(facts)), sequence_(sequence), evidence_(std::move(evidence)),
@@ -102,7 +109,7 @@ class Cell {
   std::unique_ptr<RetirementResource> resource_, failed_resource_;
   std::shared_ptr<const UpdateToken> update_;
   uint64_t sequence_ = 0, sequence_limit_;
-  bool closed_ = false, cleanup_ = false, cleanup_failed_ = false;
+  bool closed_ = false, cleanup_ = false, cleanup_failed_ = false, sequence_exhausted_ = false;
   PermitHandle bootstrap_, route_, pending_;
 
 public:
@@ -131,7 +138,6 @@ public:
   bool bootstrap_locked(const PermitHandle &p, const control::SeatCandidate &c, const control::DeviceGeneration &d) {
     if (cleanup_locked() || !permits_locked(p, c, d))
       return false;
-    route_ = p; // sealed data only, no arbitrary capture destruction
     return true;
   }
   void pending_locked(const PermitHandle &p) {
@@ -192,6 +198,7 @@ public:
   ProtectedAuthorityDomain(PreparedFacts,
                            OperatorCapability,
                            uint64_t sequence_limit = std::numeric_limits<uint64_t>::max());
+  ~ProtectedAuthorityDomain(); // lifecycle owner only; close before releasing owned Seat
   std::shared_ptr<control::InputSeat> create_seat(control::SeatCandidate,
                                                   const access::Principal &,
                                                   control::ProtectedInventory,
@@ -200,6 +207,7 @@ public:
                                                   control::SeatPolicy = {},
                                                   control::SeatThreadFactory = control::start_seat_thread);
   FactHandle facts() const;
+  PermitHandle route() const; // historical binding inspection, never permission
   Status status() const;
   PermitHandle capture_selection(const control::SeatCandidate &, const access::Principal &) const;
   UpdateResult begin_update(const OperatorCapability &, const FactHandle &expected);
