@@ -47,8 +47,10 @@ struct ProtectedRuntimeOwner::State {
   mutable std::mutex mutex;
   std::condition_variable wake;
   std::array<Cell, 4> cells;
+  std::array<unsigned, 4> order{};
+  size_t queued = 0;
   std::atomic_bool stop{false}, unknown{false}, started{false};
-  size_t bytes = sizeof(cells);
+  size_t bytes = sizeof(cells) + sizeof(order);
   protected_authority::OperatorCapability op;
   protected_authority::FactHandle facts;
   std::unique_ptr<protected_authority::ProtectedAuthorityDomain> authority;
@@ -156,6 +158,7 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
     retired = std::move(cell.receipt);
     cell.receipt = receipt;
     cell.job.swap(job); // zero copy; no arbitrary capture destruction under lock
+    s.order[s.queued++] = unsigned(cell.receipt->identity.id()); // fixed FIFO, no growing history
   }
   s.wake.notify_one();
   return {RuntimeSubmission::Accepted, std::move(receipt)};
@@ -168,27 +171,19 @@ void ProtectedRuntimeOwner::run() {
     unsigned index = 0;
     {
       std::unique_lock lock(s.mutex);
-      s.wake.wait(lock, [&] {
-        for (auto &c : s.cells)
-          if (c.job && c.receipt->state == RuntimeJobState::Queued)
-            return true;
-        return s.stop.load();
-      });
-      bool found = false;
-      for (unsigned i = 0; i < 4; ++i) {
-        auto &c = s.cells[i];
-        if (c.job && c.receipt->state == RuntimeJobState::Queued) {
-          index = i;
-          job = std::move(c.job);
-          receipt = c.receipt;
-          receipt->state = RuntimeJobState::Executing;
-          found = true;
-          break;
-        }
-      }
-      if (!found)
+      s.wake.wait(lock, [&] { return s.queued || s.stop.load(); });
+      if (!s.queued)
         break;
+      index = s.order[0];
+      for (size_t i = 1; i < s.queued; ++i)
+        s.order[i - 1] = s.order[i];
+      --s.queued;
+      auto &c = s.cells[index];
+      job = std::move(c.job);
+      receipt = c.receipt;
+      receipt->state = RuntimeJobState::Executing;
     }
+    std::shared_ptr<const TransferHandle> attempted_media;
     bool failed = false, refused = s.stop || s.unknown;
     try {
       if (!refused && job->cell == RuntimeCell::Preparation) {
@@ -230,6 +225,7 @@ void ProtectedRuntimeOwner::run() {
             !job->work) {
           refused = true;
         } else {
+          attempted_media = exact;
           const auto &candidate = exact->prepared_grant->owner;
           streaming::ConsumerRuntime::Work work;
           work.swap(job->work);
@@ -258,7 +254,16 @@ void ProtectedRuntimeOwner::run() {
       }
     } catch (...) {
       failed = true;
+      if (attempted_media) {
+        const auto &candidate = attempted_media->prepared_grant->owner;
+        s.handoff->candidate_gone(candidate.connection, candidate.peer);
+        try {
+          s.failed_media = s.composition->runtime()->revoke(candidate.connection);
+        } catch (...) { /* Missing ticket is Unknown, never successful release. Composition stays retained. */
+        }
+      }
     }
+    attempted_media.reset(); // before cell release/next preparation; outside all locks
     if (failed) {
       s.unknown = true;
       request_stop();
@@ -286,6 +291,7 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
     s.handoff->poll_deadline();
   std::shared_ptr<const TransferHandle> observed;
   RuntimeOwnerStatus result{};
+  const bool authority_unknown = s.authority && s.authority->status().quarantined;
   {
     std::lock_guard lock(s.mutex);
     observed = s.transfer.lock();
@@ -294,7 +300,8 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
       occupied += c.occupied;
     result = {s.started, s.stop, s.unknown, joined_, occupied, s.bytes};
   }
-  result.unknown = result.unknown || (observed && observed->status() == TransferStatus::Quarantined);
+  result.unknown = result.unknown || authority_unknown ||
+                   (observed && observed->status() == TransferStatus::Quarantined);
   return result;
 }
 std::shared_ptr<const TransferHandle> ProtectedRuntimeOwner::transfer() const {

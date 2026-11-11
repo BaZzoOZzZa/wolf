@@ -196,7 +196,8 @@ void run() {
   auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
   auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
   // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server, sessions::consumer_runtime(consumers));
+  auto moonlight_sess_handlers =
+      sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server, sessions::consumer_runtime(consumers));
   // Setup event handlers for player Lobbies
   auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 

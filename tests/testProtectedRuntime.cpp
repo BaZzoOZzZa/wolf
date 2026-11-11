@@ -561,3 +561,15 @@ TEST_CASE("Protected trusted clock fault quarantines Pending without status exce
   CHECK(entries.load() == 2);
   gate->release();
 }
+
+TEST_CASE("Protected invalid bootstrap never falls back and consumes the domain reservation", "[protected-runtime]") {
+  Fixture f(false);
+  auto bootstrap = f.bootstrap();
+  bootstrap.initial.destination = RunScope::fresh("foreign");
+  CHECK_FALSE(f.owner->start(std::move(bootstrap)));
+  CHECK(f.io->writes == 0);
+  CHECK(f.owner->status().unknown);
+  CHECK_FALSE(f.composition->contains(f.initial.connection));
+  CHECK_FALSE(f.owner->start(f.bootstrap()));
+  CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Closed);
+}

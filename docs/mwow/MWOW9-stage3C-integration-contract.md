@@ -438,3 +438,22 @@ payload. Clock remains trusted nonblocking/nonreentrant. Owner status calls this
 This proves a responsive decision WHEN status/tick runs while a validator is blocked; it does not
 prove autonomous notification within five seconds when every caller is idle/blocked. 3C3 periodic
 caller integration is still missing. Existing poll/F15 reservation behavior is unchanged.
+
+Final lifetime boundary: start and destruction are single lifecycle-owner operations, not concurrent
+with facade calls; no facade publication before start returns. The worker's exit future covers actual
+thread/TLS exit; Joined means orchestration thread joined, NOT shared ConsumerRuntime/all media or
+all retained Unknown resources retired. The composition remains retained independently. Startup
+failure and Unknown consume its protected-owner slot permanently. Shutdown close uses retained exact
+operator/facts capability and covers Pending/bootstrap even when `seat.current()` is empty.
+Four cell indices use a fixed FIFO; queued/executing/retained failure payloads remain charged until
+actual destructor return (Unknown stays charged). Failed media exceptions revoke the captured exact
+candidate and retain its ticket when available; a missing/throwing revoke never proves release.
+Old transfer diagnostics are weak so they cannot extend an owned validator past real Handoff's
+retirement fence. External diagnostic/caller owners remain outside that completion claim.
+
+Software evidence and exact stack/queue IDs are recorded in the new report
+`/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-stage3C2.md`.
+Earlier reports/raw artifacts are immutable. No protected runtime construction/enabling in Wolf,
+no actual media descriptor-to-Gst adapter, no Loop cancellation/TLS/ANNOUNCE/selection integration,
+no bounded DeviceExecutor/readiness/singleton/reconciliation/physical proof is claimed. WoW requires
+new explicit permission; current game/prefix untouched; future local-game tests are a separate gate.
