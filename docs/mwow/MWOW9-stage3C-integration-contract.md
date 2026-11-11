@@ -366,3 +366,24 @@ outside locks but do not acquire permission or an effectful admission cleanup ob
 allocation-fault injection claim: pre-gate allocation rollback and sealed-data releases are source proof.
 Detailed commands, failures, preservation and final validation are recorded in
 [3C1 report](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-stage3C1.md).
+
+## 9. F15: shared validator invocation reservation
+
+Protected prepared admission now checks exact Granted/current/connection/peer/typed authority under
+Seat gate before invocation, and reserves the same single authority cleanup slot used by protected
+poll. Occupied means Capacity without a second callback or current-grant quarantine. The actual retained
+TransferHandle owns the same callable throughout outside-lock invocation; no std::function copy is used
+as synchronization. Under-gate identities/health/authority are checked again before real Runtime admit.
+The invocation reservation remains occupied through actual Work/hook/handle temporary destruction and
+F12 admission retirement; acknowledgement occurs outside their cleanup, not before it. Close, neutral
+and pending deadline checks remain independent. Pending/stale admission never invokes the callback.
+
+Audit: protected poll already reserves this slot before invoking its retained Pending handle; request's
+by-value actual validator runs before that callable is published into a TransferHandle; bootstrap owns
+its separate initial validator before open. Legacy request/poll/admission continue serial invocation under
+their original gate. Aliasing mutable state through distinct externally supplied callbacks is not made
+thread-safe by this contract. No new gate field/worker, Runtime/Seat/AccessStore/crypto/loop/ingress change.
+Two deterministic actual coordinator regressions use atomic entry counts/gates, not concurrent unsafe
+mutable state: premature Pending admission and overlapping Granted Audio/Video attempts, including
+close/revalidation and deadline progress. Their bytes are identical between semantic RED and GREEN.
+F15 evidence/report: /home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F15.md.
