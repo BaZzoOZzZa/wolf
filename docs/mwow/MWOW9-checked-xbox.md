@@ -88,3 +88,16 @@ Wine XInput mapping, other-local-game isolation, bounded physical termination,
 InputSeat/feedback send fences, checked mixed input and bounded Docker executor are
 not proven here. Inherited eventbus noexcept/EAGAIN and supervisor allocation failure
 remain separate gates. Backend review is required before stages 2/3 or enabling it.
+
+## F10/F11 regression checkpoint
+
+The checked-only descriptor builder is exposed in `checked::detail` and called
+by the actual checked factory before uinput creation. This RED checkpoint retains
+the previous advertised bits and listener decisions. Legacy constructors remain
+byte-identical. A stepped IO clock tests the actual owned listener, acknowledging
+completion at its next poll; teardown releases the worker even on failed assertions.
+New cases cover repeats/delays/continuous/nonpositive stop, active update, huge
+clock jumps, gain/overlap, erase/capacity and END failures, plus descriptor bits.
+The tracked driver accepts only exact previous header/cpp pairs for migration;
+overrides remain verify-only. Pristine application is staged and hash-verified
+before either addition is published; interruption fails closed on next verify.

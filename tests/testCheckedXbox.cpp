@@ -5,6 +5,8 @@
 #include <control/checked_xbox_backend.hpp>
 #include <deque>
 #include <future>
+#include <libevdev/libevdev.h>
+#include <limits>
 #include <linux/uinput.h>
 #include <mutex>
 #include <vector>
@@ -544,4 +546,282 @@ TEST_CASE("checked Xbox transient feedback IO remains cancellable", "[checked-xb
   CHECK_FALSE(f.xbox->listener_status().failed);
   CHECK(f.resource.expired());
   CHECK(f.fake->callbacks == 0);
+}
+
+namespace {
+// One poll iteration per supplied step. The next poll acknowledges that the
+// actual listener finished IO, scheduling and callbacks for the previous step.
+// No scheduler/effect model exists in this harness. Teardown always releases it.
+struct FFDriver {
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool idle = false, ready = false, closing = false, finished = false;
+  int64_t milliseconds = 0;
+  std::optional<input_event> event;
+  ff_effect upload{};
+  int erase_id = 0, upload_result = 123, erase_result = 123;
+  unsigned long fail_end = 0;
+  std::vector<unsigned long> requests;
+  std::pair<int, int> output{0, 0};
+  std::unique_ptr<Xbox> xbox;
+  FFDriver() {
+    detail::Io io{[](int, const input_event &, size_t) -> IoResult { throw std::runtime_error("unexpected write"); },
+                  [this](int, int) {
+                    std::unique_lock lock(mutex);
+                    idle = true;
+                    cv.notify_all();
+                    cv.wait(lock, [&] { return ready || closing; });
+                    ready = false;
+                    return IoResult{event.has_value() ? 1 : 0, 0};
+                  },
+                  [this](int, input_event &out, size_t) {
+                    std::lock_guard lock(mutex);
+                    out = event.value();
+                    event.reset();
+                    return IoResult{sizeof(input_event), 0};
+                  },
+                  [this](int, unsigned long op, void *arg) {
+                    std::lock_guard lock(mutex);
+                    requests.push_back(op);
+                    if (op == UI_BEGIN_FF_UPLOAD)
+                      static_cast<uinput_ff_upload *>(arg)->effect = upload;
+                    else if (op == UI_END_FF_UPLOAD)
+                      upload_result = static_cast<uinput_ff_upload *>(arg)->retval;
+                    else if (op == UI_BEGIN_FF_ERASE)
+                      static_cast<uinput_ff_erase *>(arg)->effect_id = erase_id;
+                    else if (op == UI_END_FF_ERASE)
+                      erase_result = static_cast<uinput_ff_erase *>(arg)->retval;
+                    else
+                      throw std::runtime_error("unexpected FF ioctl");
+                    return op == fail_end ? -1 : 0;
+                  },
+                  [this] {
+                    std::lock_guard lock(mutex);
+                    return Clock::time_point{} + std::chrono::milliseconds(milliseconds);
+                  }};
+    auto resource = std::shared_ptr<int>(new int(0), [this](int *p) {
+      delete p;
+      std::lock_guard lock(mutex);
+      finished = true;
+      cv.notify_all();
+    });
+    xbox = Xbox::adopt(
+        {std::move(resource), 42},
+        std::move(io),
+        [this](int low, int high) {
+          std::lock_guard lock(mutex);
+          output = {low, high};
+        },
+        [](auto work) { return std::thread(std::move(work)); });
+    std::unique_lock lock(mutex);
+    if (!cv.wait_for(lock, 2s, [&] { return idle; })) {
+      closing = true;
+      cv.notify_all();
+      throw std::runtime_error("FF worker did not start");
+    }
+  }
+  ~FFDriver() {
+    xbox->request_stop();
+    {
+      std::lock_guard lock(mutex);
+      closing = true;
+      cv.notify_all();
+    }
+    xbox->retire_until(Clock::now() + 2s);
+    xbox.reset(); // join before mutex/callback state destruction, including RED unwind
+  }
+  void step(int64_t time, std::optional<input_event> next = {}) {
+    std::unique_lock lock(mutex);
+    REQUIRE(idle);
+    REQUIRE_FALSE(finished);
+    milliseconds = time;
+    event = next;
+    idle = false;
+    ready = true;
+    cv.notify_all();
+    REQUIRE(cv.wait_for(lock, 2s, [&] { return idle || finished; }));
+  }
+  void send(int64_t time, uint16_t type, uint16_t code, int value) {
+    input_event e{};
+    e.type = type;
+    e.code = code;
+    e.value = value;
+    step(time, e);
+  }
+  void put(int64_t time, int id, int length, int delay = 0, int strong = 1000, int weak = 2000) {
+    {
+      std::lock_guard lock(mutex);
+      upload = {};
+      upload.type = FF_RUMBLE;
+      upload.id = id;
+      upload.replay.length = length;
+      upload.replay.delay = delay;
+      upload.u.rumble.strong_magnitude = strong;
+      upload.u.rumble.weak_magnitude = weak;
+    }
+    send(time, EV_UINPUT, UI_FF_UPLOAD, 7);
+    CHECK(upload_result == 0);
+  }
+  void expect(int low, int high) {
+    std::lock_guard lock(mutex);
+    CHECK(output.first == low);
+    CHECK(output.second == high);
+  }
+};
+} // namespace
+
+TEST_CASE("checked FF advancing clock delay repeat continuous and stop", "[checked-xbox][ff-regression]") {
+  FFDriver f;
+  SECTION("three delayed repeats and expiry") {
+    f.put(0, 1, 100, 20);
+    f.send(0, EV_FF, 1, 3);
+    f.expect(0, 0);
+    f.step(19);
+    f.expect(0, 0);
+    f.step(20);
+    f.expect(1000, 2000);
+    f.step(119);
+    f.expect(1000, 2000);
+    f.step(120);
+    f.expect(0, 0);
+    f.step(140);
+    f.expect(1000, 2000);
+    f.step(240);
+    f.expect(0, 0);
+    f.step(260);
+    f.expect(1000, 2000);
+    f.step(360);
+    f.expect(0, 0);
+    f.step(100000);
+    f.expect(0, 0);
+  }
+  SECTION("continuous length zero and nonpositive stop") {
+    f.put(0, 1, 0, 10);
+    f.send(0, EV_FF, 1, 3);
+    f.step(10);
+    f.expect(1000, 2000);
+    f.step(1000000000);
+    f.expect(1000, 2000);
+    f.send(1000000000, EV_FF, 1, 0);
+    f.expect(0, 0);
+    f.send(1000000000, EV_FF, 1, 1);
+    f.step(1000000010);
+    f.expect(1000, 2000);
+    f.send(1000000010, EV_FF, 1, -1);
+    f.expect(0, 0);
+    f.step(1000000020);
+    f.expect(0, 0);
+  }
+  SECTION("negative value stops a finite effect too") {
+    f.put(0, 1, 100);
+    f.send(0, EV_FF, 1, 1);
+    f.expect(1000, 2000);
+    f.send(1, EV_FF, 1, -7);
+    f.expect(0, 0);
+  }
+  SECTION("huge repeat and clock jump are bounded") {
+    f.put(0, 1, 1);
+    f.send(0, EV_FF, 1, std::numeric_limits<int>::max());
+    f.step(2147483646LL);
+    f.expect(1000, 2000);
+    f.step(2147483647LL);
+    f.expect(0, 0);
+    // Max chrono time is representable; no deadline addition overflow.
+    const auto max_ms = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::duration::max()).count();
+    f.put(max_ms - 1, 1, 65535, 65535);
+    f.send(max_ms - 1, EV_FF, 1, std::numeric_limits<int>::max());
+    f.step(max_ms);
+    f.expect(0, 0);
+  }
+}
+
+TEST_CASE("checked FF active update retains remaining repetitions and restarts timing",
+          "[checked-xbox][ff-regression]") {
+  FFDriver f;
+  f.put(0, 1, 100, 20);
+  f.send(0, EV_FF, 1, 3);
+  f.step(140);
+  f.expect(1000, 2000);              // second repetition, two remain
+  f.put(150, 1, 50, 10, 3000, 4000); // active update, no separate play
+  f.expect(0, 0);
+  f.step(160);
+  f.expect(3000, 4000);
+  f.step(210);
+  f.expect(0, 0);
+  f.step(220);
+  f.expect(3000, 4000);
+  f.step(270);
+  f.expect(0, 0);
+  f.put(300, 1, 50, 0, 9000, 9000); // expired update must not resurrect
+  f.expect(0, 0);
+}
+
+TEST_CASE("checked FF gain overlap erase capacity and END failures", "[checked-xbox][ff-regression]") {
+  FFDriver f;
+  SECTION("overlap saturates and gain scales each contribution") {
+    f.put(0, 1, 1000, 0, 40000, 10000);
+    f.put(0, 2, 1000, 0, 40000, 20000);
+    f.send(0, EV_FF, 1, 1);
+    f.send(0, EV_FF, 2, 1);
+    f.expect(65535, 30000);
+    f.send(1, EV_FF, FF_GAIN, 32768);
+    f.expect(40000, 15000);
+    f.erase_id = 1;
+    f.send(2, EV_UINPUT, UI_FF_ERASE, 9);
+    CHECK(f.erase_result == 0);
+    f.expect(20000, 10000);
+    f.send(3, EV_FF, FF_GAIN, 0);
+    f.expect(0, 0);
+    f.send(4, EV_FF, FF_GAIN, 65535);
+    f.expect(40000, 20000);
+    f.erase_id = 2;
+    f.send(5, EV_UINPUT, UI_FF_ERASE, 9);
+    f.expect(0, 0);
+  }
+  SECTION("capacity sixteen and existing update at capacity") {
+    for (int i = 0; i < 16; ++i)
+      f.put(0, i, 100);
+    f.upload.id = 16;
+    f.send(0, EV_UINPUT, UI_FF_UPLOAD, 7);
+    CHECK(f.upload_result < 0);
+    f.put(0, 1, 100, 0, 5000, 6000);
+    f.send(0, EV_FF, 1, 1);
+    f.expect(5000, 6000);
+    f.erase_id = 2;
+    f.send(0, EV_UINPUT, UI_FF_ERASE, 8);
+    f.put(0, 16, 100);
+  }
+  SECTION("successful BEGIN then failing END upload is terminal") {
+    f.fail_end = UI_END_FF_UPLOAD;
+    f.put(0, 1, 100);
+    CHECK(f.requests == std::vector<unsigned long>{UI_BEGIN_FF_UPLOAD, UI_END_FF_UPLOAD});
+    CHECK(f.xbox->listener_status().failed);
+    CHECK(f.finished);
+    CHECK(f.xbox->retire_until(Clock::now() + 2s) == Retirement::Retired);
+  }
+  SECTION("successful BEGIN then failing END erase is terminal") {
+    f.put(0, 1, 100);
+    f.send(0, EV_FF, 1, 1);
+    f.fail_end = UI_END_FF_ERASE;
+    f.erase_id = 1;
+    f.send(1, EV_UINPUT, UI_FF_ERASE, 8);
+    CHECK(f.requests ==
+          std::vector<unsigned long>{UI_BEGIN_FF_UPLOAD, UI_END_FF_UPLOAD, UI_BEGIN_FF_ERASE, UI_END_FF_ERASE});
+    CHECK(f.xbox->listener_status().failed);
+    CHECK(f.finished);
+    CHECK(f.xbox->retire_until(Clock::now() + 2s) == Retirement::Retired);
+  }
+}
+
+TEST_CASE("checked Xbox production descriptor is truthful before device publication", "[checked-xbox][ff-regression]") {
+  auto descriptor = detail::xbox_descriptor(inputtino::DeviceDefinition{});
+  REQUIRE(descriptor);
+  for (int code = 0; code < FF_CNT; ++code)
+    CHECK(bool(libevdev_has_event_code(descriptor.get(), EV_FF, code)) == (code == FF_RUMBLE || code == FF_GAIN));
+  auto encoded = encode(Frame{});
+  for (const auto &event : encoded)
+    CHECK(libevdev_has_event_code(descriptor.get(), event.type, event.code));
+  CHECK(libevdev_get_abs_minimum(descriptor.get(), ABS_X) == -32768);
+  CHECK(libevdev_get_abs_maximum(descriptor.get(), ABS_Y) == 32767);
+  CHECK(libevdev_get_abs_maximum(descriptor.get(), ABS_Z) == 255);
 }

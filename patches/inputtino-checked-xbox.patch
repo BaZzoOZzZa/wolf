@@ -2,7 +2,7 @@ diff --git a/include/inputtino/checked_xbox.hpp b/include/inputtino/checked_xbox
 new file mode 100644
 --- /dev/null
 +++ b/include/inputtino/checked_xbox.hpp
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,131 @@
 +#pragma once
 +
 +#include <inputtino/input.hpp>
@@ -15,6 +15,8 @@ new file mode 100644
 +#include <memory>
 +#include <optional>
 +#include <thread>
++
++struct libevdev;
 +
 +namespace inputtino::checked {
 +
@@ -70,6 +72,8 @@ new file mode 100644
 +};
 +
 +namespace detail {
++// Actual pre-publication descriptor; allocation only, no device open.
++std::shared_ptr<libevdev> xbox_descriptor(const DeviceDefinition& definition);
 +// Narrow production syscall boundary, also used by device-free tests. No default
 +// fallbacks in adopt(): every function must be supplied. Factory has std::thread's
 +// all-or-nothing contract: throwing means no thread was started.
@@ -134,7 +138,7 @@ diff --git a/src/uinput/checked_xbox.cpp b/src/uinput/checked_xbox.cpp
 new file mode 100644
 --- /dev/null
 +++ b/src/uinput/checked_xbox.cpp
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,425 @@
 +#include <inputtino/checked_xbox.hpp>
 +
 +#include <fcntl.h>
@@ -152,10 +156,6 @@ new file mode 100644
 +#include <mutex>
 +#include <stdexcept>
 +
-+namespace inputtino {
-+// Reuse the exact legacy Xbox capability definition, not its thread/state/setters.
-+Result<libevdev_uinput_ptr> create_xbox_controller(const DeviceDefinition& device);
-+} // namespace inputtino
 +namespace inputtino::checked {
 +namespace {
 +constexpr uint32_t supported_buttons = 0xf7ff;
@@ -166,6 +166,57 @@ new file mode 100644
 +    return {n, n < 0 ? errno : 0};
 +}
 +} // namespace
++
++std::shared_ptr<libevdev> detail::xbox_descriptor(const DeviceDefinition& device)
++{
++    std::shared_ptr<libevdev> dev(libevdev_new(), libevdev_free);
++    if (!dev)
++        throw std::bad_alloc();
++    libevdev_set_name(dev.get(), device.name.c_str());
++    libevdev_set_id_vendor(dev.get(), device.vendor_id);
++    libevdev_set_id_product(dev.get(), device.product_id);
++    libevdev_set_id_version(dev.get(), device.version);
++    libevdev_set_id_bustype(dev.get(), BUS_USB);
++
++    libevdev_enable_event_type(dev.get(), EV_KEY);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_WEST, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_EAST, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_NORTH, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SOUTH, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBL, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBR, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TR, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TL, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SELECT, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_MODE, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_START, nullptr);
++
++    libevdev_enable_event_type(dev.get(), EV_ABS);
++
++    input_absinfo dpad{0, -1, 1, 0, 0, 0};
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0Y, &dpad);
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0X, &dpad);
++
++    input_absinfo stick{0, -32768, 32767, 16, 128, 0};
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_X, &stick);
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RX, &stick);
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Y, &stick);
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RY, &stick);
++
++    input_absinfo trigger{0, 0, 255, 0, 0, 0};
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Z, &trigger);
++    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RZ, &trigger);
++
++    libevdev_enable_event_type(dev.get(), EV_FF);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_RUMBLE, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_CONSTANT, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_PERIODIC, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_SINE, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_RAMP, nullptr);
++    libevdev_enable_event_code(dev.get(), EV_FF, FF_GAIN, nullptr);
++
++    return dev;
++}
 +
 +EncodedFrame encode(const Frame& f)
 +{
@@ -256,10 +307,12 @@ new file mode 100644
 +std::unique_ptr<Xbox> Xbox::create(
 +    const DeviceDefinition& definition, Feedback feedback)
 +{
-+    auto result = create_xbox_controller(definition);
-+    if (!result)
-+        throw std::runtime_error(result.getErrorMessage());
-+    auto handle = std::move(*result);
++    auto descriptor = detail::xbox_descriptor(definition);
++    libevdev_uinput* raw = nullptr;
++    if (libevdev_uinput_create_from_device(
++            descriptor.get(), LIBEVDEV_UINPUT_OPEN_MANAGED, &raw) != 0)
++        throw std::runtime_error("Checked Xbox device creation failed");
++    libevdev_uinput_ptr handle(raw, libevdev_uinput_destroy);
 +    const int fd = libevdev_uinput_get_fd(handle.get());
 +    const int flags = fcntl(fd, F_GETFL);
 +    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
