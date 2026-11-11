@@ -4,6 +4,7 @@
 #include <immer/vector_transient.hpp>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
+#include <sessions/protected_runtime.hpp>
 #include <state/sessions.hpp>
 #include <streaming/consumer_events.hpp>
 #include <streaming/streaming.hpp>
@@ -20,6 +21,17 @@ immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server) {
+  auto composition = std::make_shared<::sessions::ConsumerComposition>(app_state->running_sessions);
+  return setup_moonlight_handlers(app_state, runtime_dir, audio_server, composition->runtime());
+}
+
+immer::vector<immer::box<events::EventBusHandlers>>
+setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
+                         const std::string &runtime_dir,
+                         const std::optional<AudioServer> &audio_server,
+                         std::shared_ptr<streaming::ConsumerRuntime> consumers) {
+  if (!consumers)
+    throw std::invalid_argument("Moonlight handlers require the shared consumer runtime");
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
 
   /*
@@ -242,9 +254,6 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
   // AppState/EventBus from work functions to avoid a bus -> runtime -> bus cycle.
   auto running = app_state->running_sessions;
   auto lobbies = app_state->lobbies;
-  auto consumers = std::make_shared<streaming::ConsumerRuntime>([running](const ConnectionScope &scope) {
-    return state::get_session_by_scope(running->load(), scope).has_value();
-  });
   for (const auto &handler : streaming::consumer_event_handlers(app_state->event_bus, consumers))
     handlers.push_back(handler);
 

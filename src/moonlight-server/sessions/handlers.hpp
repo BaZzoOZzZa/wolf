@@ -4,6 +4,7 @@
 #include <core/docker.hpp>
 #include <events/events.hpp>
 #include <state/data-structures.hpp>
+#include <streaming/consumer_runtime.hpp>
 
 namespace wolf::core::sessions {
 
@@ -20,6 +21,13 @@ immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server);
+
+// Explicit composition overload: this exact Runtime is also retained by protected orchestration.
+immer::vector<immer::box<events::EventBusHandlers>>
+setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
+                         const std::string &runtime_dir,
+                         const std::optional<AudioServer> &audio_server,
+                         std::shared_ptr<streaming::ConsumerRuntime> consumers);
 
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_lobbies_handlers(const immer::box<state::AppState> &app_state,

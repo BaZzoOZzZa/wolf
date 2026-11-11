@@ -283,3 +283,12 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-protected-authority-tests COMMAND wolf-protected-authority-tests)
     set_tests_properties(wolf-protected-authority-tests PROPERTIES LABELS "authority;isolated" TIMEOUT 90)
 endif ()
+
+# Disabled protected orchestration, actual shared Runtime/Seat/authority; injected IO only.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-protected-runtime-tests testProtectedRuntime.cpp)
+    target_compile_features(wolf-protected-runtime-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-protected-runtime-tests PRIVATE wolf::runner Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-protected-runtime-tests COMMAND wolf-protected-runtime-tests)
+    set_tests_properties(wolf-protected-runtime-tests PROPERTIES LABELS "authority;isolated" TIMEOUT 90)
+endif ()

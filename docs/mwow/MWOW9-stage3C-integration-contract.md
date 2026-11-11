@@ -387,3 +387,36 @@ Two deterministic actual coordinator regressions use atomic entry counts/gates, 
 mutable state: premature Pending admission and overlapping Granted Audio/Video attempts, including
 close/revalidation and deadline progress. Their bytes are identical between semantic RED and GREEN.
 F15 evidence/report: /home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F15.md.
+
+## 10. 3C2 implementation checkpoint (disabled internal composition)
+
+Concrete ownership: ConsumerComposition owns one real ConsumerRuntime and a data-only atomic
+snapshot of at most two exact transport ConnectionScopes. Its Current combines that snapshot with
+the unchanged running_sessions exact-scope predicate; no Seat/authority/queue lock or user callback.
+Wolf constructs only this composition before handler registration. The compatible three-argument
+moonlight setup delegates to the explicit-runtime overload; Wolf uses the explicit shared instance.
+No protected owner/Seat/game is constructed by Wolf.
+
+ProtectedRuntimeOwner is a start-once lifecycle object, reserved before bootstrap/thread launch;
+it retains the actual authority/Seat/Handoff bundle and the same composition. A single worker runs
+request and Audio/Video admit_prepared serially. Four fixed cells (preparation/audio/video/retirement)
+retain queued, popped and Unknown obligations. Inputs transfer unique ownership (no callback or byte
+copy at submission); sizeof(job), vector/string capacity and fixed-cell overhead count against 64KiB.
+External capture graphs, dependencies, thread stacks and allocator overhead are not RSS-bounded by
+that logical budget. Refused inputs are destroyed outside locks. Cell identity/charge survive all
+payload destruction, including reentrant cleanup; Unknown retains its cell and forbids replacement.
+
+Queue mutex never nests Seat/Runtime/authority calls or arbitrary destruction. Execution moves a
+payload out while retaining its charged cell; publication moves retired diagnostic owners out before
+unlock. close_exact and stop are out-of-band, independent of blocked execution/cleanup. Existing
+Handoff owns the five-second decision and exact saved ticket; no copied permission state or new
+transfer deadline. Old lifetime can be pruned only after exact saved-ticket capture. Media payloads
+must bind source connection/peer to the actual handle and producer to destination L. Failure closes
+that exact candidate and retains its real revoke ticket, never claims partial media readiness.
+
+Thread exit uses notify-at-thread-exit future plus actual join, not an early returned flag. Factory
+is trusted all-or-nothing; failed/nonjoinable launch consumes the start-once cap. Destructor is
+lifecycle-only, can wait indefinitely on blocked user cleanup, and cannot run on its worker/callback.
+Prepared callbacks/Work are trusted internal seams; actual Gst work construction, loop cancellation,
+TLS/candidate/ANNOUNCE routing and enabled readiness remain 3C3/later gates. Tests use real classes,
+DER facts and injected checked IO, with no game/device/network runtime.
