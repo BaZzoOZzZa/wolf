@@ -952,3 +952,189 @@ TEST_CASE("3B1-R1 null or stale expected reservation preserves actual current qu
           "0B010A000000000000007B00C801");
   REQUIRE(f.executor->service());
 }
+
+TEST_CASE("F13 stale frame failures preserve new grant queue nonce and active packet", "[feedback][f13]") {
+  bool unbound = false, active = false, cancel = false, deep = false;
+  SECTION("wrong thread before reservation") {}
+  SECTION("owner missing before reservation") {
+    unbound = true;
+  }
+  SECTION("wrong thread while fresh packet active") {
+    active = true;
+  }
+  SECTION("old cancel wrong thread while fresh packet active") {
+    active = cancel = true;
+  }
+  SECTION("old pump depth failure while fresh packet active") {
+    active = deep = true;
+  }
+  Fixture f(!unbound);
+  auto old_view = f.view();
+  auto transfer = f.transfer();
+  REQUIRE(transfer.handle);
+  REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
+  auto fresh = f.seat->current();
+  REQUIRE(fresh);
+  f.live_token = f.target.peer;
+  f.associated.connection_scope = f.target.connection;
+  f.associated.run_scope = f.target.source;
+  f.current = f.associated;
+  auto fresh_view = f.view(fresh);
+  f.effect(123, 456);
+  if (active)
+    REQUIRE(f.executor->pump_one(fresh_view) == PumpResult::Queued);
+  auto creates = f.transport->creates.load();
+  auto sends = f.transport->sends.load();
+  auto resets = f.transport->resets.load();
+  auto nonce = f.key->next_sequence;
+  PumpResult result = PumpResult::Idle;
+  bool cancelled = false;
+  if (deep) {
+    unsigned nesting = 0;
+    f.transport->nested = [&] {
+      if (++nesting < 8)
+        f.executor->service();
+      else
+        result = f.executor->pump_one(old_view);
+    };
+    f.executor->service();
+    f.transport->nested = {};
+  } else if (unbound) {
+    result = f.executor->pump_one(old_view);
+  } else {
+    OwnerThread wrong({}, [&] {
+      if (cancel)
+        cancelled = f.executor->cancel_for_transfer(old_view, transfer.handle);
+      else
+        result = f.executor->pump_one(old_view);
+    });
+    wrong.finish();
+  }
+  if (cancel)
+    CHECK_FALSE(cancelled);
+  else
+    CHECK(result == PumpResult::Refused);
+  CHECK_FALSE(f.seat->quarantined());
+  CHECK_FALSE(f.executor->status().sealed);
+  CHECK(f.key->next_sequence == nonce);
+  CHECK(f.transport->creates == creates);
+  CHECK(f.transport->sends == sends);
+  CHECK(f.transport->resets == resets);
+  REQUIRE(f.seat->current());
+  REQUIRE(f.seat->current()->token.matches(fresh->token));
+  if (unbound) {
+    REQUIRE(f.executor->bind_current_thread());
+    f.bound_main = true;
+  }
+  if (!active)
+    REQUIRE(f.executor->pump_one(fresh_view) == PumpResult::Queued);
+  else if (!deep)
+    REQUIRE(f.executor->status().packet_live);
+  REQUIRE(f.transport->wire.size() == 1);
+  REQUIRE(f.key->next_sequence == 1);
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.transport->wire[0], key_hex, EncryptionMode::v2, Direction::host)) ==
+          "0B010A00000000000F007B00C801");
+  REQUIRE(f.executor->service());
+  REQUIRE_FALSE(f.seat->quarantined());
+  REQUIRE(f.executor->status().outcome == Outcome::SentReleased);
+}
+
+TEST_CASE("F13 old pre-reservation hook failure after actual handoff cannot revoke new grant", "[feedback][f13]") {
+  Fixture f;
+  auto old_view = f.view();
+  f.effect(1, 2);
+  TransferResult transfer;
+  bool granted = false;
+  auto result = f.executor->pump_one(old_view, [&](HookPoint point) {
+    if (point == HookPoint::BeforeReserve) {
+      transfer = f.transfer();
+      granted = transfer.handle && eventually([&] { return transfer.handle->status() == TransferStatus::Granted; });
+      if (granted)
+        f.effect(123, 456);
+      throw std::runtime_error("old attempt fault after real new grant");
+    }
+  });
+  REQUIRE(granted);
+  CHECK(result == PumpResult::Failed); // scoped call failed, domain has not failed
+  CHECK_FALSE(f.seat->quarantined());
+  CHECK_FALSE(f.executor->status().sealed);
+  CHECK(f.key->next_sequence == 0);
+  CHECK(f.transport->creates == 0);
+  auto fresh = f.seat->current();
+  REQUIRE(fresh);
+  f.live_token = f.target.peer;
+  f.associated.connection_scope = f.target.connection;
+  f.associated.run_scope = f.target.source;
+  f.current = f.associated;
+  auto view = f.view(fresh);
+  REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+  REQUIRE(f.key->next_sequence == 1);
+  REQUIRE(f.transport->wire.size() == 1);
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.transport->wire[0], key_hex, EncryptionMode::v2, Direction::host)) ==
+          "0B010A00000000000F007B00C801");
+  REQUIRE(f.executor->service());
+  REQUIRE_FALSE(f.seat->quarantined());
+}
+
+TEST_CASE("F13 unreserved service fault has no grant authority", "[feedback][f13]") {
+  Fixture f;
+  auto transfer = f.transfer();
+  REQUIRE(transfer.handle);
+  REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
+  auto fresh = f.seat->current();
+  f.effect(123, 456);
+  f.transport->nested = [] { throw std::runtime_error("service without an owned operation"); };
+  CHECK_FALSE(f.executor->service());
+  f.transport->nested = {};
+  CHECK_FALSE(f.seat->quarantined());
+  CHECK_FALSE(f.executor->status().sealed);
+  CHECK(f.key->next_sequence == 0);
+  CHECK(f.transport->creates == 0);
+  REQUIRE(f.seat->current());
+  REQUIRE(f.seat->current()->token.matches(fresh->token));
+  f.live_token = f.target.peer;
+  f.associated.connection_scope = f.target.connection;
+  f.associated.run_scope = f.target.source;
+  f.current = f.associated;
+  auto view = f.view(fresh);
+  REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+  REQUIRE(crypto::str_to_hex(decrypt_packet(f.transport->wire[0], key_hex, EncryptionMode::v2, Direction::host)) ==
+          "0B010A00000000000F007B00C801");
+  REQUIRE(f.executor->service());
+}
+
+TEST_CASE("F13 current grant failures still quarantine and retain owned cleanup", "[feedback][f13]") {
+  Fixture f;
+  auto view = f.view();
+  f.effect();
+  SECTION("current unreserved BeforeReserve failure") {
+    REQUIRE(f.executor->pump_one(view, [](HookPoint p) {
+      if (p == HookPoint::BeforeReserve)
+        throw std::runtime_error("current fault");
+    }) == PumpResult::Unknown);
+    REQUIRE(f.transport->creates == 0);
+  }
+  SECTION("wrong thread current owned operation") {
+    REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+    PumpResult result = PumpResult::Idle;
+    OwnerThread wrong({}, [&] { result = f.executor->pump_one(view); });
+    wrong.finish();
+    REQUIRE(result == PumpResult::Unknown);
+    REQUIRE(f.executor->status().packet_live);
+    REQUIRE(f.executor->service()); // only correct bound owner performs real free
+    REQUIRE_FALSE(f.executor->status().packet_live);
+  }
+  SECTION("wrong thread service targets only retained active operation") {
+    REQUIRE(f.executor->pump_one(view) == PumpResult::Queued);
+    bool result = true;
+    OwnerThread wrong({}, [&] { result = f.executor->service(); });
+    wrong.finish();
+    REQUIRE_FALSE(result);
+    REQUIRE(f.executor->status().packet_live);
+    REQUIRE(f.executor->service());
+    REQUIRE_FALSE(f.executor->status().packet_live);
+  }
+  REQUIRE(f.seat->quarantined());
+  REQUIRE(f.executor->status().sealed);
+  REQUIRE(f.executor->status().outcome == Outcome::Unknown);
+}
