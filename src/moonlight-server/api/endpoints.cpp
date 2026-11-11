@@ -10,11 +10,13 @@ namespace wolf::api {
 
 void UnixSocketServer::endpoint_Events(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   // curl -N --unix-socket /tmp/wolf.sock http://localhost/api/v1/events
-  state_->sockets.push_back(socket);
-  send_http(socket,
-            200,
-            {{"Content-Type: text/event-stream"}, {"Connection: keep-alive"}, {"Cache-Control: no-cache"}},
-            ""); // Inform clients this is going to be SS
+  boost::asio::dispatch(state_->strand, [this, socket] {
+    send_http(socket,
+              200,
+              {{"Content-Type: text/event-stream"}, {"Connection: keep-alive"}, {"Cache-Control: no-cache"}},
+              "");
+    state_->sockets.push_back(socket);
+  });
 }
 
 void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
@@ -380,9 +382,10 @@ void UnixSocketServer::endpoint_StreamSessionHandleInput(const HTTPRequest &req,
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto hex_pkt = input_request.value().input_packet_hex.get();
       auto pkt_parsed = crypto::hex_to_str(hex_pkt);
-      control::INPUT_PKT *input_pkt = reinterpret_cast<control::INPUT_PKT *>(pkt_parsed.data());
-      control::handle_input(session.value(), {}, input_pkt);
-
+      if (!control::handle_input(session.value(), {}, std::string_view{pkt_parsed})) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid input packet"}));
+        return;
+      }
       send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
     } else {
       logs::log(logs::warning, "[API] Invalid session_id: {}", input_request.value().session_id);
