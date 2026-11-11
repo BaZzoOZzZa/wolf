@@ -822,8 +822,8 @@ TEST_CASE("Feedback release waits for real consumer holder retirement and preser
   auto began = std::make_shared<std::atomic_bool>(false);
   auto unrelated_started = std::make_shared<std::atomic_bool>(false);
   auto unrelated_stopped = std::make_shared<std::atomic_bool>(false);
-  auto other_connection = ConnectionScope::fresh(42);
-  auto other_run = RunScope::fresh("unrelated producer stand-in");
+  auto other_connection = ConnectionScope::fresh(43);
+  auto other_run = RunScope::fresh("43");
   REQUIRE(f.runtime->admit(other_connection,
                            other_run,
                            ConsumerKind::Audio,
