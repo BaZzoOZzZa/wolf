@@ -29,7 +29,7 @@ checked_xbox_hash("src/uinput/joypad_utils.hpp" "1c764e72e56c4ee88ec677811f91f12
 checked_xbox_hash("src/uinput/include/inputtino/protected_types.hpp" "f8cfbea8d3e46a596edb28431ef159b2f9d4077685a47f912b727ac4ea24a4d2")
 set(checked_files include/inputtino/checked_xbox.hpp src/uinput/checked_xbox.cpp)
 set(expected_header "bd0d5ddf057cafa2ec4f6b37162ea9496544e7f7ff01892ebf4d09b851f12bcf")
-set(expected_cpp "271235a2ed363ee67f56b4d27dcd35ac7209741c6ec7a07199d94f5b86ab26ff")
+set(expected_cpp "2c82442b11bf00252d045912a0732688c1c1825aff46fdaff96827590a3078f9")
 set(present 0)
 foreach(relative IN LISTS checked_files)
     if(EXISTS "${INPUTTINO_SOURCE_DIR}/${relative}")
@@ -46,7 +46,8 @@ if(present EQUAL 2)
     if(header STREQUAL expected_header AND cpp STREQUAL expected_cpp)
         set(needs_apply FALSE)
     elseif(NOT ((header STREQUAL "fb7d4a39d0418042eb17efc99f726d164991767151cfef939f4b3bac2d8545dc" AND
-                 cpp STREQUAL "c43e894254ed43954f266bc4f13ae7bf8d2e05d9e1041e0e8053e4f75bd49aa0")))
+                 cpp STREQUAL "c43e894254ed43954f266bc4f13ae7bf8d2e05d9e1041e0e8053e4f75bd49aa0") OR
+                (header STREQUAL "bd0d5ddf057cafa2ec4f6b37162ea9496544e7f7ff01892ebf4d09b851f12bcf" AND cpp STREQUAL "271235a2ed363ee67f56b4d27dcd35ac7209741c6ec7a07199d94f5b86ab26ff")))
         message(FATAL_ERROR "Unexpected checked Xbox pair; refusing mutation")
     endif()
 endif()

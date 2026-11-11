@@ -101,3 +101,39 @@ clock jumps, gain/overlap, erase/capacity and END failures, plus descriptor bits
 The tracked driver accepts only exact previous header/cpp pairs for migration;
 overrides remain verify-only. Pristine application is staged and hash-verified
 before either addition is published; interruption fails closed on next verify.
+
+### F10/F11 correction contract
+
+Checked devices now build their own RAII libevdev descriptor before any uinput
+open, advertising only FF_RUMBLE and FF_GAIN. Enable failures throw before
+publication. The legacy Xbox/Switch/DS constructors and capability bytes stay
+unchanged; this is not generic FF parity.
+
+Playback retains a positive repeat count; nonpositive play stops. Each finite
+repetition includes its delay. Zero length is continuous after the initial delay
+until stop/erase. Active upload accounts for elapsed repetitions, keeps the
+remaining count and restarts timing with the newly uploaded delay/length; an
+expired upload never restarts itself. Large clock jumps skip missed repetitions
+arithmetically (O(1) per effect, at most16 effects), not physical pulse replay.
+Time is stored as integer milliseconds without adding a deadline to time_point.
+Gain scales each rumble contribution before the sum saturates.
+
+Primary references: Linux v6.12 [FF API](https://www.kernel.org/doc/html/v6.12/input/ff.html)
+and [ff-memless.c](https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/input/ff-memless.c),
+lines251–270 (rumble mix),340–355 (repeat/continuous),404–451 (play/update).
+They motivate the count/continuous/stop and restart-with-retained-count contract;
+this userspace scheduler uses nominal elapsed time rather than reproducing kernel
+timer lateness/jiffies. References do not prove the deployed kernel or Wine path.
+
+The first all-tests RED attempt exposed signed overflow in the previous deadline
+addition and aborted under UBSan. It is recorded separately, not counted as the
+semantic RED. The boundary probe is now a separate unchanged test. Completed
+semantic RED on901a4f7:17cases,13passed/4failed,3403assertions/25failed;
+all13 original cases passed. GREEN must run the same tests plus boundary probe.
+The configure-1 failure is also separate: FetchContent needed tracked patch SHA
+in its command to invalidate the old stamp. Manager authorized exactly two core
+CMake additions; native migration runs through normal FetchContent only.
+
+Stage2/3 remain disabled/unimplemented. Retirement contract is unchanged; this
+correction proves software scheduling/metadata under injected IO, not kernel
+acceptance, physical feedback, Wine/game consumption, or other-game isolation.

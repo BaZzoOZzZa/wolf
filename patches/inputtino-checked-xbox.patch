@@ -138,7 +138,7 @@ diff --git a/src/uinput/checked_xbox.cpp b/src/uinput/checked_xbox.cpp
 new file mode 100644
 --- /dev/null
 +++ b/src/uinput/checked_xbox.cpp
-@@ -0,0 +1,425 @@
+@@ -0,0 +1,483 @@
 +#include <inputtino/checked_xbox.hpp>
 +
 +#include <fcntl.h>
@@ -178,42 +178,64 @@ new file mode 100644
 +    libevdev_set_id_version(dev.get(), device.version);
 +    libevdev_set_id_bustype(dev.get(), BUS_USB);
 +
-+    libevdev_enable_event_type(dev.get(), EV_KEY);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_WEST, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_EAST, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_NORTH, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SOUTH, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBL, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBR, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TR, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TL, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SELECT, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_MODE, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_KEY, BTN_START, nullptr);
++    auto require_capability = [](int status) {
++        if (status < 0)
++            throw std::runtime_error(
++                "Checked Xbox descriptor capability failed");
++    };
++    require_capability(libevdev_enable_event_type(dev.get(), EV_KEY));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_WEST, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_EAST, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_NORTH, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SOUTH, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBL, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBR, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TR, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TL, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SELECT, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_MODE, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_START, nullptr));
 +
-+    libevdev_enable_event_type(dev.get(), EV_ABS);
++    require_capability(libevdev_enable_event_type(dev.get(), EV_ABS));
 +
 +    input_absinfo dpad{0, -1, 1, 0, 0, 0};
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0Y, &dpad);
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0X, &dpad);
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0Y, &dpad));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0X, &dpad));
 +
 +    input_absinfo stick{0, -32768, 32767, 16, 128, 0};
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_X, &stick);
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RX, &stick);
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Y, &stick);
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RY, &stick);
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_X, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RX, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Y, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RY, &stick));
 +
 +    input_absinfo trigger{0, 0, 255, 0, 0, 0};
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Z, &trigger);
-+    libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RZ, &trigger);
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Z, &trigger));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RZ, &trigger));
 +
-+    libevdev_enable_event_type(dev.get(), EV_FF);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_RUMBLE, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_CONSTANT, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_PERIODIC, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_SINE, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_RAMP, nullptr);
-+    libevdev_enable_event_code(dev.get(), EV_FF, FF_GAIN, nullptr);
++    require_capability(libevdev_enable_event_type(dev.get(), EV_FF));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_FF, FF_RUMBLE, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_FF, FF_GAIN, nullptr));
 +
 +    return dev;
 +}
@@ -434,8 +456,36 @@ new file mode 100644
 +    try {
 +        struct Effect {
 +            ff_effect data{};
-+            Clock::time_point begin{}, end{};
-+            bool playing = false;
++            int64_t anchor_ms = 0;
++            uint32_t remaining = 0;
++            // Millisecond relative scheduling avoids time_point + deadline overflow.
++            // Skip elapsed repetitions in O(1), never replay missed physical pulses.
++            bool sample(int64_t now_ms)
++            {
++                if (!remaining || now_ms < anchor_ms)
++                    return false;
++                uint64_t elapsed = uint64_t(now_ms) - uint64_t(anchor_ms);
++                const uint64_t delay = data.replay.delay,
++                               length = data.replay.length;
++                if (!length)
++                    return elapsed >= delay; // continuous until explicit stop
++                const uint64_t period = delay + length;
++                const uint64_t cycles = elapsed / period;
++                if (cycles >= remaining) {
++                    remaining = 0;
++                    return false;
++                }
++                // cycles < INT_MAX and period <= 131070: multiplication fits int64.
++                anchor_ms += static_cast<int64_t>(cycles * period);
++                remaining -= static_cast<uint32_t>(cycles);
++                elapsed %= period;
++                return elapsed >= delay;
++            }
++        };
++        const auto time_ms = [&] {
++            return std::chrono::duration_cast<std::chrono::milliseconds>(
++                       s->io.now().time_since_epoch())
++                .count();
 +        };
 +        std::map<int, Effect> effects;
 +        int gain = 0xffff;
@@ -473,8 +523,17 @@ new file mode 100644
 +                         effects.size() < 16)) {
 +                        upload.retval = 0;
 +                        try {
-+                            effects.insert_or_assign(
-+                                upload.effect.id, Effect{upload.effect});
++                            auto [it, inserted] =
++                                effects.try_emplace(upload.effect.id);
++                            auto& effect = it->second;
++                            const auto now_ms = time_ms();
++                            effect.sample(
++                                now_ms); // account for elapsed repetitions before update
++                            effect.data = upload.effect;
++                            // Linux v6.12 ml_ff_upload: restart timing of a started effect,
++                            // retaining its remaining count; an expired effect stays stopped.
++                            if (effect.remaining)
++                                effect.anchor_ms = now_ms;
 +                        } catch (...) {
 +                            upload.retval = -ENOMEM;
 +                            s->io.ioctl(s->device.fd, UI_END_FF_UPLOAD, &upload);
@@ -501,27 +560,26 @@ new file mode 100644
 +                    auto it = effects.find(ev.code);
 +                    if (it != effects.end()) {
 +                        auto& e = it->second;
-+                        e.playing = ev.value != 0;
-+                        e.begin = s->io.now() + std::chrono::milliseconds(
-+                                                    e.data.replay.delay);
-+                        e.end = e.begin + std::chrono::milliseconds(
-+                                              e.data.replay.length);
++                        e.remaining =
++                            ev.value > 0 ? static_cast<uint32_t>(ev.value) : 0;
++                        e.anchor_ms = time_ms();
 +                    }
 +                }
 +            }
-+            const auto now = s->io.now();
++            const auto now_ms = time_ms();
 +            uint64_t low = 0, high = 0;
 +            for (auto& [id, effect]: effects) {
-+                if (effect.playing && now >= effect.begin && now < effect.end) {
-+                    low += effect.data.u.rumble.strong_magnitude;
-+                    high += effect.data.u.rumble.weak_magnitude;
++                if (effect.sample(now_ms)) {
++                    // Gain precedes saturation, as in Linux's rumble mixer.
++                    low += uint64_t(effect.data.u.rumble.strong_magnitude) *
++                           gain / 0xffff;
++                    high += uint64_t(effect.data.u.rumble.weak_magnitude) *
++                            gain / 0xffff;
 +                }
 +            }
 +            std::pair<int, int> current{
-+                static_cast<int>(
-+                    std::min<uint64_t>(low, 0xffff) * gain / 0xffff),
-+                static_cast<int>(
-+                    std::min<uint64_t>(high, 0xffff) * gain / 0xffff)};
++                static_cast<int>(std::min<uint64_t>(low, 0xffff)),
++                static_cast<int>(std::min<uint64_t>(high, 0xffff))};
 +            if (current != previous && !s->stop.load()) {
 +                previous = current;
 +                auto callback =
