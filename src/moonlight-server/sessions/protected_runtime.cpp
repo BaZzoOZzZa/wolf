@@ -1,8 +1,8 @@
 #include "protected_runtime.hpp"
-#include <state/sessions.hpp>
 #include <stdexcept>
 
 namespace wolf::core::sessions {
+bool consumer_legacy_current(const state::SessionsAtoms &, const ConnectionScope &);
 ConsumerComposition::ConsumerComposition(state::SessionsAtoms running, streaming::ConsumerPolicy policy)
     : view_(std::make_shared<View>()) {
   if (!running)
@@ -16,7 +16,7 @@ ConsumerComposition::ConsumerComposition(state::SessionsAtoms running, streaming
           for (const auto &s : snapshot->scopes)
             if (s.matches(scope))
               return true;
-        return state::get_session_by_scope(running->load(), scope).has_value();
+        return consumer_legacy_current(running, scope);
       },
       policy);
 }
@@ -54,7 +54,7 @@ struct ProtectedRuntimeOwner::State {
   std::unique_ptr<protected_authority::ProtectedAuthorityDomain> authority;
   std::shared_ptr<control::InputSeat> seat;
   std::unique_ptr<InputHandoff> handoff;
-  std::shared_ptr<const TransferHandle> transfer;
+  std::weak_ptr<const TransferHandle> transfer;
   // Fixed candidate rollback obligation, never inferred from a missing status.
   std::optional<streaming::ConsumerDrainTicket> failed_media;
   explicit State(std::shared_ptr<ConsumerComposition> c) : composition(std::move(c)) {}
@@ -120,7 +120,13 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
   // Validate capacities BEFORE addition (overflow) or any internal copy/allocation.
   if (job->payload.capacity() > limit || job->correlation.ip.capacity() > 256)
     return {RuntimeSubmission::Capacity, {}};
-  const size_t charge = sizeof(RuntimeJob) + sizeof(RuntimeReceipt) + job->payload.capacity() +
+  size_t scope_bytes = 0;
+  for (const auto *scope : {&job->selection.candidate.source, &job->selection.candidate.destination, &job->producer}) {
+    if (scope->id().capacity() > 256)
+      return {RuntimeSubmission::Capacity, {}};
+    scope_bytes += scope->id().capacity();
+  }
+  const size_t charge = scope_bytes + sizeof(RuntimeJob) + sizeof(RuntimeReceipt) + job->payload.capacity() +
                         job->correlation.ip.capacity();
   auto &s = *state_;
   auto receipt = std::make_shared<RuntimeReceipt>();
@@ -130,6 +136,11 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
     std::lock_guard lock(s.mutex);
     if (!s.started || s.stop || s.unknown)
       return {RuntimeSubmission::Closed, {}};
+    // A preparation cannot retain old media owners across Handoff replacement.
+    // Refuse before effects; existing media cleanup (including popped) stays charged.
+    if ((job->cell == RuntimeCell::Preparation && (s.cells[1].occupied || s.cells[2].occupied)) ||
+        ((job->cell == RuntimeCell::Audio || job->cell == RuntimeCell::Video) && s.cells[0].occupied))
+      return {RuntimeSubmission::Busy, {}};
     auto &cell = s.cells[unsigned(job->cell)];
     if (cell.occupied)
       return {RuntimeSubmission::Busy, {}};
@@ -192,11 +203,9 @@ void ProtectedRuntimeOwner::run() {
             refused = true;
             failed = result.admission == TransferAdmission::Quarantined;
           } else {
-            std::shared_ptr<const TransferHandle> retired;
             {
               std::lock_guard lock(s.mutex);
-              retired = std::move(s.transfer);
-              s.transfer = result.handle;
+              s.transfer = result.handle; // weak diagnostic only: no extra validator owner
             }
             auto ticket = result.handle->saved_ticket();
             if (!ticket || !ticket->connection.matches(expected->owner.connection))
@@ -211,7 +220,7 @@ void ProtectedRuntimeOwner::run() {
         std::shared_ptr<const TransferHandle> exact;
         {
           std::lock_guard lock(s.mutex);
-          exact = s.transfer;
+          exact = s.transfer.lock();
         }
         if (!exact || job->handle != exact || !job->producer.matches(exact->prepared_grant->owner.destination) ||
             !job->work) {
@@ -275,7 +284,7 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
 }
 std::shared_ptr<const TransferHandle> ProtectedRuntimeOwner::transfer() const {
   std::lock_guard lock(state_->mutex);
-  return state_->transfer;
+  return state_->transfer.lock();
 }
 control::GrantHandle ProtectedRuntimeOwner::current() const {
   return state_->seat ? state_->seat->current() : nullptr;

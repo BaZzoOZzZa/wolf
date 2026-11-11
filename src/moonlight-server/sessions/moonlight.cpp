@@ -4,12 +4,15 @@
 #include <immer/vector_transient.hpp>
 #include <sessions/common.hpp>
 #include <sessions/handlers.hpp>
-#include <sessions/protected_runtime.hpp>
 #include <state/sessions.hpp>
 #include <streaming/consumer_events.hpp>
 #include <streaming/streaming.hpp>
 
 namespace wolf::core::sessions {
+
+bool consumer_legacy_current(const state::SessionsAtoms &running, const ConnectionScope &scope) {
+  return state::get_session_by_scope(running->load(), scope).has_value();
+}
 
 struct OwnedDeviceQueue {
   RunScope scope;
@@ -21,8 +24,8 @@ immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server) {
-  auto composition = std::make_shared<ConsumerComposition>(app_state->running_sessions);
-  return setup_moonlight_handlers(app_state, runtime_dir, audio_server, composition->runtime());
+  auto composition = make_consumer_composition(app_state->running_sessions);
+  return setup_moonlight_handlers(app_state, runtime_dir, audio_server, consumer_runtime(composition));
 }
 
 immer::vector<immer::box<events::EventBusHandlers>>

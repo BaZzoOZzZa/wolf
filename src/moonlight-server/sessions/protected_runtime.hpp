@@ -2,7 +2,6 @@
 #include <array>
 #include <atomic>
 #include <state/data-structures.hpp>
-#include <state/sessions.hpp>
 #include <streaming/consumer_runtime.hpp>
 
 namespace sessions {

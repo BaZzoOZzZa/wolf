@@ -211,7 +211,8 @@ TEST_CASE("Protected worker counts popped cell and bytes while reserved close pr
   CHECK(f.owner->status().occupied == 1);
   CHECK(f.owner->status().bytes >= 40000);
   CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Busy);
-  auto large = f.media({}, RuntimeCell::Audio);
+  auto large = std::make_unique<RuntimeJob>();
+  large->cell = RuntimeCell::Retirement;
   large->payload.resize(30000);
   CHECK(f.owner->submit(std::move(large)).result == RuntimeSubmission::Capacity);
   auto audio = f.owner->submit(f.media({}, RuntimeCell::Audio));
@@ -220,10 +221,10 @@ TEST_CASE("Protected worker counts popped cell and bytes while reserved close pr
   retirement->cell = RuntimeCell::Retirement;
   retirement->retire = [] {};
   auto r = f.owner->submit(std::move(retirement));
-  REQUIRE(audio.receipt);
-  REQUIRE(video.receipt);
+  CHECK(audio.result == RuntimeSubmission::Busy);
+  CHECK(video.result == RuntimeSubmission::Busy);
   REQUIRE(r.receipt);
-  CHECK(f.owner->status().occupied == 4);
+  CHECK(f.owner->status().occupied == 2);
   CHECK(f.owner->close_exact(f.op, f.original));
   f.owner->request_stop();
   CHECK(f.owner->status().stop);
@@ -231,8 +232,6 @@ TEST_CASE("Protected worker counts popped cell and bytes while reserved close pr
   gate->release();
   REQUIRE(eventually([&] { return f.owner->join_when_exited() == RuntimeJoin::Joined; }));
   CHECK_FALSE(f.owner->current());
-  CHECK(audio.receipt->state == RuntimeJobState::Refused);
-  CHECK(video.receipt->state == RuntimeJobState::Refused);
   CHECK(r.receipt->state == RuntimeJobState::Refused);
   CHECK(f.owner->status().occupied == 0);
 }
@@ -337,4 +336,95 @@ TEST_CASE("Protected stale foreign null media cannot use current transfer", "[pr
     CHECK_FALSE(f.composition->runtime()->status(f.next.connection, ConsumerKind::Audio));
     CHECK(f.owner->current());
   }
+}
+
+TEST_CASE("Protected actual saved consumer ticket waits join and single deadline never resets", "[protected-runtime]") {
+  Fixture f;
+  auto gate = f.gate();
+  ConsumerCorrelation correlation{"127.0.0.1", 9000, {}};
+  REQUIRE(f.owner->runtime()->admit(f.initial.connection,
+                                    f.initial.source,
+                                    ConsumerKind::Video,
+                                    correlation,
+                                    [gate](auto &, const auto &) {
+                                      gate->wait();
+                                      return true;
+                                    }) == ConsumerAdmission::Accepted);
+  f.owner->runtime()->ping(ConsumerKind::Video, {"127.0.0.1", 9000, {}, {}});
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  auto r = f.owner->submit(f.selection());
+  REQUIRE(r.receipt);
+  REQUIRE(eventually([&] { return r.receipt->state == RuntimeJobState::Complete; }));
+  auto h = f.owner->transfer();
+  REQUIRE(h);
+  REQUIRE(h->saved_ticket());
+  CHECK_FALSE(h->saved_ticket()->complete());
+  CHECK_FALSE(f.composition->contains(f.initial.connection));
+  CHECK(h->status() == TransferStatus::Pending);
+  f.clock->store(16001);
+  REQUIRE(eventually([&] { return h->status() == TransferStatus::Quarantined; }));
+  CHECK_FALSE(f.owner->current());
+  CHECK(f.owner->close_exact(f.op, f.original));
+  gate->release();
+  REQUIRE(eventually([&] { return h->saved_ticket()->complete(); }));
+  CHECK(h->status() == TransferStatus::Quarantined);
+  CHECK_FALSE(f.owner->current());
+}
+
+TEST_CASE("Protected F12 admission hook and sole Work cleanup keep preparation fenced", "[protected-runtime]") {
+  Fixture f;
+  auto hook_gate = f.gate(), destructor_gate = f.gate();
+  auto h = f.transfer();
+  struct Capture {
+    std::shared_ptr<TestGate> gate;
+    ProtectedRuntimeOwner *owner;
+    ~Capture() {
+      (void)owner->status();
+      gate->wait();
+    }
+  };
+  auto job = f.media(h, RuntimeCell::Audio);
+  auto capture = std::make_shared<Capture>();
+  capture->gate = destructor_gate;
+  capture->owner = f.owner.get();
+  job->work = [capture](auto &, const auto &) { return true; };
+  capture.reset();
+  job->before_cleanup = [hook_gate] { hook_gate->wait(); };
+  auto r = f.owner->submit(std::move(job));
+  REQUIRE(r.receipt);
+  REQUIRE(eventually([&] { return hook_gate->entered.load(); }));
+  auto ticket = f.owner->runtime()->revoke(f.next.connection);
+  REQUIRE(ticket);
+  REQUIRE(eventually([&] { return ticket->complete(); }));
+  f.next.connection = ConnectionScope::fresh(42);
+  f.next.peer = PeerToken::fresh(0);
+  f.next.binding = BindingRevision::fresh(0);
+  CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Busy);
+  hook_gate->release();
+  REQUIRE(eventually([&] { return destructor_gate->entered.load(); }));
+  CHECK(ticket->complete());
+  CHECK(f.owner->status().occupied == 1);
+  CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Busy);
+  destructor_gate->release();
+  REQUIRE(eventually([&] { return r.receipt->state == RuntimeJobState::Complete; }));
+  auto next = f.transfer();
+  CHECK(next->prepared_grant->owner.connection.matches(f.next.connection));
+}
+
+TEST_CASE("Protected failure retirement remains charged and independent stop is responsive", "[protected-runtime]") {
+  Fixture f;
+  auto job = std::make_unique<RuntimeJob>();
+  job->cell = RuntimeCell::Retirement;
+  job->payload.resize(32000);
+  job->retire = [] { throw std::runtime_error("unproved cleanup"); };
+  auto r = f.owner->submit(std::move(job));
+  REQUIRE(r.receipt);
+  REQUIRE(eventually([&] { return r.receipt->state == RuntimeJobState::Unknown; }));
+  CHECK(f.owner->status().occupied == 1);
+  CHECK(f.owner->status().bytes >= 32000);
+  f.owner->request_stop();
+  CHECK(f.owner->status().stop);
+  CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Closed);
+  REQUIRE(eventually([&] { return f.owner->join_when_exited() == RuntimeJoin::Joined; }));
+  CHECK(f.owner->status().unknown); // join is not Unknown-resource recovery
 }
