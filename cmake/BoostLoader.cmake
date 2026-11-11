@@ -23,6 +23,7 @@ if (NOT Boost_FOUND)
     FetchContent_Declare(
             Boost
             URL "https://github.com/boostorg/boost/releases/download/boost-${BOOST_VERSION}/boost-${BOOST_VERSION}-cmake.tar.xz"
+            URL_HASH SHA256=7da75f171837577a52bbf217e17f8ea576c7c246e4594d617bfde7fafd408be5
     )
     FetchContent_MakeAvailable(Boost)
 

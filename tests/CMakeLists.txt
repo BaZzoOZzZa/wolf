@@ -113,9 +113,38 @@ configure_file(assets/config.test.toml ${CMAKE_CURRENT_BINARY_DIR}/config.test.E
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(CTest)
 include(Catch)
-catch_discover_tests(wolftests
-        PROPERTIES
-        ENVIRONMENT "WOLF_SKIP_WAYLAND_SOCKET_WAIT=TRUE")
+option(WOLF_RUNTIME_TEST_DISCOVERY "Register upstream tests whose main initializes streaming" ON)
+if (WOLF_RUNTIME_TEST_DISCOVERY)
+    # Even --list-tests runs the upstream main and initializes streaming. Keep
+    # ordinary CI registration, but never execute that main as a build step.
+    catch_discover_tests(wolftests
+            DISCOVERY_MODE PRE_TEST
+            PROPERTIES
+            ENVIRONMENT "WOLF_SKIP_WAYLAND_SOCKET_WAIT=TRUE")
+endif ()
+
+# Isolated suites use Catch2's main and the real production libraries. Neither
+# executable includes main.cpp or initializes streaming for test discovery.
+add_executable(wolf-protocol-security-tests testCrypto.cpp testControl.cpp)
+target_link_libraries(wolf-protocol-security-tests PRIVATE wolf::moonlight wolf::helpers Catch2::Catch2WithMain)
+target_include_directories(wolf-protocol-security-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../src/moonlight-server"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../src/core/src")
+if (TARGET inputtino::libinputtino)
+    # control.hpp uses inputtino's public device/input types. Avoid linking all
+    # of wolf::core (which also propagates PulseAudio implementation sources).
+    target_link_libraries(wolf-protocol-security-tests PRIVATE inputtino::libinputtino)
+endif ()
+target_compile_features(wolf-protocol-security-tests PRIVATE cxx_std_20)
+add_test(NAME wolf-protocol-security-tests COMMAND wolf-protocol-security-tests)
+
+add_executable(wolf-api-security-tests testWolfAPI.cpp)
+target_link_libraries(wolf-api-security-tests PRIVATE wolf::runner Catch2::Catch2WithMain CURL::libcurl)
+target_compile_features(wolf-api-security-tests PRIVATE cxx_std_20)
+# Other tests in testWolfAPI.cpp require the upstream environment. Only the
+# security selector is safe here; fail rather than silently passing zero cases.
+add_test(NAME wolf-api-security-tests COMMAND wolf-api-security-tests "[security]")
+set_tests_properties(wolf-protocol-security-tests wolf-api-security-tests PROPERTIES LABELS "security;isolated")
 
 # State-only regression executable: no Wolf runtime, Docker daemon or devices.
 find_package(Threads REQUIRED)

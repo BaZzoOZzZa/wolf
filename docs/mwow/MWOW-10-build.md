@@ -1,6 +1,6 @@
 # MWOW-10 — tracked CMake dependency fixes
 
-Status: **review candidate; clean full configure pending Manager's heavy-slot grant**.
+Status: **review candidate; fresh source configure PASS, combined security execution pending**.
 Base: `0e3710be36a6a7fa130f633b358d1b520a3cee9c`, branch `feature/MWOW-10-build-fix`.
 No merge, push, system installation, Wolf/test-main startup, game, Docker or device operation.
 
@@ -21,6 +21,9 @@ No merge, push, system installation, Wolf/test-main startup, game, Docker or dev
   only in the source fallback, avoiding a new required installed component
   package on systems whose Boost packaging exposes the common headers instead.
   The fetched version remains **1.87.0** from the existing official release URL.
+  The official release archive downloaded by the zero-override run has SHA256
+  `7da75f171837577a52bbf217e17f8ea576c7c246e4594d617bfde7fafd408be5`;
+  FetchContent now verifies that exact archive hash with `URL_HASH`.
   Its real `libs/property_tree/CMakeLists.txt` defines `Boost::property_tree`
   and its transitive target links. No independent header version is mixed in.
 - Simple-Web-Server is pinned to the full previously qualified commit
@@ -73,33 +76,147 @@ Exact script-test argv, results and script SHA256:
 These are script/static checks, not generated target-property, compile or runtime tests.
 MWOW-6 caches/sources were read only; fixtures were written under MWOW-10.
 
-## Pending clean qualification
+## Native isolated security infrastructure
 
-**Do not run until Manager grants the single heavy slot.** Use the approved
-build root and a fresh, unused binary directory; no cached dependency source
-overrides, external project include, compatibility-target CLI switch or Boost
-header overlay. Proposed exact argv (not executed):
+Manager subsequently transferred ownership of `tests/CMakeLists.txt` to MWOW-10.
+The existing `wolftests` source list is preserved. `WOLF_RUNTIME_TEST_DISCOVERY`
+defaults to **ON**, preserving ordinary CI registration. Its discovery mode is
+now explicitly **PRE_TEST**: plain compilation does not run `main.cpp` through
+`--list-tests`. With the option **OFF**, no upstream Catch discovery is registered.
+Do not run even `ctest -N` with that option ON in a hardware-free environment:
+PRE_TEST discovery can execute the upstream main while CTest loads its test list.
+
+Two native targets use `Catch2::Catch2WithMain`, never `tests/main.cpp`:
+
+- `wolf-protocol-security-tests`: real `testCrypto.cpp` and `testControl.cpp`,
+  linked with `wolf::moonlight`, `wolf::helpers` and the actual inputtino target
+  when available. Explicit project header roots cover the control/input headers.
+  It does not link `wolf::core`: that target also propagates PulseAudio .cpp
+  sources to consumers. The generated protocol target contains exactly the two
+  test translation units and does not acquire PulseAudio implementation sources.
+- `wolf-api-security-tests`: real `testWolfAPI.cpp`, `wolf::runner`, libcurl and
+  Catch2's main. Its CTest command selects **`[security]`** only. Other API cases
+  require the upstream environment and must not be run through this target
+  without that selector. CTest registers both isolated suites with the
+  `security;isolated` labels, without executable-based discovery.
+
+No global sanitizer flags or production substitutes were added. API security
+cases and newer control headers belong to the separately frozen MWOW-6 changes;
+this branch remains based on develop and does not import those changes. In this
+baseline the API `[security]` selector has no cases and must not be presented as
+a passing test. Actual combined compile/security execution belongs to Manager.
+
+## Configure qualification
+
+Manager explicitly granted MWOW-10 the single heavy slot. Full compilation,
+upstream test main, test execution and installation were not performed.
+
+1. The first fresh attempt was stopped during a slow network fmt clone. Its
+   exit is `-15`; it is not a configure success. Exact command/log/exit are
+   `clean-configure-command.json`, `clean-configure.log`, `clean-configure-exit.json`
+   under the artifact root below.
+2. A separate fresh binary directory with explicitly allowed pristine source
+   cache overrides configured successfully (exit 0). SimpleWeb and mDNS used
+   normal fresh FetchContent clones, with no source override. The borrowed
+   Git trees were verified clean; modified MWOW-6 inputtino was not reused:
+   the original pinned Git tree was archived into MWOW-10. Nothing in MWOW-6
+   was edited. Exact sources/revisions/argv are recorded in
+   `clean-configure-cached-command.json`; its full log is
+   `clean-configure-cached.log`. This is a cache-qualified result, explicitly
+   **not** the zero-override vanilla result.
+3. Final cache-qualified reconfigure and target graph generation: exit 0,
+   `final-configure-command.json`, `final-configure.log`, `targets.dot`.
+   The real graph contains `moonlight -> boost_property_tree`,
+   `simple-web-server -> boost_comptarget_boost -> boost_headers`.
+   File API and compile database resolve property_tree from the split **1.87**
+   source tree. No external `CMAKE_PROJECT_INCLUDE`, monolithic header include,
+   synthetic Boost targets or manual SimpleWeb cache edits were used.
+4. Manager then required **zero source overrides**. The initial network-only
+   attempt was stopped during a slow full-history range clone (exit `-15`),
+   recorded in `vanilla-command.json`, `vanilla-configure.log`, `vanilla-exit.json`.
+   A Git transport-mirror attempt failed because local submodule transport was
+   disabled (exit 1, `vanilla-mirrored-configure.log`). The task-local Git
+   environment was then corrected and original recursive gitlinks supplied;
+   another slow submodule clone was stopped (`native-off-attempt1-*`, exit `-15`).
+   None of these attempts is presented as a passing configure.
+5. **Final fresh one-pass configure: exit 0**, in the previously nonexistent
+   `native-clean-final/` directory, 31.4 seconds configure + 0.2 seconds generate.
+   Exact command/environment, complete raw log and exit/log SHA256 are
+   `native-clean-final-command.json`, `native-clean-final-configure.log`,
+   `native-clean-final-exit.json`. All `FETCHCONTENT_SOURCE_DIR_*` cache values
+   are empty; no external project include, monolithic header overlay or manual
+   dependency/cache edit is used. All dependency source trees in this binary
+   directory are produced by native FetchContent clone/checkout/submodule/patch
+   or official archive download/extraction.
+
+The final run uses **explicit process-local Git transport mirrors**, rather
+than downloading full Git histories repeatedly. This is a download transport
+qualification, not a CMake source override: `GIT_CONFIG_COUNT/KEY_*/VALUE_*`
+temporarily map declared public URLs to read-only Git repositories, with local
+file transport allowed only in that process. No global Git config was changed.
+Git refs/commits and recursive gitlinks are recorded in `git-mirrors.json`,
+`submodule-mirrors.json` and the command JSON; needed missing refs were fetched
+from their original public URLs at exact commits. Existing MWOW-6 Git objects
+were borrowed read-only; their working-tree edits were never copied into the
+fresh trees. SimpleWeb and mDNS were cloned directly from their declared remote
+URLs. Boost was downloaded from the declared official release URL and checked
+against its tracked SHA256. A full network-only download replay was not completed.
+
+Final generated metadata/header checks: **PASS**,
+[`native-final-probes.json`](/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-10/native-final-probes.json):
+
+- Native graph contains the real property_tree and Boost compatibility edges.
+- `moonlight` and both security targets resolve property_tree under
+  `native-clean-final/_deps/boost-src/libs/property_tree/include`; their compile
+  database has no MWOW-6 or monolithic Boost overlay path.
+- Actual Clang preprocessor using the generated include search path reports
+  `BOOST_VERSION=108700` and `BOOST_LIB_VERSION="1_87"` (exit 0).
+- Fresh SimpleWeb's committed CMake is pristine; the automatically patched
+  working CMake equals the qualified adapter exactly, with both hashes saved.
+  mDNS HEAD is the required qualified SHA.
+- Final OFF CTest file has exactly the two safe registrations, API filtered to
+  `[security]`, and no generic discovery. Separate default-option reconfigure
+  (exit 0) proves ON remains the default and preserves upstream deferred
+  registration; `build.ninja` has no `CatchAddTests.cmake` build step. Saved
+  files: `CTestTestfile-final-OFF.cmake`, `CTestTestfile-default-ON.cmake`,
+  `DEFAULT-ON-wolftests-b12d07c_include.cmake`, `native-default-*`.
+
+Raw artifact hashes and exact resulting source revision are recorded in
+`rawhashes.json` and `source-revision.json`. No executable/main or CTest runtime
+was invoked to obtain these results.
+
+Artifact root:
+[`MWOW-10`](/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-10).
+The native developer/CI configure command (no external adapters) is:
 
 ```bash
 cmake -S /run/media/bazzoozza/work/Worktrees/mirror-wow-wolf-build-fix \
-  -B /run/media/bazzoozza/Games/bb-targets/wolf/MWOW-10/clean-configure \
+  -B /run/media/bazzoozza/Games/bb-targets/wolf/MWOW-10/native-clean-final \
   -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug \
   -DCMAKE_CXX_STANDARD=20 -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
   -DADD_STACKTRACE_INFO=OFF -DTEST_RUST_WAYLAND=OFF -DTEST_DOCKER=OFF \
-  -DTEST_VIRTUAL_INPUT=OFF -DTEST_UHID=OFF -DTEST_NVIDIA=OFF \
-  -DTEST_EXCEPTIONS=OFF -DCMAKE_CATCH_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+  -DTEST_VIRTUAL_INPUT=OFF -DTEST_NVIDIA=OFF -DTEST_EXCEPTIONS=OFF \
+  -DWOLF_RUNTIME_TEST_DISCOVERY=OFF
 ```
 
-Save the full configure log, cache and actual resolved dependency revisions.
-Verify generated `moonlight` include paths resolve property_tree from that
-Boost 1.87 source and its PUBLIC dependency contains `Boost::property_tree`.
-Also qualify the installed-Boost branch with a real installed package; no
-synthetic package/targets should stand in for that check. Source and installed
-paths, shared/static and GCC/Clang remain unexecuted on this revision.
+After Manager combines the frozen security/lifecycle commits and this commit,
+the intended build/test commands are (documented, **not executed here**):
 
-`PRE_TEST` is intentional: upstream `wolftests` main initializes streaming even
-for discovery. No build/discovery/test execution is authorized in this step.
-Inputtino motion fixes and tests owned by MWOW-6 are outside this diff and may
-be needed for later compilation. No OOM fix, complete BOM, runtime compatibility,
-full clean-build success or user acceptance is claimed. Exact usage is unavailable;
-Manager owns the Jiraia lease and no usage numbers are invented.
+```bash
+cmake --build <combined-build> --target wolf-protocol-security-tests wolf-api-security-tests -j2
+ctest --test-dir <combined-build> -R '^wolf-(protocol|api)-security-tests$' --output-on-failure
+# Direct equivalents, using Catch2's main:
+<combined-build>/tests/wolf-protocol-security-tests
+<combined-build>/tests/wolf-api-security-tests '[security]'
+```
+
+Normal CI can omit `-DWOLF_RUNTIME_TEST_DISCOVERY=OFF`; ON remains the default,
+and a subsequent intentional CTest run registers the existing upstream cases.
+Never run the upstream main as part of these isolated checks.
+
+Installed-Boost package qualification, complete build, GCC/static/Release,
+sanitizers, combined security cases and runtime compatibility remain untested
+on this revision. Inputtino motion fixes and the other isolated targets owned
+by MWOW-6/7 are intentionally not copied into this branch. No OOM fix, complete
+BOM or user acceptance is claimed. Exact usage is unavailable; Manager owns the
+Jiraia lease and no usage numbers are invented.
