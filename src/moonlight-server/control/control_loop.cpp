@@ -1,5 +1,4 @@
 #include "control_loop.hpp"
-#include <state/sessions.hpp>
 
 #include "protected_feedback.hpp"
 
@@ -146,7 +145,7 @@ struct State : std::enable_shared_from_this<State> {
     }
   }
   bool current(const events::StreamSession &session) {
-    auto live = state::get_session_by_id(*sessions->load(), session.session_id);
+    auto live = current_control_session(sessions, session.session_id);
     return live && same_control_generation(session, *live);
   }
   void publish() {
@@ -505,7 +504,7 @@ struct State : std::enable_shared_from_this<State> {
           !peer.session.run_scope.matches(grant->owner.source) || owner == owners.end() || owner->second != raw ||
           !current(peer.session))
         continue;
-      auto live = state::get_session_by_id(*sessions->load(), peer.session.session_id);
+      auto live = current_control_session(sessions, peer.session.session_id);
       if (!live)
         return;
       protected_feedback::CurrentOwnerSource source{

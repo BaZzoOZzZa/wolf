@@ -1,5 +1,4 @@
 #include <control/control_loop.hpp>
-#include <state/sessions.hpp>
 
 #include <control/protected_feedback.hpp>
 

@@ -44,6 +44,10 @@ std::pair<std::string /* ip */, int /* port */> get_ip(const sockaddr *const ip_
   return {std::string{data}, port};
 }
 
+std::optional<events::StreamSession> current_control_session(const state::SessionsAtoms &sessions, size_t id) {
+  return state::get_session_by_id(*sessions->load(), id);
+}
+
 bool queue_feedback(std::string_view payload, immer::box<std::shared_ptr<ControlPeer>> connected_client) {
   return *connected_client && (*connected_client)->send && (*connected_client)->send(payload);
 }

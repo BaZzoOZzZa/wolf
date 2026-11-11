@@ -30,6 +30,10 @@ std::optional<events::StreamSession> match_control_session(const state::Sessions
                                                            std::string_view client_ip,
                                                            std::uint32_t connect_token);
 
+// Reuse the existing session lookup without importing lifecycle implementation
+// headers into the owned loop or its public interface.
+std::optional<events::StreamSession> current_control_session(const state::SessionsAtoms &, size_t session_id);
+
 // Device callbacks may outlive an ENet peer. They retain only this revocable
 // sender, never an ENet address/slot. All encryption and ENet calls stay on the
 // control thread.
