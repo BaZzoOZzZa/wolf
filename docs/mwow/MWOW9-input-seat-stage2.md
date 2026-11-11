@@ -1,0 +1,56 @@
+# MWOW-9 Stage2 — disabled InputSeat and joint coordinator
+
+Assignment supersedes historical step1-only restrictions only for these internal
+classes. No runtime caller, public ingress, GameACL implementation or enable switch
+is added. Baseline328e159; game-complex owner, no delegation.
+
+## Design delta before implementation
+
+A server-owned InputSeatDomain reserves its sole slot before factory work; it never
+replaces a failed/Unknown seat. One persistent checked backend belongs to exact
+RunScope L. A shared gate contains retained immutable grants and bounded queues,
+not the backend. Backend callback captures a stable router owning that gate;
+there is no cycle back to backend/seat. The factory receives that callback before
+starting the backend listener. Inventory must explicitly attest fresh ProtectedPadOnly,
+exclusive routing and no preexisting non-pad backend/queued compositor input.
+An empty held-state set is insufficient. These attestations remain trusted caller
+preconditions until Stage3 enforces all routes.
+
+The input worker reserves each complete frame under the gate, executes IO outside
+it and retires the reservation under the gate. FIFO256 /64KiB includes command
+storage plus owned payload capacity; overflow or allocation failure closes input
+and feedback and latches neutral outside the normal queue. No release coalescing.
+Only the selected wire slot (default0, configurable0..15) accepts pad snapshots;
+all other kinds/extensions are explicit refusals. Legacy wire protocol is untouched.
+
+Router capture stamps device/grant/peer at intake. Enqueue and send reservation
+recheck that exact grant under the same gate. A send reservation has an explicit
+retirement acknowledgement; losing it cannot prove a completed send. Revoke drops
+queued input/feedback and waits for reserved IO/sends. Neutral then runs regardless
+of consumer completion. It never calls terminal backend request_stop during transfer.
+A future ENet owner executor must retain the reservation until actual send retirement;
+this stage does not claim the existing ENet outbox is fenced.
+
+Coordinator reserves an immutable shared TransferHandle before revoke, captures the
+old grant and immediately saves ConsumerRuntime::revoke(old.connection). It retains
+the actual runtime and ticket through pruning. One pending transfer; duplicate
+identity returns the same handle, competing request Busy. Fixed supervisor checks
+one monotonic5s deadline and exact ticket, input/send fences, checked20event neutral,
+backend generation and trusted current authorization/binding/lifecycle predicate.
+Grant commit and feedback publication share the gate. Candidate disconnect/auth
+change or any failure/Unknown closes the transaction permanently; late completion
+cannot grant. Prepared consumer admission is an internal gate only, not ANNOUNCE
+wiring. Initial fresh admission requires worker neutral plus trusted validation;
+there is no missing-ticket exception for a transfer from an existing grant.
+
+Resource cap per domain: one backend listener, one input worker and one coordinator
+supervisor, including Unknown. No per-packet/per-transfer thread. Shutdown is owner
+join (possibly physically unbounded); no callback blocks waiting for drain. Timer
+policy is a5s decision threshold, not measured scheduling/driver latency. Supervisor
+and validator are internal nonblocking boundaries; validator must not reenter gate.
+
+Implementation ownership: new control/input_seat.{hpp,cpp},
+sessions/input_handoff.{hpp,cpp}, tests/testInputSeat.cpp, minimal isolated target,
+this document. Existing backend/scope/ticket interfaces stay unchanged. Tests use
+real checked backend with injected IO and real ConsumerRuntime Work resources.
+Stage3 all-route wiring/auth/ENet executor and separate device executor remain gates.
