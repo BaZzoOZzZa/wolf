@@ -635,3 +635,77 @@ TEST_CASE("Owned control CONNECT reuse retires old association without resetting
   REQUIRE(decrypt_packet(f.sent(0), key, EncryptionMode::v2, Direction::host) == "new allocation");
   f.finish();
 }
+
+TEST_CASE("Owned control legacy send rejection and transferred throw preserve actual packet ownership",
+          "[control-loop]") {
+  Fixture f;
+  auto ops = f.fake->ops();
+  SECTION("negative send leaves caller ownership") {
+    ops.send = [](void *, ENetPeer *, uint8_t, ENetPacket *) { return -1; };
+  }
+  SECTION("throw after transfer forces stop and owner reset") {
+    ops.send = [](void *p, ENetPeer *, uint8_t, ENetPacket *packet) -> int {
+      auto &fake = *static_cast<Fake *>(p);
+      fake.affinity();
+      fake.pending.push_back(packet);
+      throw std::runtime_error("transferred then throw");
+    };
+  }
+  f.loop = f.domain.start(f.config, f.sessions, f.bus, std::move(ops));
+  REQUIRE(f.loop);
+  f.ready();
+  auto peer = f.connect();
+  auto before = f.fake->frees.load();
+  REQUIRE(peer.sender->send("attempt"));
+  REQUIRE(eventually([&] { return f.fake->frees > before; }));
+  f.finish();
+  REQUIRE(f.fake->destroys == 1);
+  REQUIRE_FALSE(f.fake->bad_thread);
+}
+
+TEST_CASE("Owned control lifecycle dependency destruction follows actual join outside all loop locks",
+          "[control-loop]") {
+  auto gate = std::make_shared<Gate>();
+  struct Open {
+    std::shared_ptr<Gate> gate;
+    ~Open() {
+      gate->release();
+    }
+  };
+  struct Payload {
+    std::shared_ptr<Fake> fake;
+    std::shared_ptr<Gate> gate;
+    ~Payload() {
+      gate->wait();
+    }
+  };
+  Fixture f;
+  auto domain = std::make_unique<ControlLoopDomain>();
+  auto payload = std::make_shared<Payload>();
+  payload->fake = f.fake;
+  payload->gate = gate;
+  auto ops = f.fake->ops();
+  ops.owner = std::shared_ptr<void>(payload, f.fake.get());
+  std::weak_ptr<Payload> weak = payload;
+  payload.reset();
+  auto owner = domain->start(f.config, f.sessions, f.bus, std::move(ops));
+  REQUIRE(owner);
+  REQUIRE(eventually([&] { return owner->status().ready; }));
+  owner->request_stop();
+  REQUIRE(eventually([&] { return owner->join_when_exited() == JoinResult::Joined; }));
+  REQUIRE(f.fake->destroys == 1);
+  REQUIRE_FALSE(weak.expired()); // immutable operations retained until domain release
+  owner.reset();
+  std::atomic_bool retired{false};
+  std::jthread lifecycle([domain = std::move(domain), &retired]() mutable {
+    domain.reset();
+    retired = true;
+  });
+  Open open{gate}; // opens BEFORE jthread joins, also on failed assertion
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  REQUIRE_FALSE(retired);
+  gate->release();
+  lifecycle.join();
+  REQUIRE(retired);
+  REQUIRE(weak.expired());
+}
