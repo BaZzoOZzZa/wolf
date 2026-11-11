@@ -105,7 +105,12 @@ void InputHandoff::poll() {
     }
     if (!pending_ || pending_->status() != TransferStatus::Pending)
       return;
-    if (g.quarantined || now_() - pending_->started >= 5s || !pending_->validate_(pending_->prepared_grant->owner)) {
+    const auto now = now_();
+    const auto elapsed_ms =
+        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()) -
+        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(pending_->started.time_since_epoch()).count());
+    if (g.quarantined || now < pending_->started || elapsed_ms >= 5000 ||
+        !pending_->validate_(pending_->prepared_grant->owner)) {
       quarantine_locked();
       return;
     }
@@ -162,7 +167,8 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
       !peer.matches(handle->prepared_grant->owner.peer))
     return streaming::ConsumerAdmission::Revoked;
   try {
-    if (!handle->validate_(handle->prepared_grant->owner)) {
+    const auto status = seat_->backend_->listener_status();
+    if (status.failed || status.stop_requested || !handle->validate_(handle->prepared_grant->owner)) {
       quarantine_locked();
       return streaming::ConsumerAdmission::Revoked;
     }

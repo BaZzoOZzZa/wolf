@@ -451,7 +451,8 @@ TEST_CASE("Handoff feedback captured queued and reserved send lifetimes", "[inpu
   f.io->callback(100, 200);
   auto send = router->reserve_send();
   REQUIRE(send);
-  f.io->callback(300, 400); // queued old grant must be purged
+  f.io->callback(300, 400);            // queued old grant must be purged
+  CHECK_FALSE(router->reserve_send()); // one outstanding send reservation, including Unknown
   auto transaction = f.transfer();
   REQUIRE(transaction.handle);
   CHECK_FALSE(router->enqueue(*captured));

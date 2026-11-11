@@ -79,3 +79,8 @@ admission run in the seat serial domain. `prepared_admission` is inspection only
 not a reusable permission to start a consumer outside the gate. Runtime Current
 and authority callbacks must not reenter the seat; no gate is held across drain
 waiting or device IO. Command budget includes the one reserved in-flight command.
+
+Feedback has at most one outstanding send reservation in addition to its fixed
+256-entry queue. A lost acknowledgement holds this slot and blocks the fence;
+new sends cannot accumulate behind an Unknown executor. Fresh bootstrap and
+prepared admission also check the backend listener terminal snapshot.

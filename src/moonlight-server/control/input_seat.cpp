@@ -66,7 +66,7 @@ void SeatFeedbackRouter::intake(int low, int high) noexcept {
 }
 std::shared_ptr<FeedbackReservation> SeatFeedbackRouter::reserve_send() {
   std::lock_guard lock(gate_->mutex);
-  if (!gate_->open || gate_->quarantined || !gate_->feedback_count)
+  if (!gate_->open || gate_->quarantined || !gate_->feedback_count || gate_->sends)
     return {};
   auto &value = gate_->feedback[gate_->feedback_head];
   if (!value || !gate_->matches(value->grant) || !gate_->device.matches(value->device)) {
@@ -170,7 +170,8 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
           } catch (...) {
           }
           gate->bootstrap = false;
-          gate->open = accepted && valid && !gate->quarantined;
+          const auto status = backend->listener_status();
+          gate->open = accepted && valid && !gate->quarantined && !status.failed && !status.stop_requested;
           if (!gate->open)
             gate->quarantined = true;
           gate->initial_validation = {};
