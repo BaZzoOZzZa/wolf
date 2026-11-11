@@ -3,7 +3,8 @@
 #include <stdexcept>
 namespace control {
 bool SeatCandidate::valid() const {
-  return source && destination && connection && peer && binding && slot < 16;
+  return source && destination && connection && source.id() == std::to_string(connection.id()) && peer && binding &&
+         slot < 16;
 }
 bool seat_detail::Gate::matches(const GrantHandle &grant) const {
   return grant && current && current->token.matches(grant->token) && current->owner.peer.matches(grant->owner.peer) &&

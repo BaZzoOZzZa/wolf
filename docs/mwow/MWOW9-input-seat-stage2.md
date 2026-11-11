@@ -84,3 +84,9 @@ Feedback has at most one outstanding send reservation in addition to its fixed
 256-entry queue. A lost acknowledgement holds this slot and blocks the fence;
 new sends cannot accumulate behind an Unknown executor. Fresh bootstrap and
 prepared admission also check the backend listener terminal snapshot.
+
+ConsumerRuntime's retained job run is the **source** run S/T (its stable ID must
+match ConnectionScope's ID), while the persistent pad targets L. `admit_prepared`
+passes the captured source run; Stage3's media Work must retain F6/F7 producer L
+selection. No numeric lookup supplies either authority. Initial test failure caught
+this mapping error via the existing Stale guard; the guard was preserved.

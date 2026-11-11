@@ -25,7 +25,7 @@ struct Gate {
   void wait() {
     std::unique_lock lock(mutex);
     entered = true;
-    cv.wait(lock, [&] { return released; });
+    cv.wait_for(lock, 4s, [&] { return released; }); // bounded fallback even during constructor/unwind faults
   }
   void release() {
     std::lock_guard lock(mutex);
@@ -91,10 +91,18 @@ struct Fixture {
   std::shared_ptr<std::atomic_bool> authorized = std::make_shared<std::atomic_bool>(true);
   std::shared_ptr<std::atomic<int64_t>> time = std::make_shared<std::atomic<int64_t>>(10000);
   RunScope destination = RunScope::fresh("L");
-  SeatCandidate initial{
-      RunScope::fresh("S"), destination, ConnectionScope::fresh(42), PeerToken::fresh(1), BindingRevision::fresh(1), 0};
-  SeatCandidate target{
-      RunScope::fresh("T"), destination, ConnectionScope::fresh(42), PeerToken::fresh(1), BindingRevision::fresh(1), 0};
+  SeatCandidate initial{RunScope::fresh("42"),
+                        destination,
+                        ConnectionScope::fresh(42),
+                        PeerToken::fresh(1),
+                        BindingRevision::fresh(1),
+                        0};
+  SeatCandidate target{RunScope::fresh("42"),
+                       destination,
+                       ConnectionScope::fresh(42),
+                       PeerToken::fresh(1),
+                       BindingRevision::fresh(1),
+                       0};
   std::unique_ptr<InputSeatDomain> domain = std::make_unique<InputSeatDomain>();
   std::shared_ptr<InputSeat> seat;
   std::shared_ptr<ConsumerRuntime> runtime;
@@ -157,7 +165,7 @@ struct Fixture {
     if (!scope)
       scope = initial.connection;
     if (!producer)
-      producer = destination;
+      producer = initial.source;
     struct Holder {
       std::shared_ptr<Gate> gate;
       explicit Holder(std::shared_ptr<Gate> value) : gate(std::move(value)) {}
@@ -178,6 +186,8 @@ struct Fixture {
                                      gate->wait();
                                    return true;
                                  });
+    if (result != ConsumerAdmission::Accepted)
+      gate->release();
     REQUIRE(result == ConsumerAdmission::Accepted);
     holder.reset();
     runtime->ping(ConsumerKind::Video, ConsumerPing{"local", 1234, std::array<char, 16>{}, {}});
@@ -219,7 +229,7 @@ TEST_CASE("InputSeat held IO stale FIFO and exact joint consumer retirement", "[
   CHECK(f.seat->submit(f.command()) == SeatAdmission::Stale);
   CHECK(f.seat->submit(f.command(f.seat->current())) == SeatAdmission::Accepted);
   CHECK(f.runtime->admit(f.initial.connection,
-                         f.destination,
+                         f.initial.source,
                          ConsumerKind::Audio,
                          {"local", 1234, {}},
                          [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);
@@ -286,7 +296,7 @@ TEST_CASE("InputSeat explicit protected inventory nonpad denial and failed publi
   }
   SECTION("inventory must be explicit and allocation/factory failure consumes cap") {
     InputSeatDomain domain;
-    SeatCandidate c{RunScope::fresh("S"),
+    SeatCandidate c{RunScope::fresh("1"),
                     RunScope::fresh("L"),
                     ConnectionScope::fresh(1),
                     PeerToken::fresh(1),
@@ -434,7 +444,7 @@ TEST_CASE("Handoff EOS holder retirement ticket pruning stop before registration
   REQUIRE(eventually([&] { return transaction.handle->status() == TransferStatus::Granted; }));
   f.current->remove(f.initial.connection);
   auto other = ConnectionScope::fresh(100);
-  auto other_run = RunScope::fresh("other-game");
+  auto other_run = RunScope::fresh("100");
   f.current->add(other);
   auto other_job = f.consumer(false, other, other_run);
   CHECK_FALSE(f.runtime->status(f.initial.connection, ConsumerKind::Video)); // actual prune
@@ -504,7 +514,7 @@ TEST_CASE("InputSeat healthy held input has no idle timeout and ABA cannot write
   auto transaction = f.transfer();
   REQUIRE(transaction.handle);
   CHECK(f.runtime->admit(f.initial.connection,
-                         f.destination,
+                         f.initial.source,
                          ConsumerKind::Video,
                          {"local", 1234, {}},
                          [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);

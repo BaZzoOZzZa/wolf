@@ -172,7 +172,11 @@ streaming::ConsumerAdmission InputHandoff::admit_prepared(const std::shared_ptr<
       quarantine_locked();
       return streaming::ConsumerAdmission::Revoked;
     }
-    return consumers_->admit(connection, g.destination, kind, std::move(correlation), std::move(work));
+    return consumers_->admit(connection,
+                             handle->prepared_grant->owner.source,
+                             kind,
+                             std::move(correlation),
+                             std::move(work));
   } catch (...) {
     quarantine_locked();
     return streaming::ConsumerAdmission::Revoked;
