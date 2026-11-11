@@ -520,3 +520,57 @@ TEST_CASE("InputSeat healthy held input has no idle timeout and ABA cannot write
                          [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);
   REQUIRE(eventually([&] { return transaction.handle->status() == TransferStatus::Granted; }));
 }
+
+TEST_CASE("InputSeat selected slot fifteen uses the same persistent device", "[input-seat]") {
+  Fixture f;
+  auto backend = f.seat->backend_identity();
+  f.target.slot = 15;
+  auto transaction = f.transfer();
+  REQUIRE(transaction.handle);
+  REQUIRE(eventually([&] { return transaction.handle->status() == TransferStatus::Granted; }));
+  auto command = f.command(f.seat->current());
+  CHECK(f.seat->submit(command) == SeatAdmission::Denied); // configured slot0 is no longer selected
+  command.slot = 15;
+  CHECK(f.seat->submit(std::move(command)) == SeatAdmission::Accepted);
+  CHECK(f.seat->backend_identity() == backend);
+}
+TEST_CASE("InputSeat feedback overflow and validator exception are fail closed", "[input-seat]") {
+  Fixture f;
+  SECTION("fixed feedback queue overflow") {
+    for (int i = 0; i < 257; ++i)
+      f.io->callback(i, i);
+    CHECK(f.seat->quarantined());
+    CHECK_FALSE(f.seat->router()->reserve_send());
+    REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
+  }
+  SECTION("exception in current authorization check") {
+    auto candidate = f.selection();
+    candidate.validate = [](const auto &) -> bool { throw std::bad_alloc(); };
+    CHECK(f.handoff->request(TransferToken::fresh(1), std::move(candidate)).admission ==
+          TransferAdmission::Quarantined);
+    REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
+    CHECK_FALSE(f.seat->current());
+  }
+}
+TEST_CASE("Handoff exact notification and terminal backend fault after grant revoke future admission", "[input-seat]") {
+  Fixture f;
+  auto transaction = f.transfer();
+  REQUIRE(transaction.handle);
+  REQUIRE(eventually([&] { return transaction.handle->status() == TransferStatus::Granted; }));
+  SECTION("notification racing just after commit") {
+    CHECK_FALSE(f.handoff->candidate_gone(f.target.connection, f.old->owner.peer));
+    CHECK(f.handoff->candidate_gone(f.target.connection, f.target.peer));
+  }
+  SECTION("terminal listener failure after healthy commit") {
+    f.io->fail_listener = true;
+    REQUIRE(eventually([&] { return f.seat->quarantined(); }));
+  }
+  CHECK_FALSE(f.seat->current());
+  CHECK_FALSE(f.handoff->prepared_admission(transaction.handle, f.target.connection, f.target.peer));
+  CHECK(f.handoff->admit_prepared(transaction.handle,
+                                  f.target.connection,
+                                  f.target.peer,
+                                  ConsumerKind::Audio,
+                                  {"local", 1234, {}},
+                                  [](auto &, const auto &) { return true; }) == ConsumerAdmission::Revoked);
+}

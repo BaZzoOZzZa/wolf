@@ -106,10 +106,10 @@ void InputHandoff::poll() {
     if (!pending_ || pending_->status() != TransferStatus::Pending)
       return;
     const auto now = now_();
-    const auto elapsed_ms =
-        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count()) -
-        uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(pending_->started.time_since_epoch()).count());
-    if (g.quarantined || now < pending_->started || elapsed_ms >= 5000 ||
+    const auto elapsed_ticks = uint64_t(now.time_since_epoch().count()) -
+                               uint64_t(pending_->started.time_since_epoch().count());
+    if (g.quarantined || now < pending_->started ||
+        elapsed_ticks >= uint64_t(std::chrono::duration_cast<Clock::duration>(5s).count()) ||
         !pending_->validate_(pending_->prepared_grant->owner)) {
       quarantine_locked();
       return;
@@ -121,8 +121,15 @@ void InputHandoff::poll() {
       quarantine_locked();
       return;
     }
-    if (!drain_complete(pending_->ticket_, pending_->old_grant->owner.connection))
+    if (!pending_->ticket_ || !pending_->ticket_->released.valid()) {
+      quarantine_locked();
       return;
+    }
+    if (!drain_complete(pending_->ticket_, pending_->old_grant->owner.connection)) {
+      if (pending_->ticket_->released.wait_for(0ms) == std::future_status::ready)
+        quarantine_locked();
+      return;
+    }
     // All guards and publication share input/send reservation serial gate.
     if (!g.matches(pending_->old_grant) || !pending_->prepared_grant->owner.destination.matches(g.destination) ||
         !pending_->validate_(pending_->prepared_grant->owner)) {
@@ -138,9 +145,13 @@ void InputHandoff::poll() {
 }
 bool InputHandoff::candidate_gone(const control::ConnectionScope &connection, const control::PeerToken &peer) {
   std::lock_guard lock(seat_->gate_->mutex);
-  if (!pending_ || pending_->status() != TransferStatus::Pending ||
+  if (!pending_ || pending_->status() == TransferStatus::Quarantined ||
       !connection.matches(pending_->prepared_grant->owner.connection) ||
       !peer.matches(pending_->prepared_grant->owner.peer))
+    return false;
+  // Notification racing the commit must also revoke the just-published grant.
+  // A historical handle for an older grant cannot close another incarnation.
+  if (pending_->status() == TransferStatus::Granted && !seat_->gate_->matches(pending_->prepared_grant))
     return false;
   quarantine_locked();
   return true;

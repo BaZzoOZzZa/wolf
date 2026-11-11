@@ -90,3 +90,12 @@ match ConnectionScope's ID), while the persistent pad targets L. `admit_prepared
 passes the captured source run; Stage3's media Work must retain F6/F7 producer L
 selection. No numeric lookup supplies either authority. Initial test failure caught
 this mapping error via the existing Stale guard; the guard was preserved.
+
+Authority/connection/binding revocation notifications must enter the same serial
+protocol (`candidate_gone` for the exact candidate or `InputSeat::revoke` for an
+exact current grant/peer). A notification racing commit also closes the matching
+just-published grant. External GameACL mutation without this integration is not
+claimed atomic; implementing that protocol is a Stage3 gate. A Granted transfer
+handle records a past decision, not perpetual permission: every input/send/consumer
+admission checks the current gate again. Late terminal backend failure revokes
+future admissions; no claim of impossible failure-after-observation.
