@@ -573,3 +573,48 @@ TEST_CASE("Protected invalid bootstrap never falls back and consumes the domain 
   CHECK_FALSE(f.owner->start(f.bootstrap()));
   CHECK(f.owner->submit(f.selection()).result == RuntimeSubmission::Closed);
 }
+
+TEST_CASE("Shared composition preserves exact legacy recognition and unrelated running consumer",
+          "[protected-runtime]") {
+  std::atomic_bool cancelled{true}; // retained through fixture/Runtime destruction
+  Fixture f;
+  const auto other = ConnectionScope::fresh(77);
+  const auto run = RunScope::fresh("77");
+  f.running->store(immer::vector<wolf::core::events::StreamSession>{
+      wolf::core::events::StreamSession{.session_id = 77, .connection_scope = other, .run_scope = run}});
+  auto gate = f.gate();
+  REQUIRE(f.owner->runtime()->admit(other,
+                                    run,
+                                    ConsumerKind::Video,
+                                    {"127.0.0.1", 7788, {}},
+                                    [gate, &cancelled](auto &job, const auto &) {
+                                      cancelled = job.cancelled();
+                                      gate->wait();
+                                      cancelled = job.cancelled();
+                                      return true;
+                                    }) == ConsumerAdmission::Accepted);
+  CHECK(f.owner->runtime()->admit(ConnectionScope::fresh(77), run, ConsumerKind::Audio, {}, [](auto &, const auto &) {
+    return true;
+  }) == ConsumerAdmission::Stale);
+  f.owner->runtime()->ping(ConsumerKind::Video, {"127.0.0.1", 7788, {}, {}});
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  auto h = f.transfer();
+  auto audio = f.owner->submit(f.media(h, RuntimeCell::Audio));
+  REQUIRE(audio.receipt);
+  REQUIRE(eventually([&] { return audio.receipt->state == RuntimeJobState::Complete; }));
+  // Actual new admission prunes obsolete old record; saved ticket remains independent.
+  REQUIRE(h->saved_ticket());
+  CHECK(h->saved_ticket()->complete());
+  f.owner->request_stop();
+  auto unrelated = f.owner->runtime()->status(other, ConsumerKind::Video);
+  REQUIRE(unrelated);
+  CHECK(unrelated->state == ConsumerState::Running);
+  CHECK_FALSE(cancelled.load());
+  gate->release();
+  REQUIRE(eventually([&] {
+    auto done = f.owner->runtime()->status(other, ConsumerKind::Video);
+    return done && done->joined;
+  }));
+  CHECK_FALSE(cancelled.load());
+  CHECK(run.matches(f.running->load()->front().run_scope));
+}
