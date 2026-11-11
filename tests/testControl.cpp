@@ -3,6 +3,7 @@
 
 using Catch::Matchers::Equals;
 
+#include "../src/moonlight-server/control/input_dispatch.hpp"
 #include <moonlight/control.hpp>
 using namespace moonlight::control;
 
@@ -193,6 +194,8 @@ template <typename T> static std::string input_wire(pkts::INPUT_TYPE type) {
     packet.width = boost::endian::native_to_big<int16_t>(1920);
     packet.height = boost::endian::native_to_big<int16_t>(1080);
   }
+  if constexpr (std::is_same_v<T, pkts::CONTROLLER_MOTION_PACKET>)
+    packet.motion_type = pkts::ACCELERATION;
   return {reinterpret_cast<const char *>(&packet), sizeof(packet)};
 }
 
@@ -291,4 +294,234 @@ TEST_CASE("Control feedback has canonical packed wire lengths", "[CONTROL][secur
       .reportrate = boost::endian::native_to_little<uint16_t>(100),
       .type = 2};
   REQUIRE(crypto::str_to_hex({reinterpret_cast<const char *>(&motion), sizeof(motion)}) == "015505000100640002");
+}
+
+namespace {
+// Recording device boundary used by the very same dispatch functions as the
+// production PS5 handler. No virtual device or inputtino implementation copy.
+struct RecordingPad {
+  int calls = 0;
+  int finger = -1;
+  uint16_t x = 0, y = 0;
+  bool released = false;
+  inputtino::PS5Joypad::MOTION_TYPE motion{};
+  std::array<float, 3> axes{};
+  inputtino::PS5Joypad::BATTERY_STATE battery{};
+  int percentage = -1;
+
+  void place_finger(int id, uint16_t px, uint16_t py) {
+    ++calls;
+    finger = id;
+    x = px;
+    y = py;
+  }
+  void release_finger(int id) {
+    ++calls;
+    finger = id;
+    released = true;
+  }
+  void set_motion(inputtino::PS5Joypad::MOTION_TYPE type, float a, float b, float c) {
+    ++calls;
+    motion = type;
+    axes = {a, b, c};
+  }
+  void set_battery(inputtino::PS5Joypad::BATTERY_STATE state, int charge) {
+    ++calls;
+    battery = state;
+    percentage = charge;
+  }
+};
+
+void set_float(pkts::netfloat &wire, float value) {
+  boost::endian::endian_store<float, sizeof(float), boost::endian::order::little>(wire, value);
+}
+
+template <typename Packet> bool valid_wire(const Packet &packet) {
+  return valid_input_packet({reinterpret_cast<const char *>(&packet), sizeof(packet)});
+}
+
+const std::array invalid_floats{std::numeric_limits<float>::quiet_NaN(),
+                                std::numeric_limits<float>::infinity(),
+                                -std::numeric_limits<float>::infinity()};
+const std::array finite_extremes{std::numeric_limits<float>::max(),
+                                 std::numeric_limits<float>::lowest(),
+                                 std::numeric_limits<float>::min(),
+                                 std::numeric_limits<float>::denorm_min()};
+} // namespace
+
+TEST_CASE("PS touch IDs never narrow into an invalid device slot", "[CONTROL][security]") {
+  using namespace pkts;
+  auto packet = read_packet<CONTROLLER_TOUCH_PACKET>(input_wire<CONTROLLER_TOUCH_PACKET>(CONTROLLER_TOUCH));
+  set_float(packet.x, 0.5f);
+  set_float(packet.y, 1.0f);
+  for (uint32_t id : {0u, 1u, 2u, 0x7fffffffu, 0x80000000u, 0xffffffffu}) {
+    packet.pointer_id = boost::endian::native_to_little(id);
+    for (uint8_t event = 0; event <= 7; ++event) {
+      packet.event_type = static_cast<TOUCH_EVENT_TYPE>(event);
+      RecordingPad pad;
+      CAPTURE(id, event);
+      REQUIRE(valid_wire(packet) == (id < 2));
+      REQUIRE(::control::dispatch_controller_touch(packet, pad) == (id < 2));
+      if (id >= 2 || event == TOUCH_EVENT_BUTTON_ONLY || event == TOUCH_EVENT_CANCEL_ALL) {
+        REQUIRE(pad.calls == 0);
+      } else {
+        REQUIRE(pad.calls == 1);
+        REQUIRE(pad.finger == id);
+        REQUIRE(pad.released ==
+                (event == TOUCH_EVENT_UP || event == TOUCH_EVENT_CANCEL || event == TOUCH_EVENT_HOVER_LEAVE));
+        if (!pad.released) {
+          REQUIRE(pad.x == 960);
+          REQUIRE(pad.y == 1080);
+        }
+      }
+    }
+  }
+  packet.pointer_id = 0;
+  for (uint8_t event : {8, 255}) {
+    packet.event_type = static_cast<TOUCH_EVENT_TYPE>(event);
+    RecordingPad pad;
+    REQUIRE_FALSE(valid_wire(packet));
+    REQUIRE_FALSE(::control::dispatch_controller_touch(packet, pad));
+    REQUIRE(pad.calls == 0);
+  }
+  auto screen = read_packet<TOUCH_PACKET>(input_wire<TOUCH_PACKET>(TOUCH));
+  screen.pointer_id = boost::endian::native_to_little(uint32_t{0xffffffff});
+  REQUIRE(valid_wire(screen)); // Screen IDs are not indices into the PS5's two slots.
+}
+
+TEST_CASE("PS battery enums and charge bounds precede device calls", "[CONTROL][security]") {
+  using namespace pkts;
+  auto packet = read_packet<CONTROLLER_BATTERY_PACKET>(input_wire<CONTROLLER_BATTERY_PACKET>(CONTROLLER_BATTERY));
+  const std::array mapped{inputtino::PS5Joypad::BATTERY_DISCHARGING,
+                          inputtino::PS5Joypad::BATTERY_CHARGHING,
+                          inputtino::PS5Joypad::CHARGHING_ERROR,
+                          inputtino::PS5Joypad::BATTERY_FULL};
+  for (unsigned state = 0; state <= 255; ++state) {
+    packet.battery_state = static_cast<BATTERY_STATE>(state);
+    for (unsigned charge : {0, 1, 99, 100, 101, 254, 255}) {
+      packet.battery_percentage = charge;
+      RecordingPad pad;
+      const bool valid = state <= 5 && (charge <= 100 || charge == 255);
+      CAPTURE(state, charge);
+      REQUIRE(valid_wire(packet) == valid);
+      REQUIRE(::control::dispatch_controller_battery(packet, pad) == valid); // direct typed caller too
+      if (valid && state >= 2 && charge != 255) {
+        REQUIRE(pad.calls == 1);
+        REQUIRE(pad.battery == mapped[state - 2]);
+        REQUIRE(pad.percentage == charge);
+      } else {
+        REQUIRE(pad.calls == 0);
+      }
+    }
+  }
+}
+
+TEST_CASE("All network float fields reject nonfinite input before dispatch", "[CONTROL][security]") {
+  using namespace pkts;
+  auto touch = read_packet<CONTROLLER_TOUCH_PACKET>(input_wire<CONTROLLER_TOUCH_PACKET>(CONTROLLER_TOUCH));
+  for (auto field : {&touch.x, &touch.y, &touch.pressure}) {
+    for (float invalid : invalid_floats) {
+      set_float(*field, invalid);
+      RecordingPad pad;
+      REQUIRE_FALSE(valid_wire(touch));
+      REQUIRE_FALSE(::control::dispatch_controller_touch(touch, pad));
+      REQUIRE(pad.calls == 0);
+    }
+    set_float(*field, 0);
+  }
+  auto motion = read_packet<CONTROLLER_MOTION_PACKET>(input_wire<CONTROLLER_MOTION_PACKET>(CONTROLLER_MOTION));
+  for (auto type : {ACCELERATION, GYROSCOPE}) {
+    motion.motion_type = type;
+    for (auto field : {&motion.x, &motion.y, &motion.z}) {
+      for (float invalid : invalid_floats) {
+        set_float(*field, invalid);
+        RecordingPad pad;
+        REQUIRE_FALSE(valid_wire(motion));
+        REQUIRE_FALSE(::control::dispatch_controller_motion(motion, pad));
+        REQUIRE(pad.calls == 0);
+      }
+      set_float(*field, 0);
+    }
+  }
+  for (uint8_t type : {0, 3, 255}) {
+    motion.motion_type = static_cast<MOTION_TYPE>(type);
+    RecordingPad pad;
+    REQUIRE_FALSE(valid_wire(motion));
+    REQUIRE_FALSE(::control::dispatch_controller_motion(motion, pad));
+    REQUIRE(pad.calls == 0);
+  }
+  auto screen = read_packet<TOUCH_PACKET>(input_wire<TOUCH_PACKET>(TOUCH));
+  for (auto field :
+       {&screen.x, &screen.y, &screen.pressure_or_distance, &screen.contact_area_major, &screen.contact_area_minor}) {
+    for (float invalid : invalid_floats) {
+      set_float(*field, invalid);
+      REQUIRE_FALSE(valid_wire(screen));
+      REQUIRE_FALSE(valid_input_fields(screen)); // typed touch handler uses this before device creation
+    }
+    for (float value : finite_extremes) {
+      set_float(*field, value);
+      REQUIRE(valid_wire(screen));
+    }
+    set_float(*field, 0);
+  }
+  auto pen = read_packet<PEN_PACKET>(input_wire<PEN_PACKET>(PEN));
+  for (auto field : {&pen.x, &pen.y, &pen.pressure_or_distance, &pen.contact_area_major, &pen.contact_area_minor}) {
+    for (float invalid : invalid_floats) {
+      set_float(*field, invalid);
+      REQUIRE_FALSE(valid_wire(pen));
+      REQUIRE_FALSE(valid_input_fields(pen)); // typed pen handler uses this before device creation
+    }
+    for (float value : finite_extremes) {
+      set_float(*field, value);
+      REQUIRE(valid_wire(pen));
+    }
+    set_float(*field, 0);
+  }
+}
+
+TEST_CASE("Finite extreme axes stay finite at the device boundary", "[CONTROL][security]") {
+  using namespace pkts;
+  auto touch = read_packet<CONTROLLER_TOUCH_PACKET>(input_wire<CONTROLLER_TOUCH_PACKET>(CONTROLLER_TOUCH));
+  touch.event_type = TOUCH_EVENT_DOWN;
+  for (float value : finite_extremes) {
+    set_float(touch.x, value);
+    set_float(touch.y, value);
+    set_float(touch.pressure, value);
+    RecordingPad pad;
+    REQUIRE(valid_wire(touch));
+    REQUIRE(::control::dispatch_controller_touch(touch, pad));
+    REQUIRE(pad.calls == 1);
+    REQUIRE(pad.x == (value == std::numeric_limits<float>::max() ? 1920 : 0));
+    REQUIRE(pad.y == (value == std::numeric_limits<float>::max() ? 1080 : 0));
+    REQUIRE(std::isfinite(::control::normalized_input(touch.pressure)));
+  }
+  auto motion = read_packet<CONTROLLER_MOTION_PACKET>(input_wire<CONTROLLER_MOTION_PACKET>(CONTROLLER_MOTION));
+  for (auto type : {ACCELERATION, GYROSCOPE}) {
+    motion.motion_type = type;
+    for (float value : finite_extremes) {
+      set_float(motion.x, value);
+      set_float(motion.y, value);
+      set_float(motion.z, value);
+      RecordingPad pad;
+      REQUIRE(valid_wire(motion));
+      REQUIRE(::control::dispatch_controller_motion(motion, pad));
+      REQUIRE(pad.calls == 1);
+      REQUIRE(pad.motion ==
+              (type == ACCELERATION ? inputtino::PS5Joypad::ACCELERATION : inputtino::PS5Joypad::GYROSCOPE));
+      for (float axis : pad.axes) {
+        REQUIRE(std::isfinite(axis));
+        REQUIRE(std::abs(static_cast<double>(axis)) <= std::numeric_limits<float>::max());
+        REQUIRE(std::signbit(axis) == std::signbit(value));
+      }
+    }
+  }
+  motion.motion_type = GYROSCOPE;
+  set_float(motion.x, 90);
+  set_float(motion.y, -90);
+  set_float(motion.z, 0);
+  RecordingPad pad;
+  REQUIRE(::control::dispatch_controller_motion(motion, pad));
+  REQUIRE(std::abs(pad.axes[0] - 1.57079633f) < 0.00001f);
+  REQUIRE(std::abs(pad.axes[1] + 1.57079633f) < 0.00001f);
+  REQUIRE(pad.axes[2] == 0);
 }

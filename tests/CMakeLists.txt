@@ -133,3 +133,14 @@ if (UNIX AND NOT APPLE)
     add_test(NAME wolf-docker-lifecycle-tests COMMAND wolf-docker-lifecycle-tests)
     set_tests_properties(wolf-docker-lifecycle-tests PROPERTIES TIMEOUT 30)
 endif ()
+
+# Exercise the actual patched inputtino encoder without opening input devices
+# or entering Wolf's GStreamer-initialising test main.
+if (TARGET inputtino::libinputtino)
+    get_target_property(INPUTTINO_CHECKED_SOURCE_DIR libinputtino SOURCE_DIR)
+    add_executable(wolf-inputtino-motion-tests testInputtinoSignedMotion.cpp)
+    target_compile_features(wolf-inputtino-motion-tests PRIVATE cxx_std_17)
+    target_include_directories(wolf-inputtino-motion-tests PRIVATE "${INPUTTINO_CHECKED_SOURCE_DIR}/src/uhid")
+    target_link_libraries(wolf-inputtino-motion-tests PRIVATE Catch2::Catch2WithMain)
+    add_test(NAME inputtino-signed-motion COMMAND wolf-inputtino-motion-tests)
+endif ()

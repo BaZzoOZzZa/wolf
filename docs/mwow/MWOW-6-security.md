@@ -73,3 +73,107 @@ The fetched Boost subset also omitted `property_tree` headers used by the unchan
 - This checks the shared-library Debug build on this Linux host. GCC/static/Release matrices, TSan, complete upstream tests, actual ENet/reconnect/network behavior, hardware/live Android and MWOW-9 lifecycle/barrier acceptance remain outstanding. No deployment, merge, push or release.
 
 Source is frozen at the reported security commit for independent review; do not treat these passes as user acceptance. The approved worktree/build environment is retained for Manager's combined candidate with MWOW-7.
+
+## Independent review corrections F3–F5 (after 8395abc)
+
+Status: **review candidate**, not accepted. These changes are a separate commit on
+`feature/MWOW-6-security-fix`, based on `8395abc30592640b9f89091cea3be5f4e7212554`;
+MWOW-7 lifecycle changes are not included. The prior verification section describes
+8395abc; the evidence below supersedes its input-validation coverage.
+
+- **F3:** controller-touch wire pointer IDs are checked as unsigned 32-bit values
+  before conversion to inputtino's signed finger index. The existing direct mapping
+  supports only PS5 touchpad slots 0 and 1. IDs 2, INT_MAX, 0x80000000 and UINT_MAX
+  fail before any device operation, for every event type. Screen-touch IDs retain
+  their separate semantics and are not restricted to two slots. CANCEL_ALL and
+  BUTTON_ONLY remain unsupported/no-op for controller touch; this patch does not
+  implement multi-touch ID remapping or MWOW-9 neutralisation.
+- **F4:** battery states must be 0..5; percentage must be 0..100 or 0xff (unknown).
+  Unknown/not-present reports and unknown percentage make no device call. The typed
+  device dispatch validates independently of the outer packet and has a safe default
+  switch branch, so invalid enums cannot read an uninitialised battery state.
+- **F5:** every netfloat in controller touch/motion, screen touch and pen is checked
+  for finiteness before dispatch/device creation. Finite normalized coordinates and
+  pressure preserve the existing 0..1 clamping behaviour. Contact-area fields are
+  currently unused but nonfinite values are rejected too. Gyroscope degree/radian
+  conversion uses double arithmetic. Finite extreme motion is saturated in the
+  actual patched inputtino encoder before integer conversion; negative motion is
+  preserved. Motion/event/tool enum checks reject unsupported values.
+
+`control/input_dispatch.hpp` contains the small production PS5 device-boundary
+functions used by `input_handler.cpp` and by recording-sink tests. Tests do not copy
+those implementations or instantiate devices. Typed touch/pen handlers also apply
+field validation before their lazy device creation. Existing V2 and legacy capture
+vectors are unchanged.
+
+### Tracked inputtino correction and source ownership
+
+Review of the pinned dependency also found that `htole16(float)` converted negative
+samples directly to an unsigned integer. The tracked
+[patch](../../patches/inputtino-signed-motion.patch) replaces that conversion with a
+private `motion_encoding.hpp` helper used by the real `PS5Joypad::set_motion`.
+It scales in double, clamps to the signed 16-bit range, converts to `int16_t`, then
+uses the defined signed-to-unsigned modulo conversion before endian encoding.
+Nonfinite samples at this dependency boundary encode as zero; Wolf rejects them
+before reaching the dependency. No dependency API, physical device code, sensor
+units or wire format was invented or replaced with a test copy.
+
+The pin remains **fd136cfe492b4375b4507718bcca1f044588fc6f**. `FetchContent`
+automatically applies [the checked driver](../../cmake/PatchInputtinoMotion.cmake)
+to the fetched source, with exact before/after SHA256 checks. Repeated application
+is a no-op only when both patched source and helper hashes match. Unknown source
+or a conflicting helper fails closed. Both `WOLF_CUSTOM_INPUTTINO_SRC` and
+`FETCHCONTENT_SOURCE_DIR_INPUTTINO` are **verification-only** paths: an unpatched
+custom tree fails configure with instructions; it is never silently modified.
+Custom inputtino users must explicitly apply this patch to the matching pin or
+review a new compatible integration when upgrading.
+
+Actual build source: `MWOW-6/full-build/_deps/inputtino-src`, fetched afresh by the
+normal CMake path. The old `MWOW-6/inputtino-fd136cf` override remains unchanged.
+
+| Artifact | SHA256 |
+|---|---|
+| Original `src/uhid/joypad_ps5.cpp` | `f4a5a170e7a39ac63ba4f61fd73d233bdb2d536ec9fa9736f8e9b904e376987e` |
+| Patched `src/uhid/joypad_ps5.cpp` | `4a29d8b05f58c07f06366ae6d91e0d19e058f9d20710e3d20d45ae3ee8e800d1` |
+| New private `motion_encoding.hpp` | `342fe83ced8fcb7bc964757b631b86622458511aeb5e9b066708c5586034623c` |
+| Tracked patch | `5b852c8c092b2e29f2d2c29753bce0d7580d5f443568032b94132c72d49d934b` |
+
+`tests/CMakeLists.txt` registers **wolf-inputtino-motion-tests** with Catch2's own
+main, including the actual patched dependency helper. It requires no devices and
+can be executed directly without entering Wolf's test main. This is tracked CI
+registration, not merely an external test recipe.
+
+### Correction evidence and remaining limits
+
+Final corrected-source checks: **21 crypto/control cases / 7965 assertions**, **1
+actual inputtino-helper case / 35 assertions**, **2 API/SSE cases / 145 assertions**
+all PASS with UBSan halt-on-error. Adjusted Debug/shared production build targets
+`wolf`, `wolftests`, `mwow-api-security`, `wolf-inputtino-motion-tests` PASS at `-j2`
+with PRE_TEST. Changed C++ formatting and `git diff --check` PASS. Existing
+range-v3 deprecation, crypto VLA-extension and ignored GStreamer return warnings
+remain in the raw logs; no suppression was added.
+
+The exact final correction revision, argv, exit codes, source hashes, dependency
+hashes and raw log hashes are recorded in
+[review-fixes-verification.json](/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-6/review-fixes-verification.json).
+Configure uses [these arguments](/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-6/review-fixes-configure-argv.json),
+with the previous custom inputtino source override removed. The remaining
+SimpleWebServer/Boost build qualifications above still apply; this is not a vanilla
+upstream build. The external instrumentation file additionally instruments the
+real inputtino library and its device-free test with ASan/UBSan/float-cast-overflow.
+
+Tests cover all 256 battery enum byte values and percentage boundaries; all eight
+controller-touch event kinds with boundary IDs; each netfloat field with NaN,
++Inf and -Inf; FLT_MAX, lowest finite float, minimum normal and denormal samples;
+negative signed-motion wire vectors and saturation/truncation boundaries. Invalid
+PS5 inputs must produce zero recording-sink calls. Private dependency-helper tests
+exercise the implementation compiled into the real library, not a rewritten formula.
+
+Idempotent patch application, verification of a patched override, and rejection of
+an unpatched override without modification are captured in
+[patch checks](/run/media/bazzoozza/Games/bb-targets/wolf/MWOW-6/review-fixes-patch-checks.json).
+
+No Wolf main, upstream wolftests main, live API/game, virtual input devices or Docker
+workloads were run. This correction does not claim RCE exploitation, hardware
+neutral delivery, an ENet handoff barrier, full lifecycle cleanup or acceptance.
+MWOW-9 remains deferred; its read-only design draft is preserved in thread storage.

@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <array>
 #include <boost/endian/conversion.hpp>
+#include <cmath>
 #include <crypto/crypto.hpp>
 #include <cstdint>
 #include <cstring>
@@ -423,6 +424,45 @@ inline bool valid_control_packet(std::string_view bytes) {
 // before indexing or shifting; a product-specific one-pad policy belongs above this layer.
 inline constexpr unsigned int CONTROL_SLOT_COUNT = 16;
 
+// Typed entry points use the same field checks as the wire validator. Decode
+// before arithmetic; clamp finite normalized values at the device boundary.
+inline float input_float(const pkts::netfloat &value) {
+  return boost::endian::endian_load<float, sizeof(float), boost::endian::order::little>(value);
+}
+
+inline bool valid_input_fields(const pkts::TOUCH_PACKET &pkt) {
+  return pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL && std::isfinite(input_float(pkt.x)) &&
+         std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.pressure_or_distance)) &&
+         std::isfinite(input_float(pkt.contact_area_major)) && std::isfinite(input_float(pkt.contact_area_minor));
+}
+
+inline bool valid_input_fields(const pkts::PEN_PACKET &pkt) {
+  return pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL && pkt.tool_type <= pkts::TOOL_TYPE_ERASER &&
+         std::isfinite(input_float(pkt.x)) && std::isfinite(input_float(pkt.y)) &&
+         std::isfinite(input_float(pkt.pressure_or_distance)) && std::isfinite(input_float(pkt.contact_area_major)) &&
+         std::isfinite(input_float(pkt.contact_area_minor));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_TOUCH_PACKET &pkt) {
+  // This implementation maps wire IDs directly to the two PS5 touchpad slots.
+  // Check the uint32 value BEFORE converting to inputtino's signed finger index.
+  // Screen-touch IDs have a different mapping and are not restricted here.
+  return pkt.controller_number < CONTROL_SLOT_COUNT && pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL &&
+         boost::endian::little_to_native(pkt.pointer_id) < 2 && std::isfinite(input_float(pkt.x)) &&
+         std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.pressure));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_MOTION_PACKET &pkt) {
+  return pkt.controller_number < CONTROL_SLOT_COUNT &&
+         (pkt.motion_type == pkts::ACCELERATION || pkt.motion_type == pkts::GYROSCOPE) &&
+         std::isfinite(input_float(pkt.x)) && std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.z));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_BATTERY_PACKET &pkt) {
+  return pkt.controller_number < CONTROL_SLOT_COUNT && pkt.battery_state <= pkts::BATTERY_FULL &&
+         (pkt.battery_percentage <= 100 || pkt.battery_percentage == pkts::BATTERY_PERCENTAGE_UNKNOWN);
+}
+
 inline bool valid_input_packet(std::string_view bytes) {
   using namespace pkts;
   if (!valid_control_packet(bytes) || bytes.size() < sizeof(INPUT_PKT))
@@ -451,9 +491,9 @@ inline bool valid_input_packet(std::string_view bytes) {
   case UTF8_TEXT:
     return bytes.size() > sizeof(INPUT_PKT) && bytes.size() <= sizeof(UTF8_TEXT_PACKET);
   case TOUCH:
-    return bytes.size() == sizeof(TOUCH_PACKET);
+    return bytes.size() == sizeof(TOUCH_PACKET) && valid_input_fields(read_packet<TOUCH_PACKET>(bytes));
   case PEN:
-    return bytes.size() == sizeof(PEN_PACKET);
+    return bytes.size() == sizeof(PEN_PACKET) && valid_input_fields(read_packet<PEN_PACKET>(bytes));
   case CONTROLLER_MULTI:
     if (bytes.size() != sizeof(CONTROLLER_MULTI_PACKET))
       return false;
@@ -465,13 +505,13 @@ inline bool valid_input_packet(std::string_view bytes) {
            read_packet<CONTROLLER_ARRIVAL_PACKET>(bytes).controller_number < CONTROL_SLOT_COUNT;
   case CONTROLLER_TOUCH:
     return bytes.size() == sizeof(CONTROLLER_TOUCH_PACKET) &&
-           read_packet<CONTROLLER_TOUCH_PACKET>(bytes).controller_number < CONTROL_SLOT_COUNT;
+           valid_input_fields(read_packet<CONTROLLER_TOUCH_PACKET>(bytes));
   case CONTROLLER_MOTION:
     return bytes.size() == sizeof(CONTROLLER_MOTION_PACKET) &&
-           read_packet<CONTROLLER_MOTION_PACKET>(bytes).controller_number < CONTROL_SLOT_COUNT;
+           valid_input_fields(read_packet<CONTROLLER_MOTION_PACKET>(bytes));
   case CONTROLLER_BATTERY:
     return bytes.size() == sizeof(CONTROLLER_BATTERY_PACKET) &&
-           read_packet<CONTROLLER_BATTERY_PACKET>(bytes).controller_number < CONTROL_SLOT_COUNT;
+           valid_input_fields(read_packet<CONTROLLER_BATTERY_PACKET>(bytes));
   case HAPTICS:
     return bytes.size() == sizeof(HAPTICS_PACKET);
   default:

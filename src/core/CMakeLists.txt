@@ -46,14 +46,32 @@ if (UNIX AND NOT APPLE)
     list(APPEND CORE_SRC src/platforms/linux/batched_send/batched_send.cpp)
 
     option(WOLF_CUSTOM_INPUTTINO_SRC "Use custom inputtino source" OFF)
+    set(INPUTTINO_MOTION_PATCH_DRIVER "${PROJECT_SOURCE_DIR}/cmake/PatchInputtinoMotion.cmake")
+    function(wolf_verify_inputtino_motion source_dir)
+        execute_process(COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=${source_dir}"
+                        -DINPUTTINO_VERIFY_ONLY=ON -P "${INPUTTINO_MOTION_PATCH_DRIVER}"
+                        RESULT_VARIABLE motion_check_result)
+        if (NOT motion_check_result EQUAL 0)
+            message(FATAL_ERROR "Inputtino signed-motion verification failed")
+        endif ()
+    endfunction()
     if (WOLF_CUSTOM_INPUTTINO_SRC)
+        wolf_verify_inputtino_motion("${WOLF_CUSTOM_INPUTTINO_SRC}")
         add_subdirectory(${WOLF_CUSTOM_INPUTTINO_SRC} ${CMAKE_CURRENT_BINARY_DIR}/inputtino EXCLUDE_FROM_ALL)
     else ()
         FetchContent_Declare(
                 inputtino
                 GIT_REPOSITORY https://github.com/games-on-whales/inputtino.git
-                GIT_TAG fd136cf)
+                GIT_TAG fd136cf
+                PATCH_COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=<SOURCE_DIR>"
+                              -P "${INPUTTINO_MOTION_PATCH_DRIVER}")
+        # FETCHCONTENT_SOURCE_DIR_INPUTTINO skips the FetchContent patch step.
+        # Fail closed instead of silently modifying a caller-owned source tree.
+        if (FETCHCONTENT_SOURCE_DIR_INPUTTINO)
+            wolf_verify_inputtino_motion("${FETCHCONTENT_SOURCE_DIR_INPUTTINO}")
+        endif ()
         FetchContent_MakeAvailable(inputtino)
+        wolf_verify_inputtino_motion("${inputtino_SOURCE_DIR}")
     endif ()
 
     add_subdirectory(src/platforms/linux/uinput)

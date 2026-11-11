@@ -2,6 +2,7 @@
 
 #include <boost/endian/conversion.hpp>
 #include <boost/locale.hpp>
+#include <control/input_dispatch.hpp>
 #include <control/input_handler.hpp>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
@@ -261,7 +262,7 @@ bool create_touch_screen(events::StreamSession &session) {
 }
 
 float netfloat_to_0_1(const utils::netfloat &f) {
-  return std::clamp(utils::from_netfloat(f), 0.0f, 1.0f);
+  return normalized_input(f);
 }
 
 static inline float deg2rad(float degree) {
@@ -488,6 +489,8 @@ void utf8_text(const UTF8_TEXT_PACKET &pkt, events::StreamSession &session) {
 }
 
 void touch(const TOUCH_PACKET &pkt, events::StreamSession &session) {
+  if (!valid_input_fields(pkt))
+    return;
   bool has_touch_device = session.touch_screen->has_value();
   if (!has_touch_device) {
     has_touch_device = create_touch_screen(session);
@@ -560,6 +563,8 @@ void touch(const TOUCH_PACKET &pkt, events::StreamSession &session) {
 }
 
 void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
+  if (!valid_input_fields(pkt))
+    return;
   bool has_pen_device = session.pen_tablet->has_value();
   if (!has_pen_device) {
     create_pen_tablet(session);
@@ -691,91 +696,32 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
 }
 
 void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession &session) {
+  if (!valid_input_fields(pkt))
+    return;
   auto joypads = session.joypads->load();
-  std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
-    selected_pad = std::move(*joypad);
-    auto pointer_id = boost::endian::little_to_native(pkt.pointer_id);
-    switch (pkt.event_type) {
-    case TOUCH_EVENT_DOWN:
-    case TOUCH_EVENT_HOVER:
-    case TOUCH_EVENT_MOVE: {
-      if (std::holds_alternative<PS5Joypad>(*selected_pad)) {
-        std::get<PS5Joypad>(*selected_pad)
-            .place_finger(pointer_id,
-                          netfloat_to_0_1(pkt.x) * (uint16_t)inputtino::PS5Joypad::touchpad_width,
-                          netfloat_to_0_1(pkt.y) * (uint16_t)inputtino::PS5Joypad::touchpad_height);
-      }
-      break;
-    }
-    case TOUCH_EVENT_UP:
-    case TOUCH_EVENT_HOVER_LEAVE:
-    case TOUCH_EVENT_CANCEL: {
-      if (std::holds_alternative<PS5Joypad>(*selected_pad)) {
-        std::get<PS5Joypad>(*selected_pad).release_finger(pointer_id);
-      }
-      break;
-    }
-    case TOUCH_EVENT_CANCEL_ALL:
-      logs::log(logs::warning, "Received TOUCH_EVENT_CANCEL_ALL which isn't supported");
-      break;                      // TODO: remove all fingers
-    case TOUCH_EVENT_BUTTON_ONLY: // TODO: ???
-      logs::log(logs::warning, "Received TOUCH_EVENT_BUTTON_ONLY which isn't supported");
-      break;
-    }
-  } else {
-    logs::log(logs::warning, "Received controller touch for unknown controller {}", pkt.controller_number);
+    if (auto pad = std::get_if<PS5Joypad>(joypad->get()))
+      dispatch_controller_touch(pkt, *pad);
   }
 }
 
 void controller_motion(const CONTROLLER_MOTION_PACKET &pkt, events::StreamSession &session) {
+  if (!valid_input_fields(pkt))
+    return;
   auto joypads = session.joypads->load();
-  std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
-    selected_pad = std::move(*joypad);
-    if (std::holds_alternative<PS5Joypad>(*selected_pad)) {
-      auto x = utils::from_netfloat(pkt.x);
-      auto y = utils::from_netfloat(pkt.y);
-      auto z = utils::from_netfloat(pkt.z);
-
-      if (pkt.motion_type == ACCELERATION) {
-        std::get<PS5Joypad>(*selected_pad).set_motion(inputtino::PS5Joypad::ACCELERATION, x, y, z);
-      } else if (pkt.motion_type == GYROSCOPE) {
-        std::get<PS5Joypad>(*selected_pad)
-            .set_motion(inputtino::PS5Joypad::GYROSCOPE, deg2rad(x), deg2rad(y), deg2rad(z));
-      }
-    }
+    if (auto pad = std::get_if<PS5Joypad>(joypad->get()))
+      dispatch_controller_motion(pkt, *pad);
   }
 }
 
 void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSession &session) {
+  if (!valid_input_fields(pkt))
+    return;
   auto joypads = session.joypads->load();
-  std::shared_ptr<events::JoypadTypes> selected_pad;
   if (auto joypad = joypads->find(pkt.controller_number)) {
-    selected_pad = std::move(*joypad);
-    if (std::holds_alternative<PS5Joypad>(*selected_pad)) {
-      inputtino::PS5Joypad::BATTERY_STATE state;
-      switch (pkt.battery_state) {
-      case BATTERY_STATE_UNKNOWN:
-      case BATTERY_NOT_PRESENT:
-        return; // We can't set it, let's return
-      case BATTERY_DISCHARGHING:
-        state = inputtino::PS5Joypad::BATTERY_DISCHARGING;
-        break;
-      case BATTERY_CHARGING:
-        state = inputtino::PS5Joypad::BATTERY_CHARGHING;
-        break;
-      case BATTERY_NOT_CHARGING:
-        state = inputtino::PS5Joypad::CHARGHING_ERROR;
-        break;
-      case BATTERY_FULL:
-        state = inputtino::PS5Joypad::BATTERY_FULL;
-        break;
-      }
-      if (pkt.battery_percentage != BATTERY_PERCENTAGE_UNKNOWN) {
-        std::get<PS5Joypad>(*selected_pad).set_battery(state, pkt.battery_percentage);
-      }
-    }
+    if (auto pad = std::get_if<PS5Joypad>(joypad->get()))
+      dispatch_controller_battery(pkt, *pad);
   }
 }
 
