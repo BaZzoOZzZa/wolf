@@ -617,10 +617,10 @@ TEST_CASE("Protected exhausted close invalidates the last pending update without
 }
 
 TEST_CASE("F15 Pending poll excludes premature validator invocation", "[protected-authority][f15]") {
-  Fixture f;
   auto gate = std::make_shared<TestGate>();
-  f.gates.push_back(gate);
   std::atomic_uint entries{0};
+  Fixture f;
+  f.gates.push_back(gate);
   auto transfer = f.transfer([&](const auto &) {
     if (entries.fetch_add(1) == 1)
       gate->wait(); // request first, actual supervisor poll second
@@ -646,11 +646,11 @@ TEST_CASE("F15 Pending poll excludes premature validator invocation", "[protecte
 
 TEST_CASE("F15 Granted media validators reserve once and recheck authority", "[protected-authority][f15]") {
   for (bool revoke : {false, true}) {
-    Fixture f;
     auto gate = std::make_shared<TestGate>();
-    f.gates.push_back(gate);
     std::atomic_uint entries{0};
     std::atomic_bool block{false};
+    Fixture f;
+    f.gates.push_back(gate);
     auto transfer = f.transfer([&](const auto &) {
       ++entries;
       if (block.exchange(false))
@@ -660,9 +660,9 @@ TEST_CASE("F15 Granted media validators reserve once and recheck authority", "[p
     REQUIRE(eventually([&] { return transfer.handle->status() == TransferStatus::Granted; }));
     const auto before = entries.load();
     block = true;
-    Joiner join{f};
     std::promise<ConsumerAdmission> result;
     auto done = result.get_future();
+    Joiner join{f};
     join.threads.emplace_back([&] {
       try {
         result.set_value(f.handoff->admit_prepared(transfer.handle,
