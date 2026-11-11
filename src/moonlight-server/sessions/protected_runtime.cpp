@@ -50,7 +50,9 @@ struct ProtectedRuntimeOwner::State {
   std::array<unsigned, 4> order{};
   size_t queued = 0;
   std::atomic_bool stop{false}, unknown{false}, started{false};
-  size_t bytes = sizeof(cells) + sizeof(order);
+  // Completed receipt storage remains retained in each cell. Reserve it even
+  // while empty, separately from the new in-flight receipt charged per job.
+  size_t bytes = sizeof(cells) + sizeof(order) + 4 * sizeof(RuntimeReceipt);
   protected_authority::OperatorCapability op;
   protected_authority::FactHandle facts;
   std::unique_ptr<protected_authority::ProtectedAuthorityDomain> authority;
