@@ -2,6 +2,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <future>
 #include <streaming/consumer_events.hpp>
+#include <streaming/consumer_media.hpp>
 #include <streaming/consumer_pipeline.hpp>
 
 using namespace streaming;
@@ -64,6 +65,9 @@ struct Fixture {
     handlers = consumer_event_handlers(bus, runtime);
   }
   ~Fixture() {
+    shutdown();
+  }
+  void shutdown() {
     // Last registration box unregisters before the owner joins.
     handlers = {};
     runtime.reset();
@@ -110,12 +114,20 @@ void software_gst() {
     auto core = gst_plugin_load_file(WOLF_TEST_GST_CORE_PLUGIN, nullptr);
     REQUIRE(core != nullptr);
     gst_object_unref(core);
+    auto app = gst_plugin_load_file(WOLF_TEST_GST_APP_PLUGIN, nullptr);
+    REQUIRE(app != nullptr);
+    gst_object_unref(app);
+    guint major, minor, micro, nano;
+    gst_version(&major, &minor, &micro, &nano);
+    REQUIRE(major == 1);
+    REQUIRE(minor == 28);
+    REQUIRE(micro == 7);
     auto plugins = gst_registry_get_plugin_list(gst_registry_get());
     for (auto item = plugins; item; item = item->next) {
       auto plugin = GST_PLUGIN(item->data);
       if (gst_plugin_is_loaded(plugin)) {
         const std::string name = gst_plugin_get_name(plugin);
-        CHECK((name == "coreelements" || name == "staticelements"));
+        CHECK((name == "coreelements" || name == "staticelements" || name == "app"));
       }
     }
     gst_plugin_list_free(plugins);
@@ -431,4 +443,198 @@ TEST_CASE("A broken or absent completion ticket never proves release", "[consume
   }
   ConsumerDrainTicket ticket{ConnectionScope::fresh(42), broken};
   REQUIRE_FALSE(ticket.complete());
+}
+
+namespace {
+using namespace streaming::detail;
+// Unlike timing out a borrowed callback, these gates are always opened by an
+// owner guard before joining the poster/runtime, including on RED assertions.
+struct RetirementSchedule {
+  Gate before_entry;
+  Gate after_entry;
+  Gate notify;
+  std::atomic_bool draining{false};
+  std::atomic_bool posting_ready{false};
+  std::promise<std::shared_ptr<GstBus>> bus;
+  void release() {
+    before_entry.release();
+    after_entry.release();
+    notify.release();
+  }
+};
+struct MediaTeardown {
+  Fixture &fixture;
+  std::shared_ptr<RetirementSchedule> schedule;
+  std::thread poster;
+  ~MediaTeardown() {
+    schedule->release();
+    if (poster.joinable())
+      poster.join();
+    fixture.shutdown();
+  }
+};
+struct WeakGstObservation {
+  GstObject *borrowed = nullptr;
+  std::atomic_bool destroyed{false};
+  std::atomic_bool reached{false};
+  void observe(GstObject *object) {
+    borrowed = object;
+    g_object_weak_ref(
+        G_OBJECT(object),
+        +[](gpointer raw, GObject *) { static_cast<WeakGstObservation *>(raw)->destroyed = true; },
+        this);
+    reached = true;
+  }
+};
+struct FaultTeardown {
+  Fixture &fixture;
+  std::shared_ptr<WeakGstObservation> observation;
+  ~FaultTeardown() {
+    fixture.shutdown(); // proves no worker can still use the observed reference
+    // The RED adapter loses exactly the transfer-full ref seen at the injected
+    // allocation. Rescue only AFTER assertions/worker join, keeping the RED
+    // failure semantic and preventing a leaked observer pointer at process exit.
+    if (observation->reached && !observation->destroyed)
+      gst_object_unref(observation->borrowed);
+  }
+};
+ConsumerMediaCallbacks consuming_callbacks(const std::shared_ptr<int> &owned) {
+  return {.sample =
+              [owned](GstAppSink *sink) {
+                std::unique_ptr<GstSample, decltype(&gst_sample_unref)> sample(gst_app_sink_pull_sample(sink),
+                                                                               gst_sample_unref);
+                return sample ? GST_FLOW_OK : GST_FLOW_FLUSHING;
+              },
+          .context = [owned](GstBus *, GstMessage *) { return GST_BUS_PASS; }};
+}
+} // namespace
+
+TEST_CASE("Media holder retirement precedes successful consumer release", "[consumer][software-gst][retirement]") {
+  software_gst();
+  MediaPhase blocked = MediaPhase::BeforeEntry;
+  SECTION("retained Gst bus handler paused before Lease entry") {
+    blocked = MediaPhase::BeforeEntry;
+  }
+  SECTION("retained Gst bus handler paused after Lease exit") {
+    blocked = MediaPhase::AfterEntry;
+  }
+  SECTION("destroy-notify entry is not holder resource retirement") {
+    blocked = MediaPhase::Retiring;
+  }
+  auto schedule = std::make_shared<RetirementSchedule>();
+  auto bus_ready = schedule->bus.get_future();
+  auto resource = std::make_shared<int>(7);
+  std::weak_ptr<int> weak_resource = resource;
+  auto callbacks = consuming_callbacks(resource);
+  resource.reset();
+  // Context callback readiness ensures the real bus is no longer flushing at
+  // startup; the test message is posted by a separate owned Gst posting thread.
+  auto original = std::move(callbacks.context);
+  callbacks.context = [schedule, original = std::move(original)](GstBus *bus, GstMessage *message) {
+    schedule->posting_ready = true;
+    return original(bus, message);
+  };
+  auto probe = std::make_shared<ConsumerMediaProbe>();
+  probe->ready = [schedule](GstElement *pipeline) {
+    schedule->bus.set_value(std::shared_ptr<GstBus>(gst_element_get_bus(pipeline), gst_object_unref));
+  };
+  probe->draining = [schedule] { schedule->draining = true; };
+  probe->checkpoint = [schedule, blocked](MediaCallback kind, MediaPhase phase, GstMessage *message) {
+    if (kind != MediaCallback::Context)
+      return;
+    if (phase == MediaPhase::Retiring) {
+      if (blocked == MediaPhase::Retiring)
+        schedule->notify.wait();
+      return;
+    }
+    if (!message || GST_MESSAGE_TYPE(message) != GST_MESSAGE_APPLICATION)
+      return;
+    if (phase == MediaPhase::BeforeEntry)
+      schedule->before_entry.wait();
+    else if (blocked == MediaPhase::AfterEntry)
+      schedule->after_entry.wait();
+  };
+  Fixture f(fast_policy());
+  MediaTeardown cleanup{f, schedule, {}};
+  REQUIRE(f.admit(ConsumerKind::Video, [callbacks = std::move(callbacks), probe](ConsumerJob &job, const auto &) {
+    return detail::run_media_consumer(
+        "fakesrc is-live=true ! identity sleep-time=10000 ! appsink name=wolf_udp_sink sync=false",
+        job,
+        job.connection.id(),
+        job.run,
+        callbacks,
+        probe);
+  }) == ConsumerAdmission::Accepted);
+  f.ping(ConsumerKind::Video);
+  REQUIRE(bus_ready.wait_for(2s) == std::future_status::ready);
+  auto bus = bus_ready.get();
+  REQUIRE(eventually([&] { return schedule->posting_ready.load(); }));
+  cleanup.poster = std::thread([bus] {
+    gst_bus_post(bus.get(),
+                 gst_message_new_application(GST_OBJECT(bus.get()), gst_structure_new_empty("wolf.retirement")));
+  });
+  REQUIRE(eventually([&] { return schedule->before_entry.entered.load(); }));
+  auto ticket = f.runtime->revoke(f.scope);
+  REQUIRE(ticket);
+  REQUIRE(eventually([&] { return schedule->draining.load(); }));
+  if (blocked != MediaPhase::BeforeEntry) {
+    schedule->before_entry.release();
+    REQUIRE(eventually([&] {
+      return blocked == MediaPhase::AfterEntry ? schedule->after_entry.entered.load() : schedule->notify.entered.load();
+    }));
+  }
+  REQUIRE(eventually([&] {
+    return ticket->complete() || f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Unknown;
+  }));
+  CHECK_FALSE(ticket->complete());
+  CHECK(f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Unknown);
+  CHECK_FALSE(weak_resource.expired());
+  schedule->release();
+  cleanup.poster.join();
+  REQUIRE(eventually([&] { return ticket->complete(); }));
+  REQUIRE(weak_resource.expired());
+}
+
+TEST_CASE("Production media allocation faults release acquired Gst references",
+          "[consumer][software-gst][media-fault]") {
+  software_gst();
+  MediaAllocation fault = MediaAllocation::SinkHolder;
+  SECTION("appsink ref before holder allocation") {
+    fault = MediaAllocation::SinkHolder;
+  }
+  SECTION("bus ref after partial appsink registration before context allocation") {
+    fault = MediaAllocation::ContextHolder;
+  }
+  SECTION("source ref before producer target string allocation") {
+    fault = MediaAllocation::ProducerTarget;
+  }
+  auto observation = std::make_shared<WeakGstObservation>();
+  auto resource = std::make_shared<int>(9);
+  std::weak_ptr<int> weak_resource = resource;
+  auto callbacks = consuming_callbacks(resource);
+  resource.reset();
+  auto probe = std::make_shared<ConsumerMediaProbe>();
+  probe->before_allocation = [observation, fault](MediaAllocation point, GstObject *object) {
+    if (point == fault) {
+      observation->observe(object); // genuine acquired Gst ref, not a test stand-in
+      throw std::bad_alloc();
+    }
+  };
+  const std::string description = fault == MediaAllocation::ProducerTarget
+                                      ? "fakesrc name=interpipesrc_42_video ! appsink name=wolf_udp_sink sync=false"
+                                      : "fakesrc ! appsink name=wolf_udp_sink sync=false";
+  Fixture f;
+  FaultTeardown cleanup{f, observation};
+  REQUIRE(f.admit(ConsumerKind::Video,
+                  [callbacks = std::move(callbacks), probe, description](ConsumerJob &job, const auto &) {
+                    return detail::run_media_consumer(description, job, job.connection.id(), job.run, callbacks, probe);
+                  }) == ConsumerAdmission::Accepted);
+  f.ping(ConsumerKind::Video);
+  REQUIRE(eventually([&] { return observation->reached.load(); }));
+  auto ticket = f.runtime->revoke(f.scope);
+  REQUIRE(ticket);
+  REQUIRE(eventually([&] { return ticket->complete(); }));
+  REQUIRE(f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Failed);
+  CHECK(observation->destroyed.load());
+  CHECK(weak_resource.expired());
 }

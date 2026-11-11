@@ -9,6 +9,7 @@ class ConsumerCallbackBarrier {
   std::mutex mutex_;
   std::condition_variable wake_;
   std::size_t active_ = 0;
+  std::size_t holders_ = 0;
   bool closed_ = false;
 
 public:
@@ -36,6 +37,15 @@ public:
       return Lease(nullptr);
     ++active_;
     return Lease(this);
+  }
+  void retain_holder() {
+    std::lock_guard lock(mutex_);
+    ++holders_;
+  }
+  void retire_holder() {
+    std::lock_guard lock(mutex_);
+    --holders_;
+    wake_.notify_all();
   }
   void close_and_wait() {
     std::unique_lock lock(mutex_);

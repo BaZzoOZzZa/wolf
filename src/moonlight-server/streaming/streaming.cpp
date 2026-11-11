@@ -1,4 +1,4 @@
-#include "consumer_pipeline.hpp"
+#include "consumer_media.hpp"
 #include "platforms/hw.hpp"
 
 #include <chrono>
@@ -380,112 +380,21 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, UDPSink *udp_sink) {
   }
 }
 
-struct SinkCallbackData {
-  std::shared_ptr<UDPSink> sink;
-  std::shared_ptr<ConsumerCallbackBarrier> barrier;
-};
-static void configure_appsink(GstElement *appsink,
-                              const std::shared_ptr<UDPSink> &udp_sink,
-                              const std::shared_ptr<ConsumerCallbackBarrier> &barrier) {
-  g_object_set(appsink, "emit-signals", FALSE, "buffer-list", TRUE, nullptr);
-  GstAppSinkCallbacks callbacks = {};
-  callbacks.new_sample = [](GstAppSink *sink, gpointer data) -> GstFlowReturn {
-    auto &owned = *static_cast<SinkCallbackData *>(data);
-    auto lease = owned.barrier->enter();
-    if (!lease)
-      return GST_FLOW_FLUSHING;
-    try {
-      return on_new_sample(sink, owned.sink.get());
-    } catch (...) {
-      return GST_FLOW_ERROR;
-    }
-  };
-  gst_app_sink_set_callbacks(GST_APP_SINK(appsink),
-                             &callbacks,
-                             new SinkCallbackData{udp_sink, barrier},
-                             [](gpointer data) { delete static_cast<SinkCallbackData *>(data); });
-}
 } // namespace custom_sink
 
-struct ContextCallbackData {
-  std::shared_ptr<NeedContextData> context;
-  std::shared_ptr<ConsumerCallbackBarrier> barrier;
-};
 static bool run_media_consumer(const std::string &description,
                                ConsumerJob &job,
                                std::size_t session_id,
                                const sessions::RunScope &producer,
                                const std::shared_ptr<custom_sink::UDPSink> &udp_sink,
                                const std::shared_ptr<NeedContextData> &context = {}) {
-  const std::string kind = job.kind == ConsumerKind::Video ? "video" : "audio";
-  const auto src_name = fmt::format("interpipesrc_{}_{}", session_id, kind);
-  auto barrier = std::make_shared<ConsumerCallbackBarrier>();
-  sessions::ProducerBinding binding(producer);
-  auto select = [&](GstElement *pipeline, const sessions::RunScope &selected) {
-    binding.select(selected, [&](const std::string &key) {
-      if (auto src = gst_bin_get_by_name(GST_BIN(pipeline), src_name.c_str())) {
-        auto target = key + "_" + kind;
-        g_object_set(src, "listen-to", target.c_str(), nullptr);
-        gst_object_unref(src);
-        return true;
-      }
-      return false;
-    });
-  };
-  return run_consumer_pipeline(
-      description,
-      job,
-      {.setup =
-           [&](GstElement *pipeline) {
-             if (auto sink = gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink")) {
-               if (!GST_IS_APP_SINK(sink)) {
-                 gst_object_unref(sink);
-                 throw std::runtime_error("wolf_udp_sink is not an appsink");
-               }
-               custom_sink::configure_appsink(sink, udp_sink, barrier);
-               gst_object_unref(sink);
-             }
-             if (context) {
-               auto bus = gst_element_get_bus(pipeline);
-               gst_bus_set_sync_handler(
-                   bus,
-                   [](GstBus *bus, GstMessage *message, gpointer data) -> GstBusSyncReply {
-                     auto &owned = *static_cast<ContextCallbackData *>(data);
-                     auto lease = owned.barrier->enter();
-                     if (!lease)
-                       return GST_BUS_PASS;
-                     try {
-                       return bus_sync_handler(bus, message, owned.context.get());
-                     } catch (...) {
-                       return GST_BUS_PASS;
-                     }
-                   },
-                   new ContextCallbackData{context, barrier},
-                   [](gpointer data) { delete static_cast<ContextCallbackData *>(data); });
-               gst_object_unref(bus);
-             }
-             select(pipeline, producer);
-           },
-       .commands =
-           [&](GstElement *pipeline, ConsumerCommands commands) {
-             if (commands.producer)
-               select(pipeline, *commands.producer);
-             if (commands.idr && job.kind == ConsumerKind::Video)
-               gstreamer::send_message(
-                   pipeline,
-                   gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, nullptr));
-           },
-       .drain =
-           [&](GstElement *pipeline) {
-             if (auto sink = gst_bin_get_by_name(GST_BIN(pipeline), "wolf_udp_sink")) {
-               if (GST_IS_APP_SINK(sink)) {
-                 GstAppSinkCallbacks empty = {};
-                 gst_app_sink_set_callbacks(GST_APP_SINK(sink), &empty, nullptr, nullptr);
-               }
-               gst_object_unref(sink);
-             }
-             barrier->close_and_wait();
-           }});
+  detail::ConsumerMediaCallbacks callbacks;
+  callbacks.sample = [udp_sink](GstAppSink *sink) { return custom_sink::on_new_sample(sink, udp_sink.get()); };
+  if (context)
+    callbacks.context = [context](GstBus *bus, GstMessage *message) {
+      return bus_sync_handler(bus, message, context.get());
+    };
+  return detail::run_media_consumer(description, job, session_id, producer, callbacks);
 }
 
 /**

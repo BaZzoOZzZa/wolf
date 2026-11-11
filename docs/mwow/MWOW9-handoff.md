@@ -344,3 +344,34 @@ System GStreamer used here is 1.28.7; older-version/runtime matrix is unverified
 The callback holder strategy uses Gst destroy-notify lifetime and explicit drain;
 see [GstBus callback contract](https://gstreamer.freedesktop.org/documentation/gstreamer/gstbus.html#gst_bus_set_sync_handler)
 and [installed-version appsink implementation](https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gst-plugins-base/gst-libs/gst/app/gstappsink.c).
+
+## F8/F9 review correction — RED production seams
+
+Review part9 rejects ce0e03a's release proof. Gst1.28.7 bus posting and appsink
+sample delivery retain their callback records across invocation; unregister drops
+only the registration reference, not every in-flight reference. Counting entered
+Lease objects misses a retained callback paused before entry or after Lease exit.
+Transfer-full sink/bus/source refs also crossed throwing holder/string allocations.
+
+The RED checkpoint extracts the existing real media setup/select/drain adapter to
+`streaming/consumer_media.{hpp,cpp}`. Both production consumers call it with their
+owned UDP/context functions. Narrow optional probes observe exact allocation
+sites and callback/notify boundaries; they do not substitute Gst objects or change
+production scheduling when absent. Holder retirement is instrumented AFTER deleting
+its captured resources, but the RED drain intentionally retains the old active-only
+predicate. Sink/bus/src lookups intentionally retain the old raw-ref throw holes.
+
+New tests use real Gst bus posting on an owned thread, before-entry/after-entry/
+notify gates, actual appsink from installed software app plugin, and injected
+bad_alloc immediately after the production adapter acquired a real Gst ref. Weak
+resource/object destruction is checked before successful ticket publication.
+RED fault tests rescue the known lost ref only after assertion and worker join,
+so a failing test never leaves dangling weak-notify user data or process leaks.
+RAII teardown opens every gate, joins the posting thread and shuts down the owned
+runtime even if a REQUIRE fails. Existing11cases/assertions are preserved; software
+allowlist extends only to app, with search/registry updates OFF and actual1.28.7
+version asserted. Tests are intended to stay byte-identical in RED and GREEN.
+
+Inherited eventbus noexcept/EAGAIN and general supervisor allocation failure remain
+separate residuals; this correction does not claim exception-safe ingress or fix
+InputSeat/device executor/all-route/live handoff.
