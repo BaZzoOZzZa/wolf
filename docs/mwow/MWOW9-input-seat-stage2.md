@@ -105,3 +105,18 @@ Throwing or returning a nonjoinable thread cannot publish a usable seat/coordina
 source tests exercise actual rollback, backend resource destruction and cap denial.
 A factory that secretly detaches work violates this internal contract and is not
 supported. The default is std::thread; no threads launch at library load.
+
+
+### F12 correction checkpoint (review required)
+
+Scope: prepared Work ownership plus validator capture retirement at bootstrap,
+previous TransferHandle replacement, and transaction-constructor rollback.
+Admission and validation must remain serialized. Callable invocation is trusted
+nonblocking/nonreentrant; destruction of captured resources has no such contract.
+The RED fixture uses actual Seat/Coordinator/ConsumerRuntime and checked injected
+IO. A sole capture blocks in its destructor; concurrent current/revoke/poll and
+neutral must progress. Only after that progress is observed does the destructor
+attempt direct current/revoke reentry. On RED this last attempt is suppressed to
+avoid a permanent self-deadlock; all test gates release before owned threads join.
+Bootstrap checks gate progress, not another worker operation while that same
+worker is executing cleanup. Original fifteen cases remain intact.

@@ -69,10 +69,13 @@ struct IO {
     return std::any_of(writes.begin(), writes.end(), [&](auto &e) { return e.code == code && e.value == value; });
   }
 };
+thread_local bool throw_current_query = false;
 struct Current {
   std::mutex mutex;
   std::vector<ConnectionScope> scopes;
   bool contains(const ConnectionScope &scope) {
+    if (std::exchange(throw_current_query, false))
+      throw std::runtime_error("actual Runtime Current fault");
     std::lock_guard lock(mutex);
     return std::any_of(scopes.begin(), scopes.end(), [&](auto &s) { return s.matches(scope); });
   }
@@ -109,7 +112,7 @@ struct Fixture {
   std::unique_ptr<InputHandoff> handoff;
   std::vector<std::shared_ptr<Gate>> gates;
   GrantHandle old;
-  explicit Fixture(SeatPolicy policy = {}, bool coordinator = true) {
+  explicit Fixture(SeatPolicy policy = {}, bool coordinator = true, SeatValidation bootstrap = {}, bool wait_bootstrap = true) {
     current->add(initial.connection);
     current->add(target.connection);
     ConsumerPolicy consumer_policy;
@@ -120,7 +123,7 @@ struct Fixture {
     seat = domain->create(
         initial,
         {true, true, true},
-        [](const auto &) { return true; },
+        bootstrap ? std::move(bootstrap) : SeatValidation{[](const auto &) { return true; }},
         [state = io](auto callback) {
           state->callback = callback;
           auto xbox = inputtino::checked::Xbox::adopt({state, 42}, state->ops(), std::move(callback), [](auto fn) {
@@ -129,8 +132,10 @@ struct Fixture {
           return std::make_shared<CheckedXboxBackend>(std::move(xbox));
         },
         policy);
-    REQUIRE(eventually([&] { return bool(seat->current()); }));
-    old = seat->current();
+    if (wait_bootstrap) {
+      REQUIRE(eventually([&] { return bool(seat->current()); }));
+      old = seat->current();
+    }
     if (coordinator)
       handoff = std::make_unique<InputHandoff>(seat, runtime, [clock = time] {
         return Clock::time_point{} + std::chrono::milliseconds(clock->load());
@@ -623,4 +628,208 @@ TEST_CASE("Handoff supervisor launch failures quarantine retained seat without r
   CHECK_FALSE(f.seat->current());
   REQUIRE(eventually([&] { return f.seat->neutral_complete(); }));
   CHECK_THROWS(InputHandoff(f.seat, f.runtime)); // reserved supervisor slot is not reusable
+}
+namespace {
+// No Catch assertions in worker threads. Release-before-join is unconditional,
+// including assertion unwind. RED never executes a known deadlocking reentry.
+struct CleanupProbe {
+  Gate gate;
+  std::atomic_bool progress{false}, allow_reentry{false}, reentered{false},
+      destroyed{false};
+  std::function<void()> reenter;
+};
+struct CleanupHolder {
+  std::shared_ptr<CleanupProbe> probe;
+  explicit CleanupHolder(std::shared_ptr<CleanupProbe> p)
+      : probe(std::move(p)) {}
+  ~CleanupHolder() {
+    probe->gate.wait();
+    if (probe->allow_reentry) {
+      probe->reenter();
+      probe->reentered = true;
+    }
+    probe->destroyed = true;
+  }
+};
+struct CleanupThreads {
+  std::shared_ptr<CleanupProbe> probe;
+  std::jthread caller, progress;
+  explicit CleanupThreads(std::shared_ptr<CleanupProbe> p)
+      : probe(std::move(p)) {}
+  ~CleanupThreads() { probe->gate.release(); } // before jthread members join
+  void finish() {
+    probe->gate.release();
+    if (caller.joinable())
+      caller.join();
+    if (progress.joinable())
+      progress.join();
+  }
+};
+void probe_cleanup(CleanupThreads &threads, Fixture &f,
+                   bool neutral_progress = true) {
+  auto p = threads.probe;
+  CHECK(eventually([&] { return p->gate.entered.load(); }));
+  threads.progress = std::jthread([&, p, neutral_progress] {
+    auto current = f.seat->current();
+    if (current)
+      f.seat->revoke(current, current->owner.peer);
+    if (f.handoff)
+      f.handoff->poll();
+    // Bootstrap cleanup runs on the seat worker itself; it cannot run another
+    // neutral until its own destructor returns. Gate progress is still
+    // required.
+    p->progress = !neutral_progress ||
+                  eventually([&] { return f.seat->neutral_complete(); });
+  });
+  const bool progressed_before_cleanup =
+      eventually([&] { return p->progress.load(); });
+  CHECK(progressed_before_cleanup);
+  p->allow_reentry = progressed_before_cleanup;
+  threads.finish();
+  CHECK(eventually([&] { return p->destroyed.load(); }));
+  CHECK(p->reentered.load());
+}
+std::shared_ptr<CleanupProbe> cleanup_probe(Fixture &f) {
+  auto p = std::make_shared<CleanupProbe>();
+  p->reenter = [&] {
+    (void)f.seat->current();
+    auto grant = f.seat->current();
+    if (grant)
+      f.seat->revoke(grant, grant->owner.peer);
+    else
+      f.seat->revoke(f.old, f.old->owner.peer);
+  };
+  return p;
+}
+} // namespace
+
+TEST_CASE(
+    "F12 prepared Work cleanup releases seat gate on actual Runtime paths",
+    "[input-seat][f12]") {
+  for (int path = 0; path != 4; ++path) {
+    INFO("path: duplicate=0 early-refusal=1 Runtime-Current-throw=2 "
+         "fast-success=3: "
+         << path);
+    Fixture f;
+    auto selection = f.selection();
+    selection.validate = [](const auto &) {
+      return true;
+    }; // fault belongs to Runtime Current, not validator
+    auto transfer =
+        f.handoff->request(TransferToken::fresh(1), std::move(selection));
+    REQUIRE(eventually(
+        [&] { return transfer.handle->status() == TransferStatus::Granted; }));
+    const auto grant = f.seat->current();
+    REQUIRE(grant);
+    if (path == 0) {
+      REQUIRE(f.handoff->admit_prepared(transfer.handle, f.target.connection,
+                                        f.target.peer, ConsumerKind::Video,
+                                        {"local", 1234, {}},
+                                        [](auto &, const auto &) {
+                                          return true;
+                                        }) == ConsumerAdmission::Accepted);
+    }
+    auto p = cleanup_probe(f);
+    CleanupThreads threads(p);
+    std::atomic<ConsumerAdmission> result{ConsumerAdmission::Stale};
+    std::atomic_bool ran{false};
+    threads.caller = std::jthread(
+        [&, holder = std::make_shared<CleanupHolder>(p)]() mutable {
+          throw_current_query = path == 2;
+          result = f.handoff->admit_prepared(
+              transfer.handle, f.target.connection,
+              path == 1 ? PeerToken::fresh(1) : f.target.peer,
+              ConsumerKind::Video, {"local", 1234, {}},
+              [owned = std::move(holder), &ran](auto &, const auto &) {
+                ran = true;
+                return true;
+              });
+        });
+    if (path == 3) {
+      CHECK(eventually([&] {
+        f.runtime->ping(
+            ConsumerKind::Video,
+            ConsumerPing{"local", 1234, std::array<char, 16>{}, {}});
+        return ran.load();
+      }));
+    }
+    probe_cleanup(threads, f);
+    CHECK(result.load() == (path == 0   ? ConsumerAdmission::Duplicate
+                            : path == 3 ? ConsumerAdmission::Accepted
+                                        : ConsumerAdmission::Revoked));
+    CHECK(ran.load() == (path == 3));
+    CHECK(f.seat->quarantined());
+  }
+}
+
+TEST_CASE("F12 bootstrap validator cleanup releases gate before sole capture "
+          "retirement",
+          "[input-seat][f12]") {
+  auto p = std::make_shared<CleanupProbe>();
+  Fixture f(
+      {}, false,
+      [holder = std::make_shared<CleanupHolder>(p)](const auto &) {
+        return true;
+      },
+      false);
+  p->reenter = [&] {
+    auto grant = f.seat->current();
+    if (grant)
+      f.seat->revoke(grant, grant->owner.peer);
+    (void)f.seat->current();
+  };
+  CleanupThreads threads(p);
+  probe_cleanup(threads, f, false);
+  CHECK(eventually([&] { return f.seat->neutral_complete(); }));
+}
+
+TEST_CASE("F12 replacing sole terminal transfer retires validator outside gate",
+          "[input-seat][f12]") {
+  Fixture f;
+  auto p = cleanup_probe(f);
+  auto selection = f.selection();
+  selection.validate = [holder = std::make_shared<CleanupHolder>(p)](
+                           const auto &) { return true; };
+  auto first =
+      f.handoff->request(TransferToken::fresh(1), std::move(selection));
+  REQUIRE(eventually(
+      [&] { return first.handle->status() == TransferStatus::Granted; }));
+  auto next = f.target;
+  next.connection = ConnectionScope::fresh(42);
+  next.peer = PeerToken::fresh(1);
+  f.current->add(next.connection);
+  AuthorizedSelection second{f.seat->current(), next,
+                             [](const auto &) { return true; }};
+  first.handle
+      .reset(); // coordinator now holds the only TransferHandle/validator
+  CleanupThreads threads(p);
+  threads.caller = std::jthread([&, selection = std::move(second)]() mutable {
+    (void)f.handoff->request(TransferToken::fresh(2), std::move(selection));
+  });
+  probe_cleanup(threads, f);
+}
+
+TEST_CASE(
+    "F12 transaction preparation exception retains validator until unlock",
+    "[input-seat][f12]") {
+  Fixture f({}, false);
+  f.handoff = std::make_unique<InputHandoff>(
+      f.seat, f.runtime, []() -> Clock::time_point {
+        throw std::runtime_error("actual transaction preparation clock fault");
+      });
+  auto p = cleanup_probe(f);
+  CleanupThreads threads(p);
+  std::atomic<TransferAdmission> result{TransferAdmission::Invalid};
+  threads.caller =
+      std::jthread([&, holder = std::make_shared<CleanupHolder>(p)]() mutable {
+        auto selection = f.selection();
+        selection.validate = [owned = std::move(holder)](const auto &) {
+          return true;
+        };
+        result =
+            f.handoff->request(TransferToken::fresh(1), std::move(selection))
+                .admission;
+      });
+  probe_cleanup(threads, f);
+  CHECK(result.load() == TransferAdmission::Quarantined);
 }
