@@ -588,3 +588,20 @@ TEST_CASE("Owned actual loop optional feedback adapter fences real handoff acros
   REQUIRE(seat->quarantined());
   REQUIRE(writes->load() >= 40);
 }
+
+TEST_CASE("Owned control stop during service discards late ingress and preserves actual join", "[control-loop]") {
+  Fixture f;
+  auto gate = std::make_shared<Gate>();
+  f.fake->service_gate = gate;
+  f.fake->push(ENET_EVENT_TYPE_CONNECT, 0, 123);
+  f.start();
+  f.ready();
+  REQUIRE(eventually([&] { return gate->entered.load(); }));
+  f.loop->request_stop();
+  REQUIRE(f.loop->status().calls == 1);
+  REQUIRE(f.loop->join_when_exited() == JoinResult::Refused);
+  gate->release();
+  f.finish();
+  REQUIRE(f.loop->peers().empty());
+  REQUIRE(f.fake->sends == 0);
+}

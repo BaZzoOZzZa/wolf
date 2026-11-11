@@ -216,6 +216,7 @@ struct State : std::enable_shared_from_this<State> {
     retire_packets();
     --calls;
     if (!ok) {
+      logs::log(logs::error, "[ENET] Owned control operation failed; stopping with retained cleanup");
       failed = true;
       request_stop();
     }
@@ -272,6 +273,8 @@ struct State : std::enable_shared_from_this<State> {
     if (stop)
       return;
     for (auto &request : pending.items) {
+      if (stop)
+        break;
       auto sender = request.sender.lock();
       if (!sender)
         continue;
@@ -449,8 +452,8 @@ struct State : std::enable_shared_from_this<State> {
     int count = transport->ops.service(transport->ops.owner.get(), transport->host, &event, 10);
     if (count < 0)
       throw std::runtime_error("ENet service failed");
-    if (!count)
-      return;
+    if (!count || stop)
+      return; // received-packet guard still retires late output; no post-stop dispatch
     dispatch(event);
   }
   void attach() {
