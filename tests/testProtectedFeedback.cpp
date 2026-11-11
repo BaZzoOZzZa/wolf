@@ -14,7 +14,7 @@ using namespace streaming;
 using namespace moonlight::control;
 using namespace std::chrono_literals;
 namespace {
-const std::string key_hex = "00112233445566778899aabbccddeeff00";
+const std::string key_hex = "00112233445566778899aabbccddeeff";
 using Clock = std::chrono::steady_clock;
 bool eventually(const std::function<bool()> &fn) {
   auto end = Clock::now() + 2s;
@@ -216,6 +216,8 @@ struct Fixture {
   std::optional<ProtectedFeedbackExecutor> executor;
   bool bound_main = false;
   Fixture(bool bind = true) {
+    REQUIRE(key_hex.size() == 32);
+    REQUIRE(key);
     seat = seat_domain.create(
         initial,
         {true, true, true},

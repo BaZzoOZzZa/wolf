@@ -80,6 +80,11 @@ struct State {
     cell->release_seen = true; // NOT free(data)/free(packet), stack exit or ack
   }
   bool identities(const OwnerPeerView &v, const GrantHandle &grant) {
+    if (v.associated_.aes_key.size() != 32 ||
+        !std::all_of(v.associated_.aes_key.begin(), v.associated_.aes_key.end(), [](unsigned char c) {
+          return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        }))
+      return false;
     return v.thread_ == std::this_thread::get_id() && grant && v.grant_ && grant->token.matches(v.grant_->token) &&
            grant->owner.peer.matches(v.token_) && grant->owner.peer.matches(v.grant_->owner.peer) &&
            grant->owner.connection.matches(v.associated_.connection_scope) &&
@@ -88,7 +93,10 @@ struct State {
            grant->owner.binding.matches(v.grant_->owner.binding) && grant->owner.slot == v.grant_->owner.slot &&
            v.device_.matches(seat->generation()) && v.sender_ && v.sender_ == v.current_sender_ && v.registry_ &&
            v.associated_.control_crypto && same_control_generation(v.associated_, v.current_) &&
-           v.associated_.control_crypto->mode.load() == EncryptionMode::v2 &&
+           v.associated_.control_crypto->mode.load() == EncryptionMode::v2 && v.current_source_.owner &&
+           v.current_source_.matches &&
+           v.current_source_
+               .matches(v.current_source_.owner.get(), v.raw_, v.token_, v.sender_, v.associated_, v.key_) &&
            v.registry_->find_or_insert(crypto::hex_to_str(v.associated_.aes_key, true)) == &v.key_;
   }
   void hook(HookPoint point) {
