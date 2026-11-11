@@ -188,6 +188,15 @@ void run() {
   auto p_cert_file = utils::get_env("WOLF_PRIVATE_CERT_FILE", "cert.pem");
   auto local_state = initialize(config_file, p_key_file, p_cert_file);
 
+  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
+  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
+  auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
+  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
+  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
+  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
+  // Setup event handlers for player Lobbies
+  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+
   // HTTP APIs
   std::thread([local_state]() {
     HttpServer server = HttpServer();
@@ -234,15 +243,6 @@ void run() {
       logs::log(logs::error, "mDNS error: {}", e.what());
     }
   }).detach();
-
-  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
-  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
-  auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
-  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
-  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server);
-  // Setup event handlers for player Lobbies
-  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 
   // Park the main thread until a termination signal arrives. supervisord sends
   // SIGINT on container stop (stopsignal=INT) and waits stopwaitsecs for us to
