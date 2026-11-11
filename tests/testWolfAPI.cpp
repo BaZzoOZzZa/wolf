@@ -530,6 +530,9 @@ TEST_CASE("Lobby relays a device unplug to its runner", "[API]") {
   events::StreamSession source{.session_id = 1234,
                                .connection_scope = sessions::ConnectionScope::fresh(1234),
                                .run_scope = sessions::RunScope::fresh(moonlight_session_id)};
+  lobby.members->store(immer::map<std::size_t, std::shared_ptr<events::StreamSession>>{}.set(
+      source.session_id,
+      std::make_shared<events::StreamSession>(source)));
   app_state->running_sessions->store(immer::vector<events::StreamSession>{source});
   int relayed_to_lobby = 0;
   auto observer = event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(

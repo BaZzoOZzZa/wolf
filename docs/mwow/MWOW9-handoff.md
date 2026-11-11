@@ -174,3 +174,45 @@ arbitrary-pipeline rewrite or backward alias to a reused sink is provided.
 Manager may split the next consumer/input/device stages only after reviewing this
 frozen interface checkpoint and assigning disjoint file ownership. This document
 is the handoff contract for the foundation, not acceptance of R1/R6/R9.
+
+## F6/F7 regression checkpoint (RED seam)
+
+Independent review of `8e930ba` identified two sequential routing defects:
+consumer startup after a retained-lobby resume selected the source run instead of
+the lobby (F6); numeric membership alone allowed a replacement run's devices into
+that lobby and suppressed its own queue (F7). Manager's native combined `5e465404`
+passed full compilation and six isolated suites; those suites did not cover these
+triggers. The old link-pending section above is historical evidence for 8e930ba,
+not the current status of Manager's combined baseline.
+
+This regression checkpoint deliberately preserves the old routing decisions:
+`state::get_lobby_for_session` delegates to numeric membership and
+`state::prepare_stream_consumer` selects the source run. New `[scope][routing]`
+cases are therefore expected RED. No passing runtime result is asserted here.
+The next commit changes these decisions without weakening the assertions.
+
+Production seams (all in `state/sessions.hpp`, not test copies):
+
+- `get_lobby_for_session(lobbies, StreamSession)` is shared by both lobby device
+  relays, own-queue suppression and explicit UI-combo leave.
+- `prepare_stream_consumer<VideoSession/AudioSession>(request, sessions, lobbies)`
+  runs after RTP ping and before streaming. It validates the captured current
+  connection/run, replaces any incoming `producer_scope`, and returns an optional
+  prepared consumer. Both audio/video startup paths call this same function.
+- `queue_own_session_device(event, sessions, lobbies, queue_scope, queue)` is the
+  actual own-queue adapter used by the Moonlight event callback. The tests execute
+  it directly without starting a session to create that queue.
+- VideoSession and AudioSession now have hidden `producer_scope`, separate from
+  the connection's original `run_scope`. Initial named interpipesrc binding and
+  ProducerBinding retain this selection; no raw-ID alias was restored.
+
+The three new cases cover admitted lifecycle membership plus real pause handlers,
+new audio/video preparation after resume, stale/replacement requests, and five
+routing variants (resumed same run, replacement run, missing retained member,
+missing committed projection, null lobby scope). Device tests execute actual
+lobby event handlers and inspect both the real TSQueue and the emitted unplug.
+The legacy API relay fixture now includes its retained member snapshot; its old
+assertion remains. Input-object identities and absence of implicit leave are
+checked; these synthetic joined-state fixtures do not create a Wayland display,
+exercise physical input, or prove the pending InputSeat/neutral/drain contract.
+No CMake/build dependencies or other future-stage implementation is changed.

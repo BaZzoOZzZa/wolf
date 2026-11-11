@@ -282,6 +282,8 @@ struct VideoSession {
   std::array<char, 16> rtp_secret_payload;
   rfl::Skip<sessions::ConnectionScope> connection_scope;
   rfl::Skip<sessions::RunScope> run_scope;
+  // Selected internally immediately before consumer startup; never accepted from JSON.
+  rfl::Skip<sessions::RunScope> producer_scope;
 };
 
 struct AudioSession {
@@ -303,6 +305,8 @@ struct AudioSession {
   wolf::core::audio::AudioMode audio_mode;
   rfl::Skip<sessions::ConnectionScope> connection_scope;
   rfl::Skip<sessions::RunScope> run_scope;
+  // Selected internally immediately before consumer startup; never accepted from JSON.
+  rfl::Skip<sessions::RunScope> producer_scope;
 };
 
 struct IDRRequestEvent {

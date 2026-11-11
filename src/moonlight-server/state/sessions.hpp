@@ -87,6 +87,40 @@ inline std::optional<events::Lobby> get_lobby_by_connected_session(const immer::
   return {};
 }
 
+// Shared routing decision for consumer setup, device relays and own-queue suppression.
+inline std::optional<events::Lobby> get_lobby_for_session(const immer::vector<events::Lobby> &lobbies,
+                                                          const events::StreamSession &source) {
+  return get_lobby_by_connected_session(lobbies, std::to_string(source.session_id));
+}
+
+// Called after RTP ping, on the captured connection, for BOTH audio and video.
+// This seam keeps the existing self-producer decision until F6 is corrected.
+template <typename Consumer>
+std::optional<Consumer> prepare_stream_consumer(const Consumer &request,
+                                                const immer::vector<events::StreamSession> &all,
+                                                const immer::vector<events::Lobby> &lobbies) {
+  auto source = get_session_by_scope(all, request.connection_scope.get());
+  if (!source || source->session_id != request.session_id || !source->run_scope.matches(request.run_scope.get()))
+    return {};
+  auto prepared = request;
+  prepared.producer_scope = source->run_scope;
+  return prepared;
+}
+
+// The real own-queue adapter is usable without startup, a runner or any device.
+inline bool queue_own_session_device(const immer::box<events::PlugDeviceEvent> &event,
+                                     const immer::vector<events::StreamSession> &all,
+                                     const immer::vector<events::Lobby> &lobbies,
+                                     const sessions::RunScope &queue_scope,
+                                     const std::shared_ptr<events::devices_atom_queue> &queue) {
+  auto source = get_session_by_scope(all, event->connection_scope.get());
+  if (!source || !sessions::targets(source->run_scope, event->run_scope.get(), event->session_id) ||
+      !queue_scope.matches(source->run_scope) || !queue || get_lobby_for_session(lobbies, *source))
+    return false;
+  queue->push(event);
+  return true;
+}
+
 inline std::shared_ptr<events::StreamSession> create_stream_session(immer::box<state::AppState> state,
                                                                     const events::App &run_app,
                                                                     const wolf::config::PairedClient &current_client,

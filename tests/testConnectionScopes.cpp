@@ -195,3 +195,171 @@ TEST_CASE("Consumer binding retains the selected producer beyond the switch even
   REQUIRE_FALSE(binding.select(sessions::RunScope::fresh("42"), [](const auto &) { return false; }));
   REQUIRE(sessions::RunScope::fresh("42").resource_key() != selected_key);
 }
+
+namespace {
+events::Lobby retained_lobby(const events::StreamSession &member) {
+  events::Lobby lobby{.id = "joined-lobby",
+                      .name = "joined",
+                      .started_by_profile_id = "profile",
+                      .multi_user = false,
+                      .stop_when_everyone_leaves = true,
+                      .run_scope = sessions::RunScope::fresh("joined-lobby")};
+  // The committed membership representation written by the production join path.
+  lobby.members->store(immer::map<std::size_t, std::shared_ptr<events::StreamSession>>{}.set(
+      member.session_id,
+      std::make_shared<events::StreamSession>(member)));
+  lobby.connected_sessions->store(
+      immer::vector<immer::box<std::string>>{immer::box<std::string>{std::to_string(member.session_id)}});
+  return lobby;
+}
+} // namespace
+
+TEST_CASE("Resumed audio and video retain the admitted lobby producer", "[scope][routing][isolated]") {
+  auto app = isolated_state();
+  auto source = scoped_session(42);
+  sessions::LobbyLifecycle admission;
+  auto ticket = admission.create("joined-lobby", "resource", "config").ticket;
+  REQUIRE(admission.launch(ticket));
+  REQUIRE(admission.ready(ticket));
+  REQUIRE(admission.join(ticket, source.session_id, false) == sessions::LobbyLifecycle::Join::admitted);
+  admission.finish(ticket);
+  auto lobby = retained_lobby(source);
+  lobby.run_scope = ticket->run_scope;
+  app->lobbies->store(immer::vector<events::Lobby>{lobby});
+  app->running_sessions->store(immer::vector<events::StreamSession>{source});
+  auto handlers = sessions::setup_lobbies_handlers(app, "", {});
+  // Input objects represent the already joined seat. No device/display is created.
+  const auto joined_mouse = source.mouse;
+  const auto joined_keyboard = source.keyboard;
+  const auto joined_pads = source.joypads;
+  int leaves = 0;
+  auto observer = app->event_bus->register_handler<immer::box<events::LeaveLobbyEvent>>(
+      [&](const immer::box<events::LeaveLobbyEvent> &) { ++leaves; });
+  app->event_bus->fire_event(immer::box<events::PauseStreamEvent>{
+      events::PauseStreamEvent{.session_id = source.session_id, .connection_scope = source.connection_scope}});
+  auto resumed = source;
+  resumed.connection_scope = sessions::ConnectionScope::fresh(source.session_id);
+  app->running_sessions->store(immer::vector<events::StreamSession>{resumed});
+  // Repeated join is already_joined, so correctness cannot rely on a fresh Switch event.
+  CHECK(admission.join(ticket, resumed.session_id, false) == sessions::LobbyLifecycle::Join::already_joined);
+  events::VideoSession video{.session_id = resumed.session_id,
+                             .connection_scope = resumed.connection_scope,
+                             .run_scope = resumed.run_scope};
+  events::AudioSession audio{.session_id = resumed.session_id,
+                             .connection_scope = resumed.connection_scope,
+                             .run_scope = resumed.run_scope};
+  auto v = state::prepare_stream_consumer(video, app->running_sessions->load(), app->lobbies->load());
+  auto a = state::prepare_stream_consumer(audio, app->running_sessions->load(), app->lobbies->load());
+  REQUIRE(v);
+  REQUIRE(a);
+  CHECK(v->producer_scope.get().matches(lobby.run_scope));
+  CHECK(a->producer_scope.get().matches(lobby.run_scope));
+  CHECK(v->run_scope.get().matches(source.run_scope));
+  CHECK(a->run_scope.get().matches(source.run_scope));
+  CHECK(v->connection_scope.get().matches(resumed.connection_scope));
+  CHECK(a->connection_scope.get().matches(resumed.connection_scope));
+  CHECK(leaves == 0);
+  CHECK(lobby.connected_sessions->load()->size() == 1);
+  CHECK(resumed.mouse == joined_mouse);
+  CHECK(resumed.keyboard == joined_keyboard);
+  CHECK(resumed.joypads == joined_pads);
+  CHECK(lobby.members->load()->find(42)->get()->mouse == joined_mouse);
+  // Prepared consumers own the selected producer even after the live list changes.
+  app->lobbies->store({});
+  CHECK(v->producer_scope.get().matches(lobby.run_scope));
+  CHECK(a->producer_scope.get().matches(lobby.run_scope));
+}
+
+TEST_CASE("Consumer preparation rejects stale connections and replacement membership", "[scope][routing][isolated]") {
+  const auto original = scoped_session(42);
+  auto lobby = retained_lobby(original);
+  auto replacement = scoped_session(42);
+  auto all = immer::vector<events::StreamSession>{replacement};
+  auto lobbies = immer::vector<events::Lobby>{lobby};
+  events::VideoSession video{.session_id = 42,
+                             .connection_scope = replacement.connection_scope,
+                             .run_scope = replacement.run_scope,
+                             .producer_scope = lobby.run_scope};
+  events::AudioSession audio{.session_id = 42,
+                             .connection_scope = replacement.connection_scope,
+                             .run_scope = replacement.run_scope,
+                             .producer_scope = lobby.run_scope};
+  auto v = state::prepare_stream_consumer(video, all, lobbies);
+  auto a = state::prepare_stream_consumer(audio, all, lobbies);
+  REQUIRE(v);
+  REQUIRE(a);
+  CHECK(v->producer_scope.get().matches(replacement.run_scope));
+  CHECK(a->producer_scope.get().matches(replacement.run_scope));
+  video.connection_scope = original.connection_scope;
+  audio.connection_scope = original.connection_scope;
+  CHECK_FALSE(state::prepare_stream_consumer(video, all, lobbies));
+  CHECK_FALSE(state::prepare_stream_consumer(audio, all, lobbies));
+  video.connection_scope = replacement.connection_scope;
+  video.run_scope = original.run_scope;
+  CHECK_FALSE(state::prepare_stream_consumer(video, all, lobbies));
+  audio.connection_scope = sessions::ConnectionScope{};
+  CHECK_FALSE(state::prepare_stream_consumer(audio, all, lobbies));
+}
+
+TEST_CASE("Device routing uses retained run membership for relay and own queue", "[scope][routing][isolated]") {
+  auto app = isolated_state();
+  const auto member = scoped_session(42);
+  auto lobby = retained_lobby(member);
+  auto source = member;
+  bool belongs = true;
+  SECTION("resumed connection of the admitted run") {
+    source.connection_scope = sessions::ConnectionScope::fresh(42);
+  }
+  SECTION("replacement run reusing numeric ID") {
+    source = scoped_session(42);
+    belongs = false;
+  }
+  SECTION("numeric projection without retained member") {
+    lobby.members->store({});
+    belongs = false;
+  }
+  SECTION("retained member without committed projection") {
+    lobby.connected_sessions->store({});
+    belongs = false;
+  }
+  SECTION("null lobby scope") {
+    lobby.run_scope = {};
+    belongs = false;
+  }
+  app->running_sessions->store(immer::vector<events::StreamSession>{source});
+  app->lobbies->store(immer::vector<events::Lobby>{lobby});
+  auto handlers = sessions::setup_lobbies_handlers(app, "", {});
+  auto own_queue = std::make_shared<events::devices_atom_queue>();
+  auto plug = immer::box<events::PlugDeviceEvent>{events::PlugDeviceEvent{.session_id = "42",
+                                                                          .run_scope = source.run_scope,
+                                                                          .connection_scope = source.connection_scope}};
+  // Execute the same own-queue adapter invoked by setup_moonlight_handlers.
+  CHECK(state::queue_own_session_device(plug,
+                                        app->running_sessions->load(),
+                                        app->lobbies->load(),
+                                        source.run_scope,
+                                        own_queue) == !belongs);
+  auto own = own_queue->pop(std::chrono::milliseconds(0));
+  CHECK(own.has_value() == !belongs);
+  if (own)
+    CHECK((*own)->run_scope.get().matches(source.run_scope));
+  // Execute actual lobby event handlers; no runner/Gst/device startup.
+  int unplugged = 0;
+  auto observer = app->event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+      [&](const immer::box<events::UnplugDeviceEvent> &ev) {
+        if (ev->session_id == lobby.id) {
+          ++unplugged;
+          CHECK(ev->run_scope.get().matches(lobby.run_scope));
+        }
+      });
+  app->event_bus->fire_event(plug);
+  auto relayed = lobby.plugged_devices_queue->pop(std::chrono::milliseconds(0));
+  CHECK(relayed.has_value() == belongs);
+  if (relayed)
+    CHECK((*relayed)->run_scope.get().matches(lobby.run_scope));
+  app->event_bus->fire_event(
+      immer::box<events::UnplugDeviceEvent>{events::UnplugDeviceEvent{.session_id = "42",
+                                                                      .run_scope = source.run_scope,
+                                                                      .connection_scope = source.connection_scope}});
+  CHECK(unplugged == (belongs ? 1 : 0));
+}

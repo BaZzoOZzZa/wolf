@@ -400,7 +400,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                            std::shared_ptr<udp::socket> video_socket) {
-  if (!video_session->connection_scope.get() || !video_session->run_scope.get())
+  if (!video_session->connection_scope.get() || !video_session->run_scope.get() || !video_session->producer_scope.get())
     return;
 
   auto [color_range, color_space] = get_color_params(video_session);
@@ -455,7 +455,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
      */
     if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()),
                                        fmt::format("interpipesrc_{}_video", video_session->session_id).c_str())) {
-      const auto producer = video_session->run_scope.get().resource_key() + "_video";
+      const auto producer = video_session->producer_scope.get().resource_key() + "_video";
       g_object_set(src, "listen-to", producer.c_str(), nullptr);
       gst_object_unref(src);
     }
@@ -495,7 +495,7 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
           }
         });
 
-    auto producer_binding = std::make_shared<sessions::ProducerBinding>(video_session->run_scope.get());
+    auto producer_binding = std::make_shared<sessions::ProducerBinding>(video_session->producer_scope.get());
     auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
         [scope = video_session->connection_scope.get(),
          sess_id = video_session->session_id,
@@ -546,7 +546,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
                            const std::string &server_name) {
-  if (!audio_session->connection_scope.get() || !audio_session->run_scope.get())
+  if (!audio_session->connection_scope.get() || !audio_session->run_scope.get() || !audio_session->producer_scope.get())
     return;
 
   auto pipeline = fmt::format(
@@ -574,7 +574,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
   run_pipeline(pipeline,
-               [run_scope = audio_session->run_scope.get(),
+               [run_scope = audio_session->producer_scope.get(),
                 scope = audio_session->connection_scope.get(),
                 session_id = audio_session->session_id,
                 udp_sink,

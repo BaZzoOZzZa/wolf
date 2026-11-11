@@ -554,7 +554,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             !sessions::targets(source->run_scope, plug_device_event->run_scope.get(), plug_device_event->session_id))
           return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
-        if (auto lobby = state::get_lobby_by_connected_session(lobbies, plug_device_event->session_id)) {
+        if (auto lobby = state::get_lobby_for_session(lobbies, *source)) {
           logs::log(logs::info,
                     "[LOBBY] adding device to session {} in lobby {}",
                     plug_device_event->session_id,
@@ -579,7 +579,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                           unplug_device_event->session_id))
           return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
-        if (auto lobby = state::get_lobby_by_connected_session(lobbies, unplug_device_event->session_id)) {
+        if (auto lobby = state::get_lobby_for_session(lobbies, *source)) {
           logs::log(logs::debug, "[LOBBY] Unplug device for session {}", unplug_device_event->session_id);
           app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
               events::UnplugDeviceEvent{.session_id = lobby->id,
@@ -595,7 +595,7 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
     if (!session)
       return;
     auto lobbies = app_state->lobbies->load();
-    if (auto lobby = state::get_lobby_by_connected_session(*lobbies, std::to_string(scope.id()))) {
+    if (auto lobby = state::get_lobby_for_session(*lobbies, *session)) {
       app_state->event_bus->fire_event(
           immer::box<events::LeaveLobbyEvent>{events::LeaveLobbyEvent{.lobby_id = lobby->id,
                                                                       .moonlight_session_id = scope.id(),
