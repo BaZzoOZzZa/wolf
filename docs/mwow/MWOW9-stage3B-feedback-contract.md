@@ -344,3 +344,22 @@ release are the tested seams; no ENet initialize/host/socket/device is invoked.
 Native results/first failures and exact hashes are recorded in the separate 3B1
 checkpoint report. No build/test PASS is implied by this append before that report.
 The accepted inherited limits, all3B2/3C gates and no-WoW rule above still apply.
+
+Final 3B1 boundary: a stale/foreign captured GrantToken refuses before reservation
+without revoking the fresh current grant. Cleanup can itself reenter revoke; the
+executor rechecks terminal seat state after actual owned hook destruction before
+classifying local retirement. Neither check makes future async faults impossible.
+The joint test also uses real ConsumerRuntime workers: packet release and checked
+neutral leave transfer Pending while the old worker's sole holder destructor is
+blocked; unrelated scoped Work survives. This is not an actual game/producer or
+physical delivery/isolation test.
+
+Targeted native software fixture at a41be2e49eaccfe902ccf922a9f254723a3bd551:
+15 cases / 1544 assertions PASS with unchanged sanitizer configuration. Earlier
+compile errors, a malformed fixture key caught by UBSan, and an inconsistent
+fixture scope rejected by the real Runtime are preserved as failures, not semantic
+RED evidence. Final target/executable results, source preservation and complete
+raw argv/log/exit hashes are in
+`/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-3B1.md` and
+`checks/3B1/native-evidence.json` in that thread storage. Independent review remains
+required; this disabled checkpoint does not authorize 3B2 or runtime enablement.
