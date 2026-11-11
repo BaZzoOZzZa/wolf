@@ -184,7 +184,7 @@ void InputSeat::work(const std::shared_ptr<seat_detail::Gate> &gate,
           gate->open = accepted && valid && !gate->quarantined && !status.failed && !status.stop_requested;
           if (!gate->open)
             gate->quarantined = true;
-          retired_validation = std::move(gate->initial_validation);
+          retired_validation.swap(gate->initial_validation);
         }
       } else if (!accepted)
         gate->close(true);

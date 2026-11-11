@@ -100,7 +100,8 @@ TransferResult InputHandoff::request(TransferToken identity, AuthorizedSelection
   // its wrapper under the gate, but cannot retire this callable until unlock.
   std::shared_ptr<control::SeatValidation> retained_validation;
   if (selection.validate) {
-    retained_validation = std::make_shared<control::SeatValidation>(std::move(selection.validate));
+    retained_validation = std::make_shared<control::SeatValidation>();
+    retained_validation->swap(selection.validate);
     selection.validate = [retained_validation](const control::SeatCandidate &candidate) {
       return (*retained_validation)(candidate);
     };
