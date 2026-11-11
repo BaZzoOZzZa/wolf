@@ -108,7 +108,7 @@ struct Target {
   LifecycleRevision lifecycle = LifecycleRevision::fresh(0);
   Lifecycle state = Lifecycle::Running;
 };
-}
+} // namespace detail
 namespace {
 bool game_id(std::string_view s) {
   return !s.empty() && s.size() <= max_identifier_bytes && s != "." && s != ".." &&
@@ -150,7 +150,7 @@ Result preflight(std::span<const RuleView> rules) {
   }
   return Result::Allowed;
 }
-}
+} // namespace
 TargetFact::TargetFact(std::shared_ptr<const detail::Target> value) : value_(std::move(value)) {}
 TargetFact::operator bool() const {
   return bool(value_);
@@ -344,4 +344,5 @@ bool AccessStore::is_current(const Evidence &evidence) const {
   return std::ranges::any_of(r.pins, [&](const auto &pin) {
     return pin.numeric == evidence.principal_.numeric_index() && pin.leaf.matches(evidence.principal_.leaf());
   });
+}
 } // namespace sessions::protected_access
