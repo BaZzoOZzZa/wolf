@@ -300,3 +300,47 @@ legacy queue/global boundedness, RTSP response-buffer lifetime residual, all-rou
 singleton/prefix aliases, device readiness/reconciliation/kernel/Wine/isolation
 remain gates. No WoW launch without new explicit permission; current game/prefix
 untouched. Future physical tests prefer local games, not authorized by this plan.
+
+## 3B1 implementation boundary (Manager-authorized follow-up)
+
+Only new protected_feedback.hpp/.cpp, testProtectedFeedback.cpp, appended isolated
+CMake target and this append are implemented. All preceding design text is retained
+historically. No owned control loop, runtime caller, config/wire change or enable.
+
+Two narrow decisions were confirmed after reading actual Stage2 code: public
+InputSeat::revoke calls close(true), so healthy cancellation instead requires an
+actual retained Pending TransferHandle from InputHandoff::request (which closed
+false), exact old grant/connection/peer/device/destination and matching valid saved
+ticket. The owner then executes real reset through the injected operation boundary;
+flags/raw disconnect/request alone cannot acknowledge cancellation. A quarantine
+racing reset remains quarantined; no late cleanup reopens it.
+
+FeedbackDomain holds State/cell/operations independently of executor facades. Its
+owner-only destructor requests closure and waits for actual calls/packet/payload
+retirement, outside seat/queue/control locks. It can wait indefinitely on Unknown;
+passive waiting provides NO ENet progress. It is forbidden on active execution
+stacks/callbacks; the separate lifecycle owner must allow the bound ENet owner to
+reset/service, then future3B2 joins and releases the domain. No self-cycle, force
+free, replacement, detached cleanup or global reaper. Scope-bound software tests
+release gates and use the SAME bound owner for real packet destruction on unwind.
+
+OwnerPeerView is noncopyable, with retained actual registry and fresh trusted
+CurrentOwnerSource probe in addition to same_control_generation snapshots. Probe
+must observe the actual owner map/current session without reentry or IO. Fixtures
+supply this internal owner seam; live CONNECT/TLS/GameACL proof remains3B2/3C work.
+The executor never calls ControlPeer.send or owns another nonce/replay registry.
+
+One fixed cell plus existing router256; logical sizeof charge validated against
+64KiB before State allocation; max call-depth8. Actual plaintext is packed14 bytes,
+wire38, no NO_ALLOCATE/fragments. Each owned attempt hook parameter is emptied by
+swap and its capture destruction precedes frame acknowledgement outside locks.
+Nested owner frames cannot ack early; cleanup reentry cannot recursively retire.
+Packet create gets immediate nonallocating RAII; uncertain send/destroy ownership
+retains callback cell and denies reuse. Status is observational, not external
+permission/ack. Internal test hooks are empty by default and are synchronization,
+not independent retirement proof. Actual ENet packet create/free and owned capture
+release are the tested seams; no ENet initialize/host/socket/device is invoked.
+
+Native results/first failures and exact hashes are recorded in the separate 3B1
+checkpoint report. No build/test PASS is implied by this append before that report.
+The accepted inherited limits, all3B2/3C gates and no-WoW rule above still apply.

@@ -253,3 +253,13 @@ target_include_directories(wolf-protected-access-tests PRIVATE ../src/moonlight-
 target_link_libraries(wolf-protected-access-tests PRIVATE wolf::crypto Catch2::Catch2WithMain Threads::Threads)
 add_test(NAME wolf-protected-access-tests COMMAND wolf-protected-access-tests)
 set_tests_properties(wolf-protected-access-tests PROPERTIES LABELS "security;isolated" TIMEOUT 45)
+
+# Disabled protected feedback: real Seat/crypto/ENet packet lifetime, injected
+# transport decisions only. No ENet init, host/socket, devices or generic main.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-protected-feedback-tests testProtectedFeedback.cpp)
+    target_compile_features(wolf-protected-feedback-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-protected-feedback-tests PRIVATE wolf::runner Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-protected-feedback-tests COMMAND wolf-protected-feedback-tests)
+    set_tests_properties(wolf-protected-feedback-tests PROPERTIES LABELS "input;isolated" TIMEOUT 90)
+endif ()
