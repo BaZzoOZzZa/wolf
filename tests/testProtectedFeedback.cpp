@@ -288,7 +288,8 @@ struct Fixture {
                          keys,
                          *key,
                          grant,
-                         seat->generation());
+                         seat->generation(),
+                         source());
   }
   TransferResult transfer() {
     return handoff->request(TransferToken::fresh(1), {old, target, [](const auto &) { return true; }});
@@ -502,7 +503,8 @@ TEST_CASE("Healthy feedback cancellation requires real Pending handoff and actua
                         f.keys,
                         *f.key,
                         f.old,
-                        f.seat->generation());
+                        f.seat->generation(),
+                        f.source());
     REQUIRE_FALSE(f.executor->cancel_for_transfer(wrong, transaction.handle));
     REQUIRE(f.executor->cancel_for_transfer(view, transaction.handle));
   }
