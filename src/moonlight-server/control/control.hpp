@@ -17,13 +17,6 @@ namespace control {
 using namespace std::chrono_literals;
 using namespace wolf::core;
 
-void run_control(int port,
-                 const state::SessionsAtoms &running_sessions,
-                 const std::shared_ptr<events::EventBusType> &event_bus,
-                 int peers = 20,
-                 std::chrono::milliseconds timeout = 1000ms,
-                 const std::string &host_ip = "0.0.0.0");
-
 // Strong in-process scope identifies a generation; transport secrets only correlate it. A stable
 // paired-client session_id alone must never authorize an old ENet connection.
 inline bool same_control_generation(const events::StreamSession &a, const events::StreamSession &b) {

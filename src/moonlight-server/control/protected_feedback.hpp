@@ -13,6 +13,9 @@ struct StreamSession;
 namespace control {
 struct ControlPeer;
 }
+namespace control::loop {
+struct State;
+}
 namespace control::protected_feedback {
 // Internal trusted owner view, not a TLS/GameACL proof. Referents must be stable
 // through the owner call; no copy/raw peer export into an asynchronous queue.
@@ -116,6 +119,8 @@ struct State;
 class FeedbackDomain;
 class ProtectedFeedbackExecutor {
   friend class FeedbackDomain;
+  friend struct control::loop::State;
+  bool owner_call(void *, void (*)(void *)); // private synchronous actual-loop envelope
   std::shared_ptr<State> state_;
   explicit ProtectedFeedbackExecutor(std::shared_ptr<State>);
 

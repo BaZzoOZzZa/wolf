@@ -363,18 +363,23 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     return s.sealed ? PumpResult::Unknown : PumpResult::Failed;
   }
 }
-bool ProtectedFeedbackExecutor::service() {
-  State::Frame frame(state_, {}, true); // only the retained active operation, never current()
-
-  if (!frame.entered || !state_->ops.service)
+bool ProtectedFeedbackExecutor::owner_call(void *context, void (*call)(void *)) {
+  State::Frame frame(state_, {}, true);
+  if (!frame.entered || !call)
     return false;
   try {
-    state_->ops.service(state_->ops.owner.get());
+    call(context);
     return true;
   } catch (...) {
     state_->fail_exact(frame.authority);
     return false;
   }
+}
+bool ProtectedFeedbackExecutor::service() {
+  return owner_call(state_.get(), state_->ops.service ? +[](void *p) {
+    auto &state = *static_cast<State *>(p);
+    state.ops.service(state.ops.owner.get());
+  } : nullptr);
 }
 bool ProtectedFeedbackExecutor::cancel_for_transfer(const OwnerPeerView &view,
                                                     std::shared_ptr<const ::sessions::TransferHandle> transfer) {

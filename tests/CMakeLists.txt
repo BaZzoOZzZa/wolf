@@ -263,3 +263,13 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-protected-feedback-tests COMMAND wolf-protected-feedback-tests)
     set_tests_properties(wolf-protected-feedback-tests PROPERTIES LABELS "input;isolated" TIMEOUT 90)
 endif ()
+
+# Actual owned control loop with injected host/service; real packet and crypto,
+# no ENet initialization/socket, Wolf main or devices.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-control-loop-tests testControlLoop.cpp)
+    target_compile_features(wolf-control-loop-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-control-loop-tests PRIVATE wolf::runner Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-control-loop-tests COMMAND wolf-control-loop-tests)
+    set_tests_properties(wolf-control-loop-tests PROPERTIES LABELS "control;isolated" TIMEOUT 90)
+endif ()

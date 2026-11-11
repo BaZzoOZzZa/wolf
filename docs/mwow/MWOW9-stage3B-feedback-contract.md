@@ -438,3 +438,41 @@ real proper-owner packet cleanup. Same test bytes are used for GREEN; all origin
 17case bodies/assertions are preserved. Final native/source/argv/hashes and complete
 path audit are in thread report MWOW9-F13.md; ce89/R1 proofs remain historical.
 No3B2/3C/enable/live authority; independent F13 rereview remains mandatory.
+
+### 3B2 implementation checkpoint — before source edits
+
+Authorized owned-loop replacement builds on accepted c076/F13. New control_loop.hpp
+exposes internal ControlLoopDomain (one start slot), retained ControlLoopOwner
+(request_stop/status/join_when_exited), bounded Config/Operations/ThreadFactory,
+and immutable PeerLease snapshots without raw ENet pointers. State/actual loop
+remain in control.cpp: lift current clients/owners/outbox/key registry without
+rewriting MWOW6 authentication/crypto predicates. Fresh PeerToken on each CONNECT,
+max20 retained peer records; sender closure stays immutable with revocable lease.
+
+Worker owns actual host and all transport operations. Operation context is a
+separately retained transport dependency, never a State backreference. Optional
+internal attach_feedback(existingSeat) has one reserved slot and no runtime caller
+in Wolf; it constructs no Seat/device and does not authorize ingress. Worker selects
+only exact authenticated peer/token/scope, builds OwnerPeerView from its REAL maps
+and SAME key registry, pumps outside service frames. A private friend-only executor
+owner-call wrapper surrounds actual loop service+dispatch+received-packet RAII and
+shutdown reset/disconnect/flush/host destruction; no public completion ack. Handler
+locals/payloads retire before the enclosing frame returns. Legacy send ABI/guards
+remain; outbox count/bytes include popped batch until actual payload destruction.
+
+Domain reserves before allocation/start; no retry after failed/Unknown start.
+State owns no thread/Owner (no cycle). ThreadFactory is trusted all-or-nothing with
+no escaped thread on throw/nonjoinable. Exit future uses set_value_at_thread_exit,
+not an early flag; Joined only after actual thread.join. Stop/status never waits
+for transport;5s monotonic decision may become Unknown, late cleanup cannot reopen
+slot. Lifecycle destructor may wait indefinitely outside control/seat/outbox locks;
+execution owner must perform cleanup and exit first. Hooks/ops dependencies must
+not capture State/Owner; borrowed owner-call context is synchronous stack-only.
+
+Wolf retains Domain/Owner after handlers and before other ingress listeners, waits
+readiness or explicit startup failure, and requests stop on shutdown. It waits actual
+control join, logging Unknown separately; other detached ingress/subsystem10s wait
+remains NOT global shutdown proof. No Wolf/live/device execution in tests. Tests use
+the actual extracted loop, fakehost/service table, real ENet packet create/free,
+real encrypted client packets and actual registry/replay; optional attached Seat is
+software-only. Concrete residuals/actual checks will be appended after verification.

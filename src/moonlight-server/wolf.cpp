@@ -1,3 +1,5 @@
+#include <control/control_loop.hpp>
+
 #include <api/api.hpp>
 #include <atomic>
 #include <audio/pulse_router.hpp>
@@ -197,6 +199,30 @@ void run() {
   // Setup event handlers for player Lobbies
   auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 
+  // Owned control loop: handlers already exist; other ingress is not published
+  // before actual control host/registry/owner readiness. No protected seat attach.
+  control::loop::ControlLoopDomain control_domain;
+  control::loop::Config control_config;
+  control_config.port = state::get_port(state::CONTROL_PORT);
+  auto control_owner = control_domain.start(control_config, local_state->running_sessions, local_state->event_bus);
+  if (!control_owner) {
+    logs::log(logs::error, "Control startup refused; other ingress was not started");
+    return;
+  }
+  while (true) {
+    auto status = control_owner->status();
+    if (status.failed || status.unknown || status.exited || shutdown_requested.load()) {
+      logs::log(logs::error, "Control startup failed/Unknown; retaining owner until actual exit and join");
+      control_owner->request_stop();
+      while (control_owner->join_when_exited() != control::loop::JoinResult::Joined)
+        std::this_thread::sleep_for(10ms);
+      return;
+    }
+    if (status.ready)
+      break;
+    std::this_thread::sleep_for(10ms);
+  }
+
   // HTTP APIs
   std::thread([local_state]() {
     HttpServer server = HttpServer();
@@ -212,11 +238,6 @@ void run() {
   // RTSP
   std::thread([sessions = local_state->running_sessions]() {
     rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions);
-  }).detach();
-
-  // Control
-  std::thread([sessions = local_state->running_sessions, ev_bus = local_state->event_bus]() {
-    control::run_control(state::get_port(state::CONTROL_PORT), sessions, ev_bus);
   }).detach();
 
   // RTP
@@ -251,6 +272,7 @@ void run() {
     std::this_thread::sleep_for(200ms);
   }
 
+  control_owner->request_stop(); // out-of-band: not queued behind transport cleanup
   logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
 
   // Stop lobbies first: each one makes its connected sessions leave gracefully.
@@ -273,7 +295,15 @@ void run() {
     std::this_thread::sleep_for(100ms);
   }
 
-  logs::log(logs::info, "Graceful shutdown complete");
+  bool reported_control_unknown = false;
+  while (control_owner->join_when_exited() != control::loop::JoinResult::Joined) {
+    if (control_owner->status().unknown && !reported_control_unknown) {
+      reported_control_unknown = true;
+      logs::log(logs::warning, "Control shutdown Unknown; waiting for actual owner exit/join without forced teardown");
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+  logs::log(logs::info, "Control owner joined; other detached subsystem completion is not proven by the bounded wait");
 }
 
 int main(int argc, char *argv[]) try {
