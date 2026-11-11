@@ -19,7 +19,7 @@ Unknown/partial inputs are refused before mutation. Archived fixtures are test d
 not FetchContent overrides or build inputs.
 
 `inputtino::checked::Xbox::create` is the only new device-opening entry point; nothing
-calls it from Wolf. It reuses the actual Xbox capability constructor and retains its
+calls it from Wolf. It builds a checked-only descriptor, then retains the created
 uinput handle/fd. `adopt(Device, Io, Feedback, ThreadFactory)` is the same owned
 production setup path, with every syscall/factory explicitly injectable for tests;
 no missing-hook fallback opens a device. The injection contract requires Device.owner
@@ -45,8 +45,7 @@ The separate listener state installs its immutable callback before thread start.
 It polls with 10 ms requests; this is a policy, not a kernel latency guarantee.
 It supports FF_RUMBLE uploads/playback/gain/erase with a 16-effect cap; other effect
 uploads explicitly return -EINVAL. Legacy constant/periodic/ramp emulation is not
-changed or advertised as supported by this new handler. Reusing the capability
-constructor means those upload requests can still reach the handler and be refused.
+changed; those capabilities are absent from the checked descriptor before publication.
 Callback/read/poll/ioctl exceptions or terminal errors mark failed and initiate stop.
 Transient read EAGAIN/EINTR and poll EINTR remain cancellable. The callback copy stays
 owned through invocation; no mutable callback swapping during handoff exists here.
@@ -92,7 +91,7 @@ remain separate gates. Backend review is required before stages 2/3 or enabling 
 ## F10/F11 regression checkpoint
 
 The checked-only descriptor builder is exposed in `checked::detail` and called
-by the actual checked factory before uinput creation. This RED checkpoint retains
+by the actual checked factory before uinput creation. Historical RED537e359 retains
 the previous advertised bits and listener decisions. Legacy constructors remain
 byte-identical. A stepped IO clock tests the actual owned listener, acknowledging
 completion at its next poll; teardown releases the worker even on failed assertions.
@@ -129,7 +128,7 @@ The first all-tests RED attempt exposed signed overflow in the previous deadline
 addition and aborted under UBSan. It is recorded separately, not counted as the
 semantic RED. The boundary probe is now a separate unchanged test. Completed
 semantic RED on901a4f7:17cases,13passed/4failed,3403assertions/25failed;
-all13 original cases passed. GREEN must run the same tests plus boundary probe.
+all13 original cases passed. GREEN runs the same tests plus boundary probe.
 The configure-1 failure is also separate: FetchContent needed tracked patch SHA
 in its command to invalidate the old stamp. Manager authorized exactly two core
 CMake additions; native migration runs through normal FetchContent only.
@@ -137,3 +136,10 @@ CMake additions; native migration runs through normal FetchContent only.
 Stage2/3 remain disabled/unimplemented. Retirement contract is unchanged; this
 correction proves software scheduling/metadata under injected IO, not kernel
 acceptance, physical feedback, Wine/game consumption, or other-game isolation.
+
+The update policy above deliberately uses the **new** replay timing. Linux v6.12
+`ml_ff_upload` consults its existing `state->effect`; [ff-core.c:143–149](https://raw.githubusercontent.com/torvalds/linux/v6.12/drivers/input/ff-core.c)
+copies the incoming effect after the upload callback. Thus this backend does not
+claim exact emulation of that old-timing implementation detail. It preserves the
+API-level live-update behavior and remaining repetitions, with explicit new-timing
+semantics tested on the real listener. No public protocol/owner grant changes.
