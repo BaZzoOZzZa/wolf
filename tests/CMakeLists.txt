@@ -217,3 +217,15 @@ add_test(NAME wolf-consumer-runtime-tests COMMAND wolf-consumer-runtime-tests)
 set_tests_properties(wolf-consumer-runtime-tests PROPERTIES
         LABELS "consumer;isolated" TIMEOUT 45
         ENVIRONMENT "GST_REGISTRY_1_0=${CMAKE_CURRENT_BINARY_DIR}/consumer-registry.bin;GST_REGISTRY_UPDATE=no")
+
+# Checked Xbox production IO/worker seams, only injected software operations.
+# Never runs the device-opening factory, Wolf main or generic test discovery.
+if (TARGET inputtino::libinputtino)
+    add_executable(wolf-checked-xbox-tests testCheckedXbox.cpp
+            ../src/moonlight-server/control/checked_xbox_backend.cpp)
+    target_compile_features(wolf-checked-xbox-tests PRIVATE cxx_std_20)
+    target_include_directories(wolf-checked-xbox-tests PRIVATE ../src/moonlight-server)
+    target_link_libraries(wolf-checked-xbox-tests PRIVATE inputtino::libinputtino Catch2::Catch2WithMain Threads::Threads)
+    add_test(NAME wolf-checked-xbox-tests COMMAND wolf-checked-xbox-tests)
+    set_tests_properties(wolf-checked-xbox-tests PROPERTIES LABELS "input;isolated" TIMEOUT 45)
+endif ()

@@ -55,23 +55,37 @@ if (UNIX AND NOT APPLE)
             message(FATAL_ERROR "Inputtino signed-motion verification failed")
         endif ()
     endfunction()
+    set(INPUTTINO_CHECKED_XBOX_DRIVER "${PROJECT_SOURCE_DIR}/cmake/PatchInputtinoCheckedXbox.cmake")
+    function(wolf_verify_inputtino_checked_xbox source_dir)
+        execute_process(COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=${source_dir}"
+                        -DINPUTTINO_VERIFY_ONLY=ON -P "${INPUTTINO_CHECKED_XBOX_DRIVER}"
+                        RESULT_VARIABLE checked_result)
+        if (NOT checked_result EQUAL 0)
+            message(FATAL_ERROR "Inputtino checked Xbox verification failed")
+        endif ()
+    endfunction()
     if (WOLF_CUSTOM_INPUTTINO_SRC)
         wolf_verify_inputtino_motion("${WOLF_CUSTOM_INPUTTINO_SRC}")
+        wolf_verify_inputtino_checked_xbox("${WOLF_CUSTOM_INPUTTINO_SRC}")
         add_subdirectory(${WOLF_CUSTOM_INPUTTINO_SRC} ${CMAKE_CURRENT_BINARY_DIR}/inputtino EXCLUDE_FROM_ALL)
     else ()
         FetchContent_Declare(
                 inputtino
                 GIT_REPOSITORY https://github.com/games-on-whales/inputtino.git
-                GIT_TAG fd136cf
+                GIT_TAG fd136cfe492b4375b4507718bcca1f044588fc6f
                 PATCH_COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=<SOURCE_DIR>"
-                              -P "${INPUTTINO_MOTION_PATCH_DRIVER}")
+                              -P "${INPUTTINO_MOTION_PATCH_DRIVER}"
+                      COMMAND "${CMAKE_COMMAND}" "-DINPUTTINO_SOURCE_DIR=<SOURCE_DIR>"
+                              -P "${INPUTTINO_CHECKED_XBOX_DRIVER}")
         # FETCHCONTENT_SOURCE_DIR_INPUTTINO skips the FetchContent patch step.
         # Fail closed instead of silently modifying a caller-owned source tree.
         if (FETCHCONTENT_SOURCE_DIR_INPUTTINO)
             wolf_verify_inputtino_motion("${FETCHCONTENT_SOURCE_DIR_INPUTTINO}")
+            wolf_verify_inputtino_checked_xbox("${FETCHCONTENT_SOURCE_DIR_INPUTTINO}")
         endif ()
         FetchContent_MakeAvailable(inputtino)
         wolf_verify_inputtino_motion("${inputtino_SOURCE_DIR}")
+        wolf_verify_inputtino_checked_xbox("${inputtino_SOURCE_DIR}")
     endif ()
 
     add_subdirectory(src/platforms/linux/uinput)
