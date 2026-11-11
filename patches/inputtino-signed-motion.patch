@@ -23,7 +23,8 @@
 +    this->_state->current_state.accel[0] = detail::motion_to_le(x, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
 +    this->_state->current_state.accel[1] = detail::motion_to_le(y, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
 +    this->_state->current_state.accel[2] = detail::motion_to_le(z, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
- 
+-
++
      send_report(*this->_state);
      break;
    }
@@ -34,7 +35,8 @@
 +    this->_state->current_state.gyro[0] = detail::motion_to_le(x, uhid::gyro_resolution);
 +    this->_state->current_state.gyro[1] = detail::motion_to_le(y, uhid::gyro_resolution);
 +    this->_state->current_state.gyro[2] = detail::motion_to_le(z, uhid::gyro_resolution);
- 
+-
++
      send_report(*this->_state);
      break;
 --- /dev/null
