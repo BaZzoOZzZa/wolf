@@ -121,8 +121,12 @@ class ProtectedFeedbackExecutor {
 
 public:
   bool bind_current_thread(); // once; no new thread, cannot rebind after owner loss
+  // Unreserved failure has only the attempted exact grant's authority. Stale
+  // frame refusal cannot fault a replacement or seal its shared executor.
   PumpResult pump_one(const OwnerPeerView &, AttemptHook = {});
   bool cancel_for_transfer(const OwnerPeerView &, std::shared_ptr<const ::sessions::TransferHandle>);
+  // Failure can fault only the retained active operation. Without one, false is
+  // a local service failure, not global shutdown; lifecycle owner uses request_close.
   bool service(); // owner-only wrapped operation, supports nested frames
   Status status() const;
   void request_close(); // no IO/wait; exact current seat revoke, never healthy cancellation

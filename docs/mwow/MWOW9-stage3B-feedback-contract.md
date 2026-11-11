@@ -388,3 +388,53 @@ are separately rejected on the actual queue. RED a440f6e25c4d211db99abbe8fb4fab4
 compiled and deterministically failed 2 cases / 7 of 34 assertions (exit42), without
 hang/sanitizer failure. Same test bytes are retained for GREEN; separate R1 raw
 proofs/results and f98 immutable snapshot are listed in the final report.
+
+### F13 / P2 — exact authority on unreserved/frame/exception failures
+
+Independent review part16 found F13 beyond resolved local3B1-R1: early frame
+failure and BeforeReserve handoff-then-throw called unknown(), which looked up and
+revoked the fresh current grant. The F13 correction changes only this executor,
+its header contract, appended tests and this append; accepted Seat/Handoff/runtime/
+crypto/dependencies/CMake and original17 feedback tests remain unchanged.
+
+`fail_exact(retained_grant)` uses existing InputSeat::revoke(grant, grant.peer),
+whose identity comparison and quarantine transition are atomic under the seat
+gate. Only successful exact revoke seals this executor; missing/stale refusal
+cannot fault a replacement. There is no current() lookup in error handling.
+An active reservation fences grant replacement until actual retirement; owner
+packet/destroy/cleanup failures use that exact reservation grant. This preserves
+owned Unknown/cap/fence semantics and does not acknowledge or drop another grant.
+
+Frame holds an exact attempted grant for pump/cancel. Service instead snapshots
+only the reserved active grant under the short existing lifetime mutex. Publication
+and clearing of that immutable identity swap ownership, so no last-owner release,
+seat call, callback or IO runs under that mutex. Wrong-thread frame failure never
+reads owner-only Cell/depth/hook fields. A stale attempted frame cannot fault an
+unrelated active packet; a wrong-thread service call with a retained active
+operation still fails closed for THAT operation. Owner-depth overflow follows the
+same distinction. Active metadata is cleared after the real reservation retirement;
+a late copied identity cannot revoke a later grant because seat revoke rechecks it.
+
+Pump catch tracks whether THIS invocation reserved; an unreserved hook fault never
+sets cell.failed on some other operation. BeforeReserve handoff-then-throw is a
+local Failed result, leaves T/current queue/nonce/domain intact and allows its
+valid bound owner to send. Stale frame returns Refused when domain remains healthy;
+current-owned/missing-owner fault remains Unknown/quarantine. Service with no
+active operation has no grant authority: false reports its failure, but does not
+become an implicit global shutdown. An actual broken loop requires the separate
+trusted lifecycle owner to call explicit request_close (future3B2).
+
+Explicit request_close/domain destruction and failed domain construction retain
+their lifecycle authority/behavior; they are not callable error fallbacks. Pump's
+preliminary current() snapshot only refuses mismatches; scoped reserve remains the
+atomic admission authority. None of these APIs proves complete process shutdown.
+
+F13 RED bbe21727a7504fa862ac854b76c8d74b9d2dc777: native build0, selector[f13]
+4cases/153assertions,3cases and26assertions failed, exit42; no timeout/sanitizerabort.
+Tests use real S→T, queue/nonce/exact wire, wrong-thread and missing-owner paths,
+fresh active packet, old cancel, depth overflow, handoff-then-throw and unreserved
+service fault. Current-owned frame/hook/service faults remain quarantining, with
+real proper-owner packet cleanup. Same test bytes are used for GREEN; all original
+17case bodies/assertions are preserved. Final native/source/argv/hashes and complete
+path audit are in thread report MWOW9-F13.md; ce89/R1 proofs remain historical.
+No3B2/3C/enable/live authority; independent F13 rereview remains mandatory.

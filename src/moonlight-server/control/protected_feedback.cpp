@@ -39,6 +39,9 @@ struct State {
   std::mutex lifetime;
   std::condition_variable wake;
   std::thread::id owner;
+  // Immutable identity of the reserved operation, protected by lifetime. Foreign
+  // threads may snapshot this metadata, NEVER inspect the owner-only Cell.
+  GrantHandle active_grant;
   std::atomic_bool closing{false}, sealed{false}, occupied{false}, live{false}, cipher_live{false};
   std::atomic_size_t calls{0};
   std::atomic<Phase> phase{Phase::Idle};
@@ -63,12 +66,25 @@ struct State {
     if (auto grant = seat->current())
       seat->revoke(grant, grant->owner.peer);
   }
-  void unknown() {
+  void set_active(GrantHandle grant) {
+    {
+      std::lock_guard lock(lifetime);
+      active_grant.swap(grant);
+    } // displaced identity's last release is outside the lock
+  }
+  void fail_exact(const GrantHandle &grant) {
+    // revoke performs the exact identity comparison AND fault transition under
+    // the seat gate. A later lookup/current comparison would recreate F13.
+    if (!grant || !seat->revoke(grant, grant->owner.peer))
+      return;
     sealed = true;
     phase = Phase::Unknown;
     outcome = Outcome::Unknown;
-    if (auto grant = seat->current())
-      seat->revoke(grant, grant->owner.peer);
+  }
+  void fail_active() {
+    // Bound owner only. A live reservation fences replacement until retirement.
+    if (cell.reservation)
+      fail_exact(cell.reservation->feedback.grant);
   }
   static void released(ENetPacket *packet) noexcept {
     auto *cell = static_cast<Cell *>(packet->userData);
@@ -112,7 +128,7 @@ struct State {
     try {
       ops.destroy(ops.owner.get(), cell.packet);
     } catch (...) {
-      unknown();
+      fail_active();
     }
   }
   void retire_ready() noexcept {
@@ -121,9 +137,9 @@ struct State {
     if (live && !cell.release_seen)
       return;
     if (cell.callback_invalid)
-      unknown();
+      fail_active();
     if (seat->quarantined() && !cell.failed)
-      unknown();
+      fail_active();
     cleaning = true;
     // Only called after ALL nested actual operations returned. The marker alone
     // was not sufficient: packet/data have now been freed by the actual destroy.
@@ -151,7 +167,7 @@ struct State {
     // Cleanup itself can reenter revoke; never relabel that terminal fault as a
     // successful local release merely because the earlier snapshot was healthy.
     if (seat->quarantined() && !cell.failed)
-      unknown();
+      fail_active();
     if (cell.reservation) {
       bool success = !sealed && !closing && !cell.failed && cell.release_seen &&
                      (cell.cancelling || (cell.flags.load() & ENET_PACKET_FLAG_SENT));
@@ -162,11 +178,12 @@ struct State {
       try {
         cell.reservation->retire(success);
       } catch (...) {
-        unknown();
+        fail_active();
         cleaning = false;
         return;
       }
       cell.reservation.reset(); // only after retire returned and unlocked its gate
+      set_active({});
     }
     if (!sealed) {
       phase = Phase::Retired;
@@ -178,22 +195,29 @@ struct State {
     std::shared_ptr<State> state;
     bool entered = false;
     bool counted = false;
-    explicit Frame(std::shared_ptr<State> s) : state(std::move(s)) {
+    GrantHandle authority;
+    explicit Frame(std::shared_ptr<State> s, GrantHandle attempted = {}, bool from_active = false)
+        : state(std::move(s)), authority(std::move(attempted)) {
       bool bad = false;
+      GrantHandle snapshot;
       {
         std::lock_guard lock(state->lifetime);
         bad = state->owner != std::this_thread::get_id() || state->owner == std::thread::id{};
+        if (from_active)
+          snapshot = state->active_grant; // snapshot was empty: no last release under lock
         ++state->calls;
         counted = true;
         if (!bad)
           entered = true;
       }
+      if (from_active)
+        authority.swap(snapshot); // all prior/snapshot ownership releases outside lock
       if (bad) {
-        state->unknown();
+        state->fail_exact(authority);
         return;
       }
       if (state->depth >= state->policy.call_depth) {
-        state->unknown();
+        state->fail_exact(authority);
       } else {
         ++state->depth;
         return;
@@ -236,18 +260,21 @@ void ProtectedFeedbackExecutor::request_close() {
   state_->close();
 }
 PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, AttemptHook hook) {
-  State::Frame frame(state_); // last local destructor: ack only after outer owners
+  State::Frame frame(state_, view.grant_); // last local destructor: ack only after outer owners
   AttemptHook owned;
   owned.swap(hook); // empties parameter; moved std::function is not an ownership proof
   auto &s = *state_;
-  if (!frame.entered || s.sealed)
+  if (!frame.entered)
+    return s.sealed ? PumpResult::Unknown : PumpResult::Refused;
+  if (s.sealed)
     return PumpResult::Unknown;
   if (s.closing || s.occupied || s.depth != 1 || s.cleaning)
     return PumpResult::Refused;
+  bool reserved_by_attempt = false;
   try {
     auto current = s.seat->current();
-    // A stale/foreign capability cannot poison the new current grant. Only an
-    // inconsistent observation of the exact current grant seals this domain.
+    // Preliminary refusal only; scoped reservation below is the atomic gate.
+    // Errors never derive authority from this observational current snapshot.
     if (!current || !view.grant_ || !current->token.matches(view.grant_->token))
       return PumpResult::Refused;
     if (owned)
@@ -255,6 +282,8 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     s.cell.reservation = s.router->reserve_send(view.grant_);
     if (!s.cell.reservation)
       return PumpResult::Idle;
+    reserved_by_attempt = true;
+    s.set_active(s.cell.reservation->feedback.grant);
     s.occupied = true;
     s.phase = Phase::Reserved;
     s.outcome = Outcome::None;
@@ -316,7 +345,7 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     try {
       result = s.ops.send(s.ops.owner.get(), &view.raw_, 0, s.cell.packet);
     } catch (...) {
-      s.unknown();
+      s.fail_active();
       return PumpResult::Unknown;
     }
     if (result < 0) {
@@ -327,27 +356,29 @@ PumpResult ProtectedFeedbackExecutor::pump_one(const OwnerPeerView &view, Attemp
     s.hook(HookPoint::AfterSend);
     return PumpResult::Queued;
   } catch (...) {
-    s.cell.failed = true;
-    if (!s.occupied)
-      s.unknown();
+    if (reserved_by_attempt)
+      s.cell.failed = true;
+    else
+      s.fail_exact(view.grant_); // no Cell access/mutation for an unreserved fault
     return s.sealed ? PumpResult::Unknown : PumpResult::Failed;
   }
 }
 bool ProtectedFeedbackExecutor::service() {
-  State::Frame frame(state_);
+  State::Frame frame(state_, {}, true); // only the retained active operation, never current()
+
   if (!frame.entered || !state_->ops.service)
     return false;
   try {
     state_->ops.service(state_->ops.owner.get());
     return true;
   } catch (...) {
-    state_->unknown();
+    state_->fail_exact(frame.authority);
     return false;
   }
 }
 bool ProtectedFeedbackExecutor::cancel_for_transfer(const OwnerPeerView &view,
                                                     std::shared_ptr<const ::sessions::TransferHandle> transfer) {
-  State::Frame frame(state_);
+  State::Frame frame(state_, view.grant_);
   std::shared_ptr<const ::sessions::TransferHandle> retained;
   retained.swap(transfer); // parameter emptied; owned validator refs retire BEFORE frame ack
   auto &s = *state_;
@@ -373,7 +404,7 @@ bool ProtectedFeedbackExecutor::cancel_for_transfer(const OwnerPeerView &view,
       s.cell.failed = true;
     return true;
   } catch (...) {
-    s.unknown();
+    s.fail_exact(view.grant_);
     return false;
   }
 }
@@ -382,7 +413,7 @@ size_t FeedbackDomain::logical_charge() {
   // command. EVP/allocator overhead and external retained graphs are not RSS caps.
   return sizeof(State) + 256 * sizeof(std::optional<SeatFeedback>) + sizeof(FeedbackReservation) +
          sizeof(ControlEncryptedPacket) + sizeof(ENetPacket) + sizeof(ControlEncryptedPacket) +
-         sizeof(ENetOutgoingCommand);
+         sizeof(ENetOutgoingCommand) + 8 * sizeof(State::Frame);
 }
 std::optional<ProtectedFeedbackExecutor>
 FeedbackDomain::create(std::shared_ptr<InputSeat> seat, EnetOperations ops, Policy policy) {
