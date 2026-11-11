@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -75,6 +76,23 @@ struct ConsumerStatus {
   bool joined;
 };
 
+// Retain this ticket across registry pruning/replacement. Only a successful
+// completion after ALL reserved workers join is positive release evidence.
+struct ConsumerDrainTicket {
+  ConnectionScope connection;
+  std::shared_future<void> released;
+  bool complete() const {
+    if (!released.valid() || released.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready)
+      return false;
+    try {
+      released.get();
+      return true;
+    } catch (...) {
+      return false; // broken promise/owner loss is never completion
+    }
+  }
+};
+
 // No pipeline pointer escapes to event-bus callers. These methods only touch
 // bounded in-memory state; Gst operations belong exclusively to the worker.
 class ConsumerJob {
@@ -119,6 +137,10 @@ private:
     ConnectionScope scope;
     bool revoked = false;
     std::vector<std::shared_ptr<Worker>> workers;
+    std::shared_ptr<std::promise<void>> completion = std::make_shared<std::promise<void>>();
+    std::shared_future<void> released = completion->get_future().share();
+    bool published = false;
+    void finish_if_drained();
   };
   ConsumerPolicy policy_;
   Current current_;
@@ -138,7 +160,7 @@ public:
   ConsumerRuntime &operator=(const ConsumerRuntime &) = delete;
   ConsumerAdmission
   admit(ConnectionScope scope, RunScope run, ConsumerKind kind, ConsumerCorrelation correlation, Work work);
-  void revoke(const ConnectionScope &scope);
+  std::optional<ConsumerDrainTicket> revoke(const ConnectionScope &scope);
   void ping(ConsumerKind kind, const ConsumerPing &ping);
   void command(const ConnectionScope &scope, ConsumerKind kind, ConsumerCommands command);
   std::optional<ConsumerStatus> status(const ConnectionScope &scope, ConsumerKind kind) const;

@@ -311,3 +311,26 @@ Frozen build commits applied in the authorized order, stable patch IDs identical
 869e1a0 -> 21683d9 (UUID), d2c6212 -> a480299 (ENet PIC),
 a10e7e8 -> ffa5388 (test-only Beast). Their production CMake is not rewritten;
 only the new isolated consumer test target is appended to tests/CMakeLists.txt.
+
+Consumer native follow-up: first native configure passed; first build exposed
+pinned eventbus `function_traits` rejecting generic registration lambdas in the
+new adapter. Registrations now name their concrete event types (including fixture
+observers); no dependency workaround. Historical build-1.log remains evidence.
+
+Completion contract for subsequent stages: `revoke(scope)` returns
+`optional<ConsumerDrainTicket>`. It closes admission immediately; the ticket
+retains that exact ConnectionScope and a shared completion future. `complete()`
+is a zero-time readiness query, true only after every reserved worker has joined;
+missing/broken tickets are false. A retained ticket survives registry pruning and
+numeric-ID reuse. Unknown does not fulfil it. A revoked connection with no
+reserved workers can complete immediately, while later ANNOUNCE stays denied.
+`status(scope, kind)` supplies diagnostic state/reason; absence of a status is not
+release proof. Share the owner runtime with the future coordinator and retain the
+returned ticket before publishing any replacement input/device owner; no polling
+by raw numeric ID. This patch supplies the consumer fence, not that future grant
+protocol or input neutral/device completion.
+
+The consumer streaming entry points additionally require job/request exact
+ConnectionScope+RunScope, matching public ID and kind. Regression checks now also
+observe actual pipeline destruction via GObject weak notify and cancel in the
+after-ping/before-Gst-setup gap. No EOS send or ticket issuance counts as release.

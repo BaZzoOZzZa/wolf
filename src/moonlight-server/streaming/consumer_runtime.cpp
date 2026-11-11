@@ -38,22 +38,34 @@ ConsumerRuntime::ConsumerRuntime(Current current, ConsumerPolicy policy)
     throw std::invalid_argument("Invalid consumer policy");
   supervisor_ = std::thread([this] { supervise(); });
 }
+void ConsumerRuntime::Record::finish_if_drained() {
+  if (revoked && !published && std::all_of(workers.begin(), workers.end(), [](const auto &w) { return w->joined; })) {
+    completion->set_value();
+    published = true;
+  }
+}
 ConsumerRuntime::~ConsumerRuntime() {
   {
     std::lock_guard lock(mutex_);
     closing_ = true;
-    for (auto &record : records_)
+    for (auto &record : records_) {
+      record.revoked = true;
       for (auto &worker : record.workers)
         worker->job->cancel(ConsumerReason::Cancelled);
+    }
   }
   wake_.notify_all();
   supervisor_.join();
   // External Gst/driver calls may not return. Keep ownership rather than claim
   // a bounded physical shutdown or detach a worker with borrowed resources.
-  for (auto &record : records_)
-    for (auto &worker : record.workers)
+  for (auto &record : records_) {
+    for (auto &worker : record.workers) {
       if (worker->thread.joinable())
         worker->thread.join();
+      worker->joined = true;
+    }
+    record.finish_if_drained();
+  }
 }
 void ConsumerRuntime::prune() {
   std::erase_if(records_, [&](const Record &record) {
@@ -138,9 +150,9 @@ ConsumerAdmission ConsumerRuntime::admit(
   wake_.notify_all();
   return ConsumerAdmission::Accepted;
 }
-void ConsumerRuntime::revoke(const ConnectionScope &scope) {
+std::optional<ConsumerDrainTicket> ConsumerRuntime::revoke(const ConnectionScope &scope) {
   if (!scope)
-    return;
+    return {};
   std::lock_guard lock(mutex_);
   for (auto &record : records_) {
     if (!record.scope.matches(scope))
@@ -148,19 +160,22 @@ void ConsumerRuntime::revoke(const ConnectionScope &scope) {
     record.revoked = true;
     for (auto &worker : record.workers)
       worker->job->cancel(ConsumerReason::Cancelled);
+    record.finish_if_drained();
     wake_.notify_all();
-    return;
+    return ConsumerDrainTicket{scope, record.released};
   }
   if (!current_(scope))
-    return;
+    return {};
   prune();
   if (records_.size() >= policy_.max_records) {
     // Losing a current-scope tombstone would reopen stop-before-register.
     // Permanently fail closed until the owner runtime is replaced at shutdown.
     saturated_revocations_ = true;
-    return;
+    return {};
   }
   records_.push_back(Record{scope, true, {}});
+  records_.back().finish_if_drained();
+  return ConsumerDrainTicket{scope, records_.back().released};
 }
 void ConsumerRuntime::ping(ConsumerKind kind, const ConsumerPing &ping) {
   std::lock_guard lock(mutex_);
@@ -238,6 +253,8 @@ void ConsumerRuntime::supervise() {
       job.ping_.reset();
       job.commands_ = {};
     }
+    for (auto &record : records_)
+      record.finish_if_drained();
     wake_.wait_for(lock, policy_.poll_interval);
   }
 }

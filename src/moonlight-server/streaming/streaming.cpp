@@ -497,7 +497,9 @@ bool start_streaming_video(immer::box<events::VideoSession> video_session,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                            std::shared_ptr<udp::socket> video_socket) {
-  if (!video_session->connection_scope.get() || !video_session->run_scope.get() || !video_session->producer_scope.get())
+  if (!job.connection.matches(video_session->connection_scope.get()) ||
+      !job.run.matches(video_session->run_scope.get()) || job.kind != ConsumerKind::Video ||
+      job.connection.id() != video_session->session_id || !video_session->producer_scope.get())
     return false;
 
   auto [color_range, color_space] = get_color_params(video_session);
@@ -551,7 +553,9 @@ bool start_streaming_audio(immer::box<events::AudioSession> audio_session,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
                            const std::string &server_name) {
-  if (!audio_session->connection_scope.get() || !audio_session->run_scope.get() || !audio_session->producer_scope.get())
+  if (!job.connection.matches(audio_session->connection_scope.get()) ||
+      !job.run.matches(audio_session->run_scope.get()) || job.kind != ConsumerKind::Audio ||
+      job.connection.id() != audio_session->session_id || !audio_session->producer_scope.get())
     return false;
 
   auto pipeline = fmt::format(

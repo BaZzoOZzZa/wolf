@@ -108,8 +108,10 @@ TEST_CASE("Consumer stop-before-registration and cancel-before-ping use real bus
   Fixture f;
   std::atomic_int starts{0};
   std::atomic_int game_stops{0};
-  auto game = f.bus->register_handler<immer::box<events::GameStopRequest>>([&](auto &) { ++game_stops; });
-  auto ended = f.bus->register_handler<immer::box<events::RunEnded>>([&](auto &) { ++game_stops; });
+  auto game = f.bus->register_handler<immer::box<events::GameStopRequest>>(
+      [&](const immer::box<events::GameStopRequest> &) { ++game_stops; });
+  auto ended = f.bus->register_handler<immer::box<events::RunEnded>>(
+      [&](const immer::box<events::RunEnded> &) { ++game_stops; });
   auto work = [&](ConsumerJob &, const ConsumerPing &) {
     ++starts;
     return true;
@@ -118,6 +120,9 @@ TEST_CASE("Consumer stop-before-registration and cancel-before-ping use real bus
     f.fire(events::StopStreamEvent{.session_id = 42, .connection_scope = f.scope});
     REQUIRE(f.admit(ConsumerKind::Video, work) == ConsumerAdmission::Revoked);
     REQUIRE(f.admit(ConsumerKind::Audio, work) == ConsumerAdmission::Revoked);
+    auto ticket = f.runtime->revoke(f.scope);
+    REQUIRE(ticket);
+    REQUIRE(ticket->complete());
   }
   SECTION("pause while both wait") {
     REQUIRE(f.admit(ConsumerKind::Video, work) == ConsumerAdmission::Accepted);
@@ -220,6 +225,9 @@ TEST_CASE("Unknown retains worker ownership and denies replacement and bounded c
   f.fire(events::StopStreamEvent{.session_id = 42, .connection_scope = f.scope});
   REQUIRE(eventually([&] { return f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Unknown; }));
   REQUIRE_FALSE(f.runtime->status(f.scope, ConsumerKind::Video)->joined);
+  auto ticket = f.runtime->revoke(f.scope);
+  REQUIRE(ticket);
+  REQUIRE_FALSE(ticket->complete());
   auto old = f.scope;
   auto replacement = ConnectionScope::fresh(42);
   auto unrelated = ConnectionScope::fresh(43);
@@ -231,7 +239,11 @@ TEST_CASE("Unknown retains worker ownership and denies replacement and bounded c
   }) == ConsumerAdmission::Capacity);
   gate.release();
   REQUIRE(eventually([&] { return f.runtime->status(old, ConsumerKind::Video)->joined; }));
+  REQUIRE(eventually([&] { return ticket->complete(); }));
   REQUIRE(f.admit(ConsumerKind::Video, [](auto &, auto &) { return true; }) == ConsumerAdmission::Accepted);
+  REQUIRE_FALSE(f.runtime->status(old, ConsumerKind::Video)); // old record pruned
+  REQUIRE(ticket->connection.matches(old));
+  REQUIRE(ticket->complete()); // durable proof survives pruning and ID reuse
   f.ping(ConsumerKind::Video);
   REQUIRE(eventually([&] { return f.joined(ConsumerKind::Video); }));
 }
@@ -256,23 +268,32 @@ TEST_CASE("Consumer capacity bounds waiters and preserves stop tombstones", "[co
 TEST_CASE("EOS is not completion until private-context drain and worker join", "[consumer][software-gst]") {
   software_gst();
   Gate drain;
-  std::atomic_bool context_owned{false};
+  std::atomic_bool context_owned{false}, pipeline_destroyed{false};
   Fixture f(fast_policy());
   REQUIRE(f.admit(ConsumerKind::Video, [&](ConsumerJob &job, auto &) {
     return run_consumer_pipeline(
         "fakesrc num-buffers=1 ! fakesink sync=false",
         job,
-        {.setup = [&](GstElement *) { context_owned = g_main_context_is_owner(g_main_context_get_thread_default()); },
+        {.setup =
+             [&](GstElement *pipeline) {
+               context_owned = g_main_context_is_owner(g_main_context_get_thread_default());
+               g_object_weak_ref(
+                   G_OBJECT(pipeline),
+                   +[](gpointer data, GObject *) { *static_cast<std::atomic_bool *>(data) = true; },
+                   &pipeline_destroyed);
+             },
          .drain = [&](GstElement *) { drain.wait(); }});
   }) == ConsumerAdmission::Accepted);
   f.ping(ConsumerKind::Video);
   REQUIRE(eventually([&] { return drain.entered.load(); }));
   REQUIRE(context_owned);
   REQUIRE_FALSE(f.joined(ConsumerKind::Video));
+  REQUIRE_FALSE(pipeline_destroyed);
   REQUIRE(eventually([&] { return f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Unknown; }));
   drain.release();
   REQUIRE(eventually([&] { return f.joined(ConsumerKind::Video); }));
   REQUIRE(f.runtime->status(f.scope, ConsumerKind::Video)->state == ConsumerState::Stopped);
+  REQUIRE(pipeline_destroyed);
 }
 
 TEST_CASE("Consumer commands execute on their private context and do not touch persistent producers",
@@ -282,7 +303,8 @@ TEST_CASE("Consumer commands execute on their private context and do not touch p
   std::atomic_int commands{0}, stops{0};
   std::atomic_bool correct{false};
   Fixture f;
-  auto observer = f.bus->register_handler<immer::box<events::GameStopRequest>>([&](auto &) { ++stops; });
+  auto observer = f.bus->register_handler<immer::box<events::GameStopRequest>>(
+      [&](const immer::box<events::GameStopRequest> &) { ++stops; });
   REQUIRE(f.admit(ConsumerKind::Video, [&](ConsumerJob &job, auto &) {
     auto worker = std::this_thread::get_id();
     return run_consumer_pipeline("fakesrc is-live=true ! identity sleep-time=10000 ! fakesink sync=false",
@@ -357,4 +379,37 @@ TEST_CASE("In-flight Gst callback stays owned through cancellation and NULL drai
   callback.release();
   REQUIRE(eventually([&] { return f.joined(ConsumerKind::Audio); }));
   REQUIRE(drained);
+}
+
+TEST_CASE("Revocation after ping but before Gst setup never starts a pipeline", "[consumer][software-gst]") {
+  software_gst();
+  Gate activation;
+  std::atomic_int setups{0};
+  Fixture f;
+  REQUIRE(f.admit(ConsumerKind::Video, [&](ConsumerJob &job, const auto &) {
+    activation.wait();
+    return run_consumer_pipeline("fakesrc num-buffers=1 ! fakesink sync=false", job, {.setup = [&](GstElement *) {
+                                   ++setups;
+                                 }});
+  }) == ConsumerAdmission::Accepted);
+  f.ping(ConsumerKind::Video);
+  REQUIRE(eventually([&] { return activation.entered.load(); }));
+  auto ticket = f.runtime->revoke(f.scope);
+  REQUIRE(ticket);
+  REQUIRE_FALSE(ticket->complete());
+  activation.release();
+  REQUIRE(eventually([&] { return ticket->complete(); }));
+  REQUIRE(setups == 0);
+}
+
+TEST_CASE("A broken or absent completion ticket never proves release", "[consumer]") {
+  ConsumerDrainTicket empty;
+  REQUIRE_FALSE(empty.complete());
+  std::shared_future<void> broken;
+  {
+    std::promise<void> lost;
+    broken = lost.get_future().share();
+  }
+  ConsumerDrainTicket ticket{ConnectionScope::fresh(42), broken};
+  REQUIRE_FALSE(ticket.complete());
 }
