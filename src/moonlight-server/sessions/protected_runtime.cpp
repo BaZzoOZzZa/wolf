@@ -2,7 +2,7 @@
 #include <state/sessions.hpp>
 #include <stdexcept>
 
-namespace sessions {
+namespace wolf::core::sessions {
 ConsumerComposition::ConsumerComposition(state::SessionsAtoms running, streaming::ConsumerPolicy policy)
     : view_(std::make_shared<View>()) {
   if (!running)
@@ -20,11 +20,19 @@ ConsumerComposition::ConsumerComposition(state::SessionsAtoms running, streaming
       },
       policy);
 }
+std::shared_ptr<ConsumerComposition> make_consumer_composition(state::SessionsAtoms running) {
+  return std::make_shared<ConsumerComposition>(std::move(running));
+}
+std::shared_ptr<streaming::ConsumerRuntime> consumer_runtime(const std::shared_ptr<ConsumerComposition> &composition) {
+  if (!composition)
+    throw std::invalid_argument("Missing consumer composition");
+  return composition->runtime();
+}
 bool ConsumerComposition::contains(const streaming::ConnectionScope &scope) const {
   auto snapshot = view_->snapshot.load();
   return snapshot && (snapshot->scopes[0].matches(scope) || snapshot->scopes[1].matches(scope));
 }
-} // namespace sessions
+} // namespace wolf::core::sessions
 #ifdef __linux__
 namespace sessions {
 using namespace std::chrono_literals;
@@ -87,7 +95,12 @@ bool ProtectedRuntimeOwner::start(RuntimeBootstrap bootstrap, control::SeatThrea
     auto done = std::make_shared<std::promise<void>>();
     exited_ = done->get_future().share();
     worker_ = start_thread([this, done] {
-      run();
+      try {
+        run();
+      } catch (...) {
+        state_->unknown = true;
+        request_stop();
+      }
       done->set_value_at_thread_exit(); // ready only after thread/TLS exit
     });
     if (!worker_.joinable())

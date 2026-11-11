@@ -21,7 +21,6 @@
 #include <rest/rest.hpp>
 #include <rtsp/net.hpp>
 #include <sessions/handlers.hpp>
-#include <sessions/protected_runtime.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
 #include <vector>
@@ -191,13 +190,13 @@ void run() {
   auto p_cert_file = utils::get_env("WOLF_PRIVATE_CERT_FILE", "cert.pem");
   auto local_state = initialize(config_file, p_key_file, p_cert_file);
 
-  auto consumers = std::make_shared<::sessions::ConsumerComposition>(local_state->running_sessions);
+  auto consumers = sessions::make_consumer_composition(local_state->running_sessions);
   auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
   // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
   auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
   auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
   // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server, consumers->runtime());
+  auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server, sessions::consumer_runtime(consumers));
   // Setup event handlers for player Lobbies
   auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 

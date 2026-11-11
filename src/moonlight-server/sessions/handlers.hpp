@@ -12,6 +12,10 @@ static constexpr int DEFAULT_SESSION_TIMEOUT_MILLIS = 4000;
 
 using namespace wolf::core;
 
+class ConsumerComposition;
+std::shared_ptr<ConsumerComposition> make_consumer_composition(state::SessionsAtoms);
+std::shared_ptr<streaming::ConsumerRuntime> consumer_runtime(const std::shared_ptr<ConsumerComposition> &);
+
 struct AudioServer {
   std::shared_ptr<audio::Server> server;
   std::optional<docker::Container> container = {};

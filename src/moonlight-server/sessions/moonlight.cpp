@@ -21,7 +21,7 @@ immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server) {
-  auto composition = std::make_shared<::sessions::ConsumerComposition>(app_state->running_sessions);
+  auto composition = std::make_shared<ConsumerComposition>(app_state->running_sessions);
   return setup_moonlight_handlers(app_state, runtime_dir, audio_server, composition->runtime());
 }
 

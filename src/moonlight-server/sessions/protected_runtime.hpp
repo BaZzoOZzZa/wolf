@@ -2,13 +2,16 @@
 #include <array>
 #include <atomic>
 #include <state/data-structures.hpp>
+#include <state/sessions.hpp>
 #include <streaming/consumer_runtime.hpp>
 
 namespace sessions {
-// Transport lifetime only, not permission. Snapshots own identities, never callbacks.
 class ProtectedRuntimeOwner;
+}
+namespace wolf::core::sessions {
+// Transport lifetime only, not permission. Snapshots own identities, never callbacks.
 class ConsumerComposition {
-  friend class ProtectedRuntimeOwner;
+  friend class ::sessions::ProtectedRuntimeOwner;
   struct Lifetimes {
     std::array<streaming::ConnectionScope, 2> scopes;
   };
@@ -26,13 +29,14 @@ public:
   }
   bool contains(const streaming::ConnectionScope &) const;
 };
-} // namespace sessions
+} // namespace wolf::core::sessions
 
 #ifdef __linux__
 #include <sessions/input_handoff.hpp>
 #include <sessions/protected_access.hpp>
 #include <sessions/protected_authority.hpp>
 namespace sessions {
+using ConsumerComposition = wolf::core::sessions::ConsumerComposition;
 struct RuntimeJobTag;
 using RuntimeJobIdentity = wolf::core::sessions::Scope<unsigned, RuntimeJobTag>;
 enum class RuntimeCell {
