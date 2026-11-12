@@ -10,6 +10,7 @@ using namespace wolf::core;
 using namespace moonlight::control;
 using namespace moonlight::control::pkts;
 using namespace std::chrono_literals;
+namespace config = wolf::config;
 namespace diag = wolf::core::sessions::diagnostic;
 namespace ast = wolf::core::audio::startup;
 namespace state {
@@ -27,7 +28,7 @@ parse_apps(const std::vector<config::BaseApp> &,
 }
 namespace {
 events::StreamSession session(bool diagnostic = true) {
-  auto s = events::StreamSession{.app = std::make_shared<events::App>(),
+  auto s = events::StreamSession{.app = std::make_shared<events::App>(events::App{}),
                                  .session_id = 42,
                                  .connection_scope = sessions::ConnectionScope::fresh(42),
                                  .run_scope = sessions::RunScope::fresh("42")};
@@ -176,8 +177,10 @@ TEST_CASE("Actual config parse validates diagnostic before runner construction",
 TEST_CASE("Diagnostic common input ingress refuses all valid types after real V2 decrypt", "[diagnostic]") {
   auto s = session();
   unsigned plugs = 0, combos = 0;
-  auto plug = s.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>([&](auto) { ++plugs; });
-  auto combo = s.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>([&](auto) { ++combos; });
+  auto plug = s.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
+      [&](const immer::box<events::PlugDeviceEvent> &) { ++plugs; });
+  auto combo = s.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
+      [&](const immer::box<events::ClientWolfUIComboEvent> &) { ++combos; });
   auto wires = std::vector<std::string>{bytes(packet<MOUSE_MOVE_REL_PACKET>(MOUSE_MOVE_REL)),
                                         bytes(packet<MOUSE_MOVE_ABS_PACKET>(MOUSE_MOVE_ABS)),
                                         bytes(packet<MOUSE_BUTTON_PACKET>(MOUSE_BUTTON_PRESS)),
@@ -217,7 +220,10 @@ TEST_CASE("Diagnostic common input ingress refuses all valid types after real V2
   for (const auto &wire : wires) {
     REQUIRE(valid_input_packet(wire));
     auto encrypted = encrypt_packet(key, sequence++, wire, EncryptionMode::v2, Direction::client);
-    auto clear = decrypt_packet(to_string(*encrypted), key, EncryptionMode::v2, Direction::client);
+    auto clear = decrypt_packet(std::string(reinterpret_cast<const char *>(encrypted.get()), encrypted->full_size()),
+                                key,
+                                EncryptionMode::v2,
+                                Direction::client);
     CHECK_FALSE(control::handle_input(s, {}, clear)); // SAME ENet/Unix API common call
     CHECK_FALSE(control::handle_input(s, {}, wire.substr(0, wire.size() - 1)));
   }
