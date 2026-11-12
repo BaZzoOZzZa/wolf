@@ -45,13 +45,13 @@ inline boost::future<void> start(const events::App &app, StartupOps ops) {
       ops.mouse();
       ops.keyboard();
     }
-    // RED extraction: preserve the old empty readiness/Wayland continuation.
-    boost::promise<streaming::WaylandDisplayReady> promise;
-    ready = promise.get_future();
-    promise.set_value({});
   }
   if (app.start_audio_server)
     ops.audio();
+  if (!app.start_virtual_compositor) {
+    ops.runner();
+    return {};
+  }
   return ready.then([ops = std::move(ops)](auto future) {
     auto display = future.get();
     ops.bind_wayland(display);
