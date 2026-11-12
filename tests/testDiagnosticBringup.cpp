@@ -1666,6 +1666,14 @@ TEST_CASE("Explicit keyboard mode reuses VK conversion with held modifiers and e
   REQUIRE(control::handle_input(s, peer, bytes(ctrl)));
   key.type = KEY_RELEASE;
   REQUIRE(control::handle_input(s, peer, bytes(key)));
+  auto unsupported = key;
+  unsupported.type = KEY_PRESS;
+  auto unchanged = io.keys.size();
+  for (short vk : {short(0x0c), short(0x7fff)}) { // real exported KEY_CLEAR+8 >255; unmapped VK
+    unsupported.key_code = boost::endian::native_to_little(vk);
+    CHECK_FALSE(control::handle_input(s, peer, bytes(unsupported)));
+    CHECK(io.keys.size() == unchanged);
+  }
   io.focus = 8;
   before = io.keys.size();
   key.type = KEY_PRESS;
@@ -1685,6 +1693,19 @@ TEST_CASE("Explicit keyboard mode reuses VK conversion with held modifiers and e
   CHECK(io.keys.size() == before);
   CHECK_FALSE(s.keyboard->has_value());
   CHECK(sends == 0);
+  DirectIO failed_io;
+  auto failed_backend = direct::WindowInput::bind(failed_io.spec, failed_io.ops(), true);
+  auto failed_session = direct_session(failed_backend);
+  failed_session.app->legacy_keyboard_mouse_trial = true;
+  REQUIRE(control::handle_input(failed_session, peer, bytes(direct_abs())));
+  failed_io.key_ok = false;
+  key.type = KEY_PRESS;
+  key.modifiers = 0;
+  CHECK_FALSE(control::handle_input(failed_session, peer, bytes(key)));
+  CHECK(failed_io.keys == std::vector<std::pair<uint8_t, bool>>{{38, true}, {38, false}});
+  failed_io.key_ok = true;
+  CHECK_FALSE(control::handle_input(failed_session, peer, bytes(key)));
+  CHECK(failed_io.keys.size() == 2);
 }
 
 namespace {
