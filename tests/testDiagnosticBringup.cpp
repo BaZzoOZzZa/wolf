@@ -767,7 +767,9 @@ TEST_CASE("PadOnly trial config defaults and contradictory policy fail before ap
   app.runner = config::AppDocker{};
   CHECK_THROWS_AS(parse(), std::invalid_argument);
   app.legacy_pad_only_trial = false;
-  CHECK_NOTHROW(parse()); // unrelated normal configuration remains permitted
+  CHECK_NOTHROW(diag::validate(app)); // normal Docker policy, without constructing a daemon client
+  app.runner = config::AppCMD{.run_cmd = "unused"};
+  CHECK_NOTHROW(parse()); // actual normal process app construction has no external IO
 }
 
 TEST_CASE("PadOnly trial actual startup has no devices and one runner", "[pad-only-trial]") {

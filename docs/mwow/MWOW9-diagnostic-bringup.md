@@ -175,3 +175,17 @@ or neutral on pause/disconnect. Release controls before disconnect; Manager owns
 No new worker, global singleton or reaper was added. `/dev/uinput` ACL alone does not prove Wine access
 to newly created event/js nodes or game hotplug/mapping; those remain separate supervised runtime checks.
 No `/dev/uhid` permission is needed/requested. Current game/prefix and deployed binaries remain untouched.
+
+### Native trial verification follow-up
+
+Before build, the lobby target guard was corrected to retain the members snapshot for the entire
+iteration. Initial new-fixture compile failed on ambiguous UNKNOWN and generic eventbus lambdas;
+concrete packet namespace/callback types fixed that without changing the original14-case prefix.
+The first targeted8-case run passed assertions but revealed an unintended real Docker GET /version:
+normal config construction still held AppDocker after the trial rejection check. It is NOT counted
+as isolated software-only evidence. The new case now checks normal Docker policy without constructing
+a daemon client, then constructs an actual normal process app. The old unchanged config case has the
+same inherited constructor probe; full-suite execution needs an explicitly approved inaccessible
+Docker socket environment guard. Raw first run remains preserved; no container mutation was attempted.
+Final native/SAN status is recorded in the accompanying thread-storage report, not inferred from this
+historical source checkpoint or from a green assertion count alone.
