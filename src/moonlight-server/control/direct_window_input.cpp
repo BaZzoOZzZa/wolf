@@ -564,7 +564,7 @@ bool WindowInput::text(const wolf::core::sessions::ConnectionScope &source,
       return false;
     }
     auto map = ops_.keymap(connection_.get());
-    if (!map || map->first < 8 || map->last < map->first || !map->columns || map->columns > 32 || map->group > 3 ||
+    if (!map || map->first < 8 || map->last < map->first || !map->columns || map->columns > 32 || map->group > 1 ||
         map->latched || map->locked || map->latched_group || (map->mods & ~XCB_MOD_MASK_SHIFT) ||
         map->symbols.size() != size_t(map->last - map->first + 1) * map->columns)
       return false;

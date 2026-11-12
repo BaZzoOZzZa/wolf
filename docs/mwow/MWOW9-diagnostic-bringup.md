@@ -254,3 +254,7 @@ map. Unsupported/unrepresentable/malformed text refuses without a prefix. This i
 clipboard/paste/IME support. Map/focus changes or IO errors DURING execution may leave a prefix; no automatic
 replay/rollback claim. Current group/map/focus checked before each character; failed owned IO sticks closed.
 No raw text/key-character logs or global keymap changes. Root must test actual iPad/Wine input separately.
+
+TEXT core-map projection is conservatively limited to current group0 or1 base/Shift columns;
+groups>=2 refuse before effects even if a wide core reply contains more symbols. Higher-group XKB
+projection/type semantics are not claimed supported. Existing group1 Cyrillic software case remains.

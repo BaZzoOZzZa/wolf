@@ -1741,6 +1741,15 @@ TEST_CASE("Mapped UTF8 actual decoder preflights whole current layout and effect
   io.layout.group = 1;
   CHECK(control::handle_input(s, peer, direct_text("ф")));
   CHECK(io.keys[io.keys.size() - 2] == std::pair<uint8_t, bool>{38, true});
+  auto supported_layout = io.layout;
+  auto before_unsupported_group = io.keys.size();
+  io.layout.group = 2;
+  io.layout.columns = 8;
+  io.layout.symbols.assign((io.layout.last - io.layout.first + 1) * 8, 0);
+  io.layout.symbols[(38 - io.layout.first) * 8 + 4] = 'a';
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == before_unsupported_group);
+  io.layout = supported_layout;
   io.layout.group = 0;
   io.layout.mods = 1;
   count = io.keys.size();
