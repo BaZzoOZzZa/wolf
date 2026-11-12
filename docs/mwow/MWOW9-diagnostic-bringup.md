@@ -86,3 +86,29 @@ to Manager after review. D29-1 protected-test scheduling follow-up remains separ
 The tracked ENet diff uses zero context to avoid whitespace-only context lines in the patch artifact;
 --unidiff-zero is allowed only after the complete pristine-file SHA check, then exact post-hash verification.
 No fuzzy or unknown-source application is permitted.
+
+## Actual custom audio GObject lifetime correction (after 6007 live replay)
+
+The next Manager-owned live replay reached AudioSession but failed in aes_iv string assignment:
+GObject's C allocation does not construct embedded std::string aes_key/aes_iv or shared rs_ptr.
+Instance init now explicitly constructs all three before assignment/property access; finalize destroys
+all three once. Repeated dispose exchanges the shard matrix to null before deletion. Shard/RS preparation
+uses temporary RAII owners; a caught allocation failure leaves a destructible instance whose actual output
+path fails closed. This does not establish general allocation/exception safety across GObject callbacks:
+property string allocations, GLib allocation failures and upstream RS internals retain their existing limits.
+AES defaults, key/IV use, RTP/FEC and wire behavior are unchanged. No encryption/audio/SAN workaround.
+
+New isolated tests instantiate the ACTUAL custom audio GType, properties, repeated dispose and finalize,
+observe real RS owner expiration, then run a bounded real appsrc → statically registered custom audio
+payloader → appsink pipeline. Four dummy encoded buffers exercise AES roundtrip plus two FEC outputs;
+invalid-key production split helper remains fail-closed. This deliberately expands earlier core-only
+fixtures: linked app types and the custom static plugin are exercised, registry scanning disabled; no
+external plugin, socket, sound device, main or live session. Existing ten diagnostic test bodies preserved.
+Software output is not actual audio/video network delivery; Manager replay after review remains required.
+
+Adjacent read-only audit: video GObject instance contains only scalar fields beyond its C base, so the
+same nontrivial-member construction defect is not present there. No video source changes. Audio packet
+size limits, property concurrency, general callback exception safety and output flow propagation are not
+claimed audited/closed by this lifetime change. Manager's orphan sleep600 inheriting listener FDs is a
+SEPARATE observed process-runner residual: no process.cpp fix here; diagnostic wrapper cleanup remains
+Manager-owned. D29-1, mDNS alignment mitigation and previous live/physical/isolation gates remain open.

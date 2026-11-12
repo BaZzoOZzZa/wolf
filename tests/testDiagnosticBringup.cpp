@@ -452,3 +452,171 @@ TEST_CASE("Pinned actual ENet header offset and wire layout remain unchanged", "
   CHECK(offsetof(ENetProtocolHeader, sentTime) == sizeof(enet_uint16));
   CHECK(sizeof(ENetProtocolHeader) == 2 * sizeof(enet_uint16));
 }
+
+#include <gst-plugin/audio.hpp>
+#include <gst/app/gstappsink.h>
+#include <gst/app/gstappsrc.h>
+GST_PLUGIN_STATIC_DECLARE(rtpmoonlightpay_audio);
+namespace {
+void diagnostic_audio_gst() {
+  static const bool initialized = [] {
+    g_setenv("GST_PLUGIN_SYSTEM_PATH_1_0", "", TRUE);
+    g_setenv("GST_PLUGIN_PATH_1_0", "", TRUE);
+    g_setenv("GST_REGISTRY_UPDATE", "no", TRUE);
+    if (!gst_init_check(nullptr, nullptr, nullptr))
+      return false;
+    moonlight::fec::init();
+    GST_PLUGIN_STATIC_REGISTER(rtpmoonlightpay_audio);
+    return true;
+  }();
+  REQUIRE(initialized);
+  guint major, minor, micro, nano;
+  gst_version(&major, &minor, &micro, &nano);
+  REQUIRE(major == 1);
+  REQUIRE(minor == 28);
+  REQUIRE(micro == 7);
+  auto plugins = gst_registry_get_plugin_list(gst_registry_get());
+  for (auto item = plugins; item; item = item->next) {
+    auto plugin = GST_PLUGIN(item->data);
+    if (gst_plugin_is_loaded(plugin)) {
+      const std::string name = gst_plugin_get_name(plugin);
+      CHECK((name == "staticelements" || name == "rtpmoonlightpay_audio"));
+    }
+  }
+  gst_plugin_list_free(plugins);
+}
+struct AudioObject {
+  GstElement *value;
+  ~AudioObject() {
+    if (value)
+      gst_object_unref(value);
+  }
+};
+struct AudioPipeline {
+  GstElement *value = gst_pipeline_new(nullptr);
+  ~AudioPipeline() {
+    if (value) {
+      gst_element_set_state(value, GST_STATE_NULL);
+      gst_object_unref(value);
+    }
+  }
+};
+} // namespace
+
+TEST_CASE("Actual audio GObject constructs properties and finalizes C++ owners after repeated dispose",
+          "[diagnostic][audio-lifetime]") {
+  diagnostic_audio_gst();
+  for (int iteration = 0; iteration < 8; ++iteration) {
+    AudioObject object{GST_ELEMENT(g_object_new(gst_TYPE_rtp_moonlight_pay_audio,
+                                                "aes-key",
+                                                "00112233445566778899aabbccddeeff",
+                                                "aes-iv",
+                                                "1234567890123456789",
+                                                nullptr))};
+    REQUIRE(object.value);
+    auto pay = gst_rtp_moonlight_pay_audio(object.value);
+    REQUIRE(pay->rs);
+    REQUIRE(pay->packets_buffer);
+    std::weak_ptr<reed_solomon> rs = pay->rs;
+    CHECK(pay->aes_key == crypto::hex_to_str("00112233445566778899aabbccddeeff", true));
+    gchar *iv = nullptr;
+    gboolean encrypt = false;
+    gint duration = 0;
+    g_object_get(object.value, "aes-iv", &iv, "encrypt", &encrypt, "packet-duration", &duration, nullptr);
+    std::unique_ptr<gchar, decltype(&g_free)> iv_owner(iv, g_free);
+    REQUIRE(iv);
+    CHECK(std::string(iv) == "1234567890123456789");
+    CHECK(encrypt);
+    CHECK(duration == 5);
+    g_object_run_dispose(G_OBJECT(object.value));
+    CHECK(pay->packets_buffer == nullptr);
+    g_object_run_dispose(G_OBJECT(object.value));
+    CHECK(pay->packets_buffer == nullptr);
+    CHECK_FALSE(rs.expired()); // C++ properties/state remain alive until finalize.
+    g_object_set(object.value, "aes-iv", "17", nullptr);
+    CHECK(pay->aes_iv == "17");
+    gst_object_unref(std::exchange(object.value, nullptr));
+    CHECK(rs.expired()); // actual finalize released RS, not merely dispose entry.
+  }
+}
+
+TEST_CASE("Actual static audio payloader pipeline encrypts four buffers and emits two FEC packets",
+          "[diagnostic][audio-lifetime]") {
+  diagnostic_audio_gst();
+  AudioPipeline pipeline;
+  REQUIRE(pipeline.value);
+  auto src = GST_ELEMENT(g_object_new(GST_TYPE_APP_SRC, "format", GST_FORMAT_TIME, nullptr));
+  gst_bin_add(GST_BIN(pipeline.value), src);
+  auto pay = gst_element_factory_make("rtpmoonlightpay_audio", nullptr);
+  REQUIRE(pay);
+  gst_bin_add(GST_BIN(pipeline.value), pay);
+  auto sink = GST_ELEMENT(g_object_new(GST_TYPE_APP_SINK, "sync", FALSE, "async", FALSE, "max-buffers", 8u, nullptr));
+  gst_bin_add(GST_BIN(pipeline.value), sink);
+  const auto key = crypto::hex_to_str("00112233445566778899aabbccddeeff", true);
+  g_object_set(pay, "aes-key", "00112233445566778899aabbccddeeff", "aes-iv", "17", "encrypt", TRUE, nullptr);
+  auto caps = gst_caps_new_empty_simple("application/octet-stream");
+  gst_app_src_set_caps(GST_APP_SRC(src), caps);
+  gst_caps_unref(caps);
+  REQUIRE(gst_element_link_many(src, pay, sink, nullptr));
+  std::weak_ptr<reed_solomon> rs = gst_rtp_moonlight_pay_audio(pay)->rs;
+  REQUIRE(gst_element_set_state(pipeline.value, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE);
+  const std::string payload = "bounded dummy encoded audio";
+  for (unsigned i = 0; i < 4; ++i) {
+    auto buffer = gst_buffer_new_allocate(nullptr, payload.size(), nullptr);
+    gst_buffer_fill(buffer, 0, payload.data(), payload.size());
+    GST_BUFFER_PTS(buffer) = i * 5 * GST_MSECOND;
+    GST_BUFFER_DURATION(buffer) = 5 * GST_MSECOND;
+    REQUIRE(gst_app_src_push_buffer(GST_APP_SRC(src), buffer) == GST_FLOW_OK);
+  }
+  REQUIRE(gst_app_src_end_of_stream(GST_APP_SRC(src)) == GST_FLOW_OK);
+  for (unsigned i = 0; i < 6; ++i) {
+    auto sample = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 2 * GST_SECOND);
+    std::unique_ptr<GstSample, decltype(&gst_sample_unref)> owner(sample, gst_sample_unref);
+    REQUIRE(sample);
+    auto buffer = gst_sample_get_buffer(sample);
+    REQUIRE(buffer);
+    const auto bytes = gst_buffer_copy_content(buffer);
+    if (i < 4) {
+      REQUIRE(bytes.size() > audio::RTP_HEADER_SIZE);
+      audio::AudioRTPHeaders header{};
+      memcpy(&header, bytes.data(), sizeof(header));
+      CHECK(header.rtp.packetType == 97);
+      CHECK(boost::endian::big_to_native(header.rtp.sequenceNumber) == i);
+      CHECK(boost::endian::big_to_native(header.rtp.timestamp) == i * 5);
+      const std::string ciphertext(bytes.begin() + audio::RTP_HEADER_SIZE, bytes.end());
+      CHECK(ciphertext != payload);
+      CHECK(crypto::aes_decrypt_cbc(ciphertext, key, derive_iv("17", i), true) == payload);
+    } else {
+      REQUIRE(bytes.size() > audio::FEC_HEADER_SIZE);
+      audio::AudioFECPacket header{};
+      memcpy(&header, bytes.data(), sizeof(header));
+      CHECK(header.rtp.packetType == 127);
+      CHECK(header.fec_header.fecShardIndex == i - 4);
+      CHECK(header.fec_header.baseSequenceNumber == 0);
+      CHECK(header.fec_header.payloadType == 97);
+    }
+  }
+  auto extra = gst_app_sink_try_pull_sample(GST_APP_SINK(sink), 2 * GST_SECOND);
+  if (extra)
+    gst_sample_unref(extra);
+  CHECK(extra == nullptr);
+  CHECK(gst_app_sink_is_eos(GST_APP_SINK(sink)));
+  REQUIRE(gst_element_set_state(pipeline.value, GST_STATE_NULL) != GST_STATE_CHANGE_FAILURE);
+  gst_object_unref(std::exchange(pipeline.value, nullptr));
+  CHECK(rs.expired());
+}
+
+TEST_CASE("Actual audio payloader keeps encryption failure closed", "[diagnostic][audio-lifetime]") {
+  diagnostic_audio_gst();
+  AudioObject object{
+      GST_ELEMENT(g_object_new(gst_TYPE_rtp_moonlight_pay_audio, "aes-key", "00", "aes-iv", "17", nullptr))};
+  auto pay = gst_rtp_moonlight_pay_audio(object.value);
+  auto buffer = gst_buffer_new_and_fill(16, 1);
+  std::unique_ptr<GstBuffer, decltype(&gst_buffer_unref)> owner(buffer, gst_buffer_unref);
+  auto packets = audio::split_into_rtp(pay, buffer);
+  std::unique_ptr<GstBufferList, decltype(&gst_buffer_list_unref)> packet_owner(packets, gst_buffer_list_unref);
+  CHECK(gst_buffer_list_length(packets) == 0);
+  CHECK(pay->encrypt);
+  CHECK(pay->encrypt_failed);
+  CHECK(pay->cur_seq_number == 0);
+}
