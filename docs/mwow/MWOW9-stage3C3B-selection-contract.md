@@ -227,3 +227,51 @@ No WoW/game/prefix/device/network/service operation is authorized here. WoW requ
 AFTER readiness; arrival is not a trigger. Future physical tests prefer local games under separate grant.
 UI/HUD requires Penpot. Full allroutes/singleton/DeviceExecutor/reconciliation/isolation, config writer
 coverage and protocol interoperability remain enable gates. No ready-by-arrival ETA or full MVP claim.
+
+## 5. B1 implementation checkpoint (disabled; D26 conditions)
+
+The implementation uses a structured authority-publication alternative in the existing Runtime Retirement
+cell, not generic RuntimeJob::retire forwarding. An independent latched execution-failure condition
+preserves all generic Unknown guards; facts-only completion after permission closure requires a healthy
+owned worker and no occupied/unproved cleanup. It never clears Seat/media quarantine or grants readiness.
+Pairing owner prepares a single coherent source/revision/seal/Facts tuple before Runtime bootstrap; update
+transactions bind owner, sequence, expected source and exact resulting publication. The persistence
+operation in B1 is explicitly an injected software contract, not real TOML IO or durability evidence.
+
+Owner/queue mutexes protect bounded bookkeeping only; release before actual Seat calls, verification,
+provider invocation or arbitrary destruction. Typed completion follows actual full command/provider
+retirement, then a separate owner sequence check permits tuple exchange. Reserved close invalidates
+both phases using retained exact old/prepared facts; no global-current fallback. Runtime commands never
+own PairingMutationOwner. Historical publication observations retain data only, not callback payloads.
+Implementation evidence/tests/results will be linked in the scoped B1 report; B2 and all enable gates stay pending.
+
+Implemented interface: `PairingMutationOwner` lifecycle bootstrap installs the revision/Facts before
+starting the same ProtectedRuntimeOwner. `begin_update/prepare/ready/submit/poll/close_exact` separate
+observation, queue acceptance, full command retirement and tuple publication. `capture_https` consumes
+one exact publication; `capture_selection` accepts its actual sealed identity and calls the new expected
+Facts/Pairing overload. Both actual gate sections validate those identities. The optional CaptureProbe
+is borrowed synchronous test synchronization after evaluation, outside locks, with no authority result.
+
+D26 execution health is separately latched on actual start/worker/job failures. Typed publication refuses
+occupied generic cells, authority/admission cleanup, failed/incomplete neutral or terminal listener state;
+it also inspects at most two exact consumer scopes plus the retained old data-only ticket for observed
+Unknown/Failed/broken completion. No missing record is used as release evidence. A healthy in-flight old
+consumer may still drain: permission closure and facts publication do not complete its ticket or reopen
+anything. Checks are observations, not an atomic guarantee against future physical/kernel/driver failure.
+
+The one typed command uses the existing Retirement cell and 64KiB logical accounting (including fixed
+health references/receipt/transaction). Publication DER/PEM has the separate stated per-publication caps;
+external persistent config settings graphs, provider-owned external resources, allocator overhead and RSS
+are not included in that logical job charge. Provider must not own the Pairing owner/Runtime or call back
+through an owning cycle; no built-in command contains that back-reference. Its owned destructor completes
+before final receipt. A new resource deliberately transferred into authority remains lifecycle-owned;
+completion concerns old-resource and temporary command/provider retirement, not destruction of new facts.
+The B1 PersistenceOutcome is transaction-bound software-seam evidence ONLY. No positive real persistence
+adapter, config write, endpoint registration or enabled protected route exists. Allocation/throwing C++
+destructor and physical termination guarantees are not invented; no global allocation-fault injection.
+
+B1 review evidence: [scoped report](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-stage3C3B1.md)
+with exact source/run bindings and preserved failures; [manifest](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/checks/3C3B1/manifest.json).
+Targeted software fixture covers 16 cases/266 assertions before freeze; final source-bound checks are
+reported separately there. No semantic RED is claimed for this new feature. Independent review is required
+before B2; source/config writer enclosure and every protocol/device/enable gate in §2–4 remain unchanged.

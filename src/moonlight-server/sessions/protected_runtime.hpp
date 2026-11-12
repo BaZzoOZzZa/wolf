@@ -34,6 +34,10 @@ public:
 #include <sessions/input_handoff.hpp>
 #include <sessions/protected_access.hpp>
 #include <sessions/protected_authority.hpp>
+namespace sessions::protected_pairing {
+class PublicationCommand;
+class PairingMutationOwner;
+} // namespace sessions::protected_pairing
 namespace sessions {
 using ConsumerComposition = wolf::core::sessions::ConsumerComposition;
 struct RuntimeJobTag;
@@ -115,6 +119,13 @@ class ProtectedRuntimeOwner {
   bool attempted_ = false; // lifecycle owner only
   std::atomic_bool joined_{false};
   void run();
+  friend class protected_pairing::PairingMutationOwner;
+  protected_authority::UpdateResult begin_authority_update(const protected_authority::OperatorCapability &,
+                                                           const protected_authority::FactHandle &);
+  bool consumer_execution_known() const; // diagnostic faults only, never transport permission/completion
+  bool publication_ready(const protected_authority::OperatorCapability &,
+                         const std::shared_ptr<const protected_authority::UpdateToken> &) const;
+  RuntimeSubmission submit_publication(std::unique_ptr<protected_pairing::PublicationCommand>);
 
 public:
   explicit ProtectedRuntimeOwner(std::shared_ptr<ConsumerComposition>,
@@ -128,6 +139,11 @@ public:
   std::shared_ptr<const TransferHandle> transfer() const; // historical diagnostic, not authority
   control::GrantHandle current() const;
   protected_authority::PermitHandle capture(const control::SeatCandidate &, const protected_access::Principal &) const;
+  protected_authority::PermitHandle capture(const control::SeatCandidate &,
+                                            const protected_access::Principal &,
+                                            const protected_authority::FactHandle &,
+                                            const protected_authority::PairingRevision &,
+                                            protected_authority::CaptureProbe = {}) const;
   bool close_exact(const control::ConnectionScope &, const control::PeerToken &);
   bool close_exact(const protected_authority::OperatorCapability &, const protected_authority::FactHandle &);
   void request_stop();

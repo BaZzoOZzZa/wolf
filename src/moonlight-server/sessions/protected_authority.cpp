@@ -110,13 +110,22 @@ Status ProtectedAuthorityDomain::status() const {
 }
 PermitHandle ProtectedAuthorityDomain::capture_selection(const control::SeatCandidate &candidate,
                                                          const access::Principal &principal) const {
+  auto expected = facts();
+  return capture_selection(candidate, principal, expected, expected ? expected->pairing : PairingRevision{});
+}
+PermitHandle ProtectedAuthorityDomain::capture_selection(const control::SeatCandidate &candidate,
+                                                         const access::Principal &principal,
+                                                         const FactHandle &expected,
+                                                         const PairingRevision &pairing,
+                                                         CaptureProbe probe) const {
   FactHandle captured;
   control::DeviceGeneration device;
   uint64_t seq;
   const auto &c = *gate_->authority;
   {
     std::lock_guard lock(gate_->mutex);
-    if (c.closed_ || gate_->quarantined || !gate_->device.matches(gate_->device))
+    if (!expected || !pairing || c.facts_ != expected || !expected->pairing.matches(pairing) || c.closed_ ||
+        gate_->quarantined || !gate_->device.matches(gate_->device))
       return {};
     captured = c.facts_;
     device = gate_->device;
@@ -125,6 +134,8 @@ PermitHandle ProtectedAuthorityDomain::capture_selection(const control::SeatCand
   if (!candidate.valid() || !candidate.destination.matches(captured->target_run))
     return {};
   auto evaluated = captured->evaluate(principal);
+  if (probe.after_evaluation)
+    probe.after_evaluation(probe.context); // test synchronization only, outside both gate sections
   if (evaluated.result != access::Result::Allowed)
     return {};
   auto permit = PermitHandle(new Permit(c.domain_,
@@ -134,7 +145,24 @@ PermitHandle ProtectedAuthorityDomain::capture_selection(const control::SeatCand
                                         candidate,
                                         device));
   std::lock_guard lock(gate_->mutex);
-  return !gate_->quarantined && c.permits_locked(permit, candidate, gate_->device) ? permit : nullptr;
+  return c.facts_ == expected && expected->pairing.matches(pairing) && !gate_->quarantined &&
+                 c.permits_locked(permit, candidate, gate_->device)
+             ? permit
+             : nullptr;
+}
+bool ProtectedAuthorityDomain::publication_ready(const OperatorCapability &op,
+                                                 const std::shared_ptr<const UpdateToken> &token) const {
+  std::lock_guard lock(gate_->mutex);
+  const auto &c = *gate_->authority;
+  const auto &g = *gate_;
+  if (!seat_ || !token || !op.matches(c.operator_) || token != c.update_ || !token->domain_.matches(c.domain_) ||
+      token->sequence_ != c.sequence_ || token->expected_ != c.facts_ || c.sequence_exhausted_ || c.cleanup_locked() ||
+      g.shutdown || g.bootstrap || g.writing || g.sends || g.neutral_running || g.neutral_requested ||
+      !g.neutral_done || !g.neutral || g.admission_cleanup_pending || g.admission_cleanup_owner)
+    return false;
+  const auto listener = seat_->backend_->listener_status();
+  return !listener.failed && !listener.stop_requested && g.device.matches(seat_->backend_->generation()) &&
+         g.neutral->generation.matches(g.device);
 }
 UpdateResult ProtectedAuthorityDomain::begin_update(const OperatorCapability &cap, const FactHandle &expected) {
   // Fresh token allocation before gate. No callback/payload owns this token.

@@ -189,6 +189,11 @@ public:
 // Trusted C++ capability owner, not a TLS implementation or wire permission.
 // create_seat/start/destruction are single lifecycle-owner operations. All other
 // calls may race; slow preparation/publication retirement must stay off ingress.
+// Optional synchronous internal scheduling probe; no retained capture/permission value.
+struct CaptureProbe {
+  void *context = nullptr;
+  void (*after_evaluation)(void *) = nullptr;
+};
 class ProtectedAuthorityDomain {
   const std::shared_ptr<control::seat_detail::Gate> gate_;
   std::shared_ptr<control::InputSeat> seat_;
@@ -210,6 +215,13 @@ public:
   PermitHandle route() const; // historical binding inspection, never permission
   Status status() const;
   PermitHandle capture_selection(const control::SeatCandidate &, const access::Principal &) const;
+  PermitHandle capture_selection(const control::SeatCandidate &,
+                                 const access::Principal &,
+                                 const FactHandle &expected,
+                                 const PairingRevision &,
+                                 CaptureProbe = {}) const;
+  // Typed facts-only execution prerequisite, not permission or a recovery proof.
+  bool publication_ready(const OperatorCapability &, const std::shared_ptr<const UpdateToken> &) const;
   UpdateResult begin_update(const OperatorCapability &, const FactHandle &expected);
   bool close_exact(const OperatorCapability &, const FactHandle &expected);
   bool close_exact(const control::ConnectionScope &, const control::PeerToken &);

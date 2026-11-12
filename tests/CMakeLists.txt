@@ -308,3 +308,12 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-protected-identity-tests COMMAND wolf-protected-identity-tests)
     set_tests_properties(wolf-protected-identity-tests PROPERTIES LABELS "security;isolated" TIMEOUT 45)
 endif ()
+
+# Disabled pairing publication bridge; real authority/Runtime, injected IO only.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-protected-pairing-tests testProtectedPairing.cpp)
+    target_compile_features(wolf-protected-pairing-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-protected-pairing-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+    add_test(NAME wolf-protected-pairing-tests COMMAND wolf-protected-pairing-tests)
+    set_tests_properties(wolf-protected-pairing-tests PROPERTIES LABELS "security;isolated" TIMEOUT 90)
+endif ()
