@@ -513,8 +513,13 @@ ProtectedRuntimeOwner::~ProtectedRuntimeOwner() {
   if (worker_.joinable())
     worker_.join();
   // Payload retirement may inspect the still-live bundle. Never hold queue lock.
-  for (auto &cell : state_->cells)
+  for (auto &cell : state_->cells) {
     cell.job.reset();
+    // Failed/Unknown and queued-on-stop typed payloads have the same borrowed
+    // inspection contract. Retire while bookkeeping and the full bundle live;
+    // this lifecycle release does not clear occupancy or acknowledge success.
+    cell.publication.reset();
+  }
   if (state_->probe)
     state_->probe->before_bundle_teardown();
   // Probe captures retire while State is complete, never a per-call last release.

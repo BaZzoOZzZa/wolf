@@ -74,7 +74,7 @@ PairingMutationOwner::PairingMutationOwner(std::shared_ptr<ProtectedRuntimeOwner
   if (!runtime_ || !op_ || !limit || game_.empty() || app_.empty() || clients.empty())
     throw std::invalid_argument("Unresolved pairing bootstrap");
   current_ = prepare_publication(clients, rules, bootstrap.initial.destination, authority::PairingRevision::fresh(0));
-  if (!current_)
+  if (!current_ || !current_->sealed.contains(bootstrap.principal))
     throw std::invalid_argument("Invalid bounded pairing publication");
   bootstrap.facts.facts = current_->facts; // revision installed BEFORE actual protected Seat bootstrap
   if (!runtime_->start(std::move(bootstrap)))

@@ -64,6 +64,14 @@ PairingRevision PairedSnapshot::revision() const {
 std::size_t PairedSnapshot::size() const {
   return data_ ? data_->records.size() : 0;
 }
+bool PairedSnapshot::contains(const access::Principal &principal) const {
+  if (!data_ || !principal)
+    return false;
+  for (const auto &record : data_->records)
+    if (record.numeric == principal.numeric_index() && record.leaf.matches(principal.leaf()))
+      return true;
+  return false;
+}
 namespace {
 // Reconstitute ephemeral verifier objects ONLY from already bounded canonical DER.
 // No mutable X509 aliases survive capture; reuse the public verifier via Principal.

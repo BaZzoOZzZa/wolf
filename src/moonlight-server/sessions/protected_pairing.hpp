@@ -96,7 +96,9 @@ public:
   PersistenceOutcome outcome(PersistenceResult) const;
   bool matches(const PersistenceOutcome &) const;
 };
-// Trusted provider may own persistence resources, NEVER this owner/Runtime or a callback back to them.
+// Trusted provider may own persistence resources, NEVER an owning back-reference to this owner/Runtime.
+// Synchronous borrowed Runtime status/current inspection during live-bundle retirement is allowed;
+// concurrent facade destruction, lifecycle teardown reentry and owning callback cycles are not.
 // Destruction must be noexcept; arbitrary external capture graphs are outside the logical byte cap.
 struct PersistenceOperation {
   virtual ~PersistenceOperation() = default;

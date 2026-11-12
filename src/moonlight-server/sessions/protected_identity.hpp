@@ -50,6 +50,9 @@ public:
   seal(const state::PairedClientList &, PairingRevision, Indexers = Indexers::defaults()) noexcept;
   PairingRevision revision() const;
   std::size_t size() const;
+  // Data-only sealed membership: full DER and matching numeric metadata.
+  // Historical snapshot membership is not current authority or TLS possession.
+  bool contains(const access::Principal &) const;
 };
 class VerifiedHttpsIdentity {
   access::Leaf presented_, paired_;

@@ -275,3 +275,48 @@ with exact source/run bindings and preserved failures; [manifest](/home/bazzoozz
 Targeted software fixture covers 16 cases/266 assertions before freeze; final source-bound checks are
 reported separately there. No semantic RED is claimed for this new feature. Independent review is required
 before B2; source/config writer enclosure and every protocol/device/enable gate in §2–4 remain unchanged.
+
+
+## 6. F17/F18 correction checkpoint (disabled B1)
+
+F17: initial PairingMutationOwner checks the initial Principal against the SAME freshly prepared
+Publication.sealed before calling Runtime.start. PairedSnapshot::contains is a bounded, data-only
+comparison of frozen full DER plus consistent numeric metadata; a null Principal/snapshot fails closed.
+It performs no parsing, verification, mutation, callback or revision retag. This is sealed membership,
+not TLS possession, current-pairing revocation atomicity or a second GameACL evaluator. Existing
+Authority bootstrap still enforces its actual Facts/ACL and target. A historical B allowed by ACL but
+absent from the current pairing A, same-key reissued B, and numeric mismatch are denied before backend
+or listener/worker effects. Exact-current A remains the positive case.
+
+F18: after actual orchestration worker join, lifecycle teardown explicitly resets BOTH generic jobs
+and typed PublicationCommands outside all locks, before Handoff/Seat/Authority or State bookkeeping
+leave lifetime. Failed/Unknown and queued-on-stop typed commands stay occupied/Unknown until this
+terminal cleanup; release does not set Complete, clear quarantine, retry publication or reopen a slot.
+The provider contract permits synchronous borrowed status/current inspection while that bundle is live;
+owning back-reference cycles, concurrent facade destruction and lifecycle teardown reentry remain
+prohibited. Such inspection is not permission or successful retirement of a failed operation.
+
+The existing immutable RuntimeInspectionProbe gains default-empty before_worker_run and
+before_bundle_teardown hooks: deterministic test scheduling and a lifecycle marker only. They execute
+outside locks; the probe is retained once, not copied/released per call (F16 preserved). The marker is
+not an ACK. RED tests first observe the actual bundle boundary using an externally owned atomic sentinel;
+if retirement occurs late they assert the ordering failure WITHOUT dereferencing the ended Runtime.
+GREEN permits actual borrowed status/current reentry only while the sentinel proves the bundle live.
+Provider and PreparedFacts resource are independently checked, including Failed, Unknown, throw and a
+queued command stopped before execution. Thread launch throw/nonjoinable paths cannot accept a typed
+command: started remains false and the submit guard refuses. This reachability limit is source-backed;
+there is no invented typed command at failed launch and no allocation-fault claim.
+
+Audit: healthy typed run already destroys outcome temporaries and command before Complete; failed run
+retains the exact cell, and rejected submit destroys its by-value command after lock guards unwind.
+Constructor failure before Runtime.start has no backend effects; failed Runtime.start retains its cap.
+New destructor cleanup covers every retained cell after join without changing these guards or counters.
+No Authority/Seat/Handoff/ConsumerRuntime/legacy/ingress/dependency/CMake code changes are included.
+
+Evidence: [F17/F18 report](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F17-F18.md)
+and [manifest](/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/checks/F17F18/manifest.json).
+The committed RED regression checkpoint produces 3 failing cases/23 failed assertions (4 cases total),
+not a crash or sanitizer failure. Identical test bytes are required for GREEN; final source-bound checks
+are recorded in the report. B1 still requires independent re-review; B2, real persistence, TLS/selection,
+all routes, provisioning/isolation and live validation remain separate gates. No WoW launch is authorized
+by this checkpoint or by arrival; a new explicit command after readiness is required.
