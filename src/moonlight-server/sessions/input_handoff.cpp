@@ -171,6 +171,12 @@ bool InputHandoff::drain_complete(const std::optional<streaming::ConsumerDrainTi
                                   const control::ConnectionScope &scope) {
   return ticket && ticket->connection.matches(scope) && ticket->complete();
 }
+std::optional<TransferObservation> InputHandoff::observe() const {
+  std::lock_guard lock(seat_->gate_->mutex);
+  if (!pending_)
+    return {};
+  return TransferObservation{pending_->identity, pending_->status()};
+}
 void InputHandoff::poll_deadline() {
   std::lock_guard lock(seat_->gate_->mutex);
   if (!pending_ || pending_->status() != TransferStatus::Pending)

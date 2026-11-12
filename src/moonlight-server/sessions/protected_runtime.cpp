@@ -139,11 +139,12 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
   auto receipt = std::make_shared<RuntimeReceipt>();
   receipt->identity = RuntimeJobIdentity::fresh(unsigned(job->cell));
   std::shared_ptr<RuntimeReceipt> retired;
-  std::shared_ptr<const TransferHandle> observed;
+  // Observe under Seat gate BEFORE queue lock; never retain a validator owner
+  // across queue publication, notification or caller return.
+  const auto observed = s.handoff ? s.handoff->observe() : std::optional<TransferObservation>{};
   {
     std::lock_guard lock(s.mutex);
-    observed = s.transfer.lock();
-    if (observed && observed->status() == TransferStatus::Quarantined)
+    if (observed && observed->status == TransferStatus::Quarantined)
       s.unknown = true;
     if (!s.started || s.stop || s.unknown)
       return {RuntimeSubmission::Closed, {}};
@@ -296,12 +297,11 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
   // timer if all callers (including the existing supervisor) are blocked/idle.
   if (s.handoff)
     s.handoff->poll_deadline();
-  std::shared_ptr<const TransferHandle> observed;
+  const auto observed = s.handoff ? s.handoff->observe() : std::optional<TransferObservation>{};
   RuntimeOwnerStatus result{};
   const bool authority_unknown = s.authority && s.authority->status().quarantined;
   {
     std::lock_guard lock(s.mutex);
-    observed = s.transfer.lock();
     size_t occupied = 0;
     for (const auto &c : s.cells)
       occupied += c.occupied;
@@ -309,8 +309,7 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
   }
   if (s.probe)
     s.probe->after_status_inspection();
-  result.unknown = result.unknown || authority_unknown ||
-                   (observed && observed->status() == TransferStatus::Quarantined);
+  result.unknown = result.unknown || authority_unknown || (observed && observed->status == TransferStatus::Quarantined);
   return result;
 }
 std::shared_ptr<const TransferHandle> ProtectedRuntimeOwner::transfer() const {

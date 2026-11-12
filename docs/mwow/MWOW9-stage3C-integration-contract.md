@@ -475,3 +475,15 @@ teardown after worker join, outside locks; no per-call hook capture cleanup. Pro
 owner strongly and tests keep synchronization owners alive through all joined calls. Production never
 installs it. The seam schedules actual H1 sole-validator retirement versus H2 request; it is not itself
 completion evidence. RED preserves the old strong-observation decisions; GREEN changes only observation.
+
+F16 implementation: actual InputHandoff::observe() returns optional TransferObservation under the
+same Seat gate, copying only TransferToken and enum status. submit/status use it before queue lock;
+neither obtains a strong TransferHandle. No callbacks/clock/Runtime/IO/allocation are performed by
+observe. Existing actual authority/phase/cap/failure checks remain; these historical diagnostics do
+not authorize effects. Remaining weak.lock sites are explicit external transfer() and phase-charged
+media execution; request result owners retire before preparation cell release. Deadline/status
+remain responsive during replacement capture retirement; no internal observer can delay its ACK.
+Probe ownership resets on lifecycle owner after worker join, while full State remains valid for
+reentrant destruction, before State field teardown. Actual test schedules use no external strong H1
+handle/validator owner and retain all gates through joins. Exact semantic RED/GREEN/test hashes and
+final native evidence are in `/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F16.md`.

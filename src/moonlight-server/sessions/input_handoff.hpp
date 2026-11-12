@@ -10,6 +10,12 @@ enum class TransferStatus {
   Granted,
   Quarantined
 };
+// Payload-free historical observation: this token retains only its empty scope
+// allocation identity, never TransferHandle, validator, facts, Work or ticket.
+struct TransferObservation {
+  TransferToken identity;
+  TransferStatus status;
+};
 enum class TransferAdmission {
   Accepted,
   Duplicate,
@@ -75,6 +81,7 @@ public:
   // nonblocking and nonreentrant; clock exceptions quarantine the exact Pending.
   // Progress requires a caller/tick; this is not an autonomous timer guarantee.
   void poll_deadline();
+  std::optional<TransferObservation> observe() const; // same Gate; no callbacks/IO/authority effect
   bool candidate_gone(const control::ConnectionScope &, const control::PeerToken &);
   // Inspection only; execution must use admit_prepared under the serial gate.
   bool prepared_admission(const std::shared_ptr<const TransferHandle> &,
