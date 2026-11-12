@@ -456,7 +456,9 @@ TEST_CASE("Pinned actual ENet header offset and wire layout remain unchanged", "
 #include <gst-plugin/audio.hpp>
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
+extern "C" {
 GST_PLUGIN_STATIC_DECLARE(rtpmoonlightpay_audio);
+}
 namespace {
 void diagnostic_audio_gst() {
   static const bool initialized = [] {
