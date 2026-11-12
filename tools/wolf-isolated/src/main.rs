@@ -1,6 +1,24 @@
 use std::{env, path::Path, process::ExitCode};
 fn main() -> ExitCode {
     let args: Vec<_> = env::args().collect();
+    if args.len() == 4 && matches!(args[1].as_str(), "start" | "status" | "stop") {
+        return match wolf_isolated::supervisor::command(&args[1], &args[2], &args[3]) {
+            Ok(view) => {
+                println!("{}", serde_json::to_string(&view).unwrap());
+                if view.phase == wolf_isolated::runtime::Phase::Unknown {
+                    ExitCode::from(4)
+                } else if view.phase == wolf_isolated::runtime::Phase::Refused {
+                    ExitCode::from(3)
+                } else {
+                    ExitCode::SUCCESS
+                }
+            }
+            Err(_) => {
+                eprintln!("runtime not provisioned, busy or ownership unknown; no new grant");
+                ExitCode::from(3)
+            }
+        };
+    }
     if args.len() == 2 && matches!(args[1].as_str(), "start" | "status" | "stop") {
         println!("{{\"runtime_supported\":false,\"error\":\"runtime_stage_not_implemented\"}}");
         return ExitCode::from(3);

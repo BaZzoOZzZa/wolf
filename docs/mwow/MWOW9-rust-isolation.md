@@ -299,3 +299,32 @@ create-history Unknown; foreign/ABA stop refusal; native exit alone never Stoppe
 operation in outer adapter; concurrent launch blocked; unowned Minecraft identities untouched.
 Existing eleven foundation cases remain intact. Native/helper/image/physical checks are future
 explicit grants, not part of this read-only decision. No build/runtime/device/game/system changes.
+
+
+## Authorized outer-runtime implementation contract
+
+Implement a single-thread foreground owner, no daemon or guest mutation client. `start PROFILE SPEC`
+checks root-owned immutable profile/spec/config/image/prefix contracts before reserving private
+journal + prefix lease. One typed controller calls injected primitive IO for reserve, spawn,
+read-only observation, pidfd stop, child wait and release; no callbacks under a controller lock
+(the controller has no shared lock). `status/stop PROFILE SPEC` use the private journal/control
+socket exact boot/PID/starttime/nonce identity, never arbitrary PID signalling. Unknown is sticky,
+retains lease/journal and never auto-releases. Positive release is limited to the declared single-
+client native topology: one previously observed running labeled exact CID, no observation failure/
+identity change/multiple guests, final exact guest exit + actual child wait. No CID or late/unobserved
+create remains Unknown. Root/docker admin intentionally changing that topology is outside scope.
+Wine caps/entrypoint and prefix migration are provisioned root-owned contracts, not inspect success.
+No production provisioning records exist here; examples must fail before effects. Root contracts
+must pin reviewed e1 binary revision and digests. Real TOML v7 + nested Docker JSON are parsed with
+cached pinned toml0.8.23. Runtime code is source only until review + explicit physical start grant.
+
+## Статус внешнего контроллера (источник, не приёмка)
+
+Rust-контроллер (`start|status|stop PROFILE SPEC`) реализован и проверен только юнит-тестами с
+инжектированными примитивами (offline, `-j2`): реальные Docker/X/устройства/Wolf не запускались.
+Контейнеры игры создаёт и останавливает только нативный reviewed e1 RunDocker; Rust лишь читает
+Docker (GET) и владеет lease/journal. Мёртвый владелец: `status`/`stop` отдают только вердикт
+журнала (`Stopped`/`Refused` при том же boot ID, иначе `Unknown`), без сигналов. Inspect отвергает
+privileged/host-namespace и mounts docker.sock/X11/`/dev/input`/udev. Неверифицировано: совместимость
+Pulse `unix:` пути с нативным mount, образ/entrypoint/кэпы, миграция префикса. Provisioning, запуск
+и приёмка изоляции — отдельные решения Manager/пользователя.
