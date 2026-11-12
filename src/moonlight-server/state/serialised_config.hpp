@@ -127,6 +127,7 @@ struct BaseApp {
   std::optional<bool> legacy_pad_only_trial;
   std::optional<int> legacy_pad_slot;
   std::optional<bool> legacy_direct_touch_trial;
+  std::optional<bool> legacy_keyboard_mouse_trial;
   std::optional<DirectWindowTarget> direct_window_target;
   std::string title;
   std::optional<std::string> icon_png_path;

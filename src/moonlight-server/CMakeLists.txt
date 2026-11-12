@@ -221,5 +221,5 @@ target_link_libraries(wolf wolf::runner
 target_compile_features(wolf PRIVATE cxx_std_17)
 
 # Supervised direct-window pointing: owned checked XCB connection, no Xlib globals.
-pkg_check_modules(WOLF_DIRECT_XCB REQUIRED IMPORTED_TARGET xcb xcb-xtest)
+pkg_check_modules(WOLF_DIRECT_XCB REQUIRED IMPORTED_TARGET xcb xcb-xtest xcb-xkb xkbcommon)
 target_link_libraries(wolf_runner PRIVATE PkgConfig::WOLF_DIRECT_XCB)

@@ -17,6 +17,8 @@ bool handle_input(events::StreamSession &session,
                   immer::box<std::shared_ptr<ControlPeer>> connected_client,
                   std::string_view bytes);
 
+char modifier_bit(short moonlight_key); // shared existing modifier conversion
+
 // Peer-aware direct path; old typed helpers intentionally keep isolated-mode deny.
 bool handle_direct_input(events::StreamSession &, immer::box<std::shared_ptr<ControlPeer>>, std::string_view);
 

@@ -77,6 +77,7 @@ struct App {
   rfl::Skip<bool> legacy_pad_only_trial = false;
   rfl::Skip<int> legacy_pad_slot = 0;
   rfl::Skip<bool> legacy_direct_touch_trial = false;
+  rfl::Skip<bool> legacy_keyboard_mouse_trial = false;
   rfl::Skip<std::shared_ptr<control::direct::WindowInput>> direct_window_input;
   moonlight::App base;
 

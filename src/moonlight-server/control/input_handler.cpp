@@ -437,7 +437,7 @@ void mouse_h_scroll(const MOUSE_HSCROLL_PACKET &pkt, events::StreamSession &sess
   }
 }
 
-static char modifier_bit(short moonlight_key) {
+char modifier_bit(short moonlight_key) {
   switch (moonlight_key) {
   case M_SHIFT:
   case M_LSHIFT:
@@ -886,7 +886,25 @@ bool handle_direct_input(events::StreamSession &session,
   auto backend = session.app->direct_window_input.get();
   if (!backend)
     return false;
+  const bool full = session.app->legacy_keyboard_mouse_trial.get();
   switch (read_packet<INPUT_PKT>(bytes).type) {
+  case UTF8_TEXT:
+    return full && backend->text(session.connection_scope, *peer, bytes.substr(sizeof(INPUT_PKT)));
+  case KEY_PRESS:
+  case KEY_RELEASE:
+    return full && backend->key(session.connection_scope, *peer, read_packet<KEYBOARD_PACKET>(bytes));
+  case MOUSE_MOVE_REL:
+    return full && backend->relative(session.connection_scope, *peer, read_packet<MOUSE_MOVE_REL_PACKET>(bytes));
+  case MOUSE_SCROLL:
+    return full && backend->scroll(session.connection_scope,
+                                   *peer,
+                                   boost::endian::big_to_native(read_packet<MOUSE_SCROLL_PACKET>(bytes).scroll_amt1),
+                                   false);
+  case MOUSE_HSCROLL:
+    return full && backend->scroll(session.connection_scope,
+                                   *peer,
+                                   boost::endian::big_to_native(read_packet<MOUSE_HSCROLL_PACKET>(bytes).scroll_amount),
+                                   true);
   case MOUSE_MOVE_ABS:
     return backend->absolute(session.connection_scope, *peer, read_packet<MOUSE_MOVE_ABS_PACKET>(bytes));
   case MOUSE_BUTTON_PRESS:
@@ -915,6 +933,12 @@ bool handle_input_impl(events::StreamSession &session,
   if (sessions::diagnostic::pad_only(session)) {
     auto route = [&](const detail::TrialPadIO &io) {
       switch (read_packet<INPUT_PKT>(bytes).type) {
+      case UTF8_TEXT:
+      case KEY_PRESS:
+      case KEY_RELEASE:
+      case MOUSE_MOVE_REL:
+      case MOUSE_SCROLL:
+      case MOUSE_HSCROLL:
       case MOUSE_MOVE_ABS:
       case MOUSE_BUTTON_PRESS:
       case MOUSE_BUTTON_RELEASE:

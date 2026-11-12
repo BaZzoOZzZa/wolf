@@ -1,4 +1,12 @@
 #include "direct_window_input.hpp"
+#include <boost/locale/encoding_utf.hpp>
+#include <control/input_handler.hpp>
+#include <inputtino/keyboard.hpp>
+#include <xkbcommon/xkbcommon.h>
+// xcb-xkb C protocol structs use the C++ keyword as a field name.
+#define explicit xcb_explicit_field
+#include <xcb/xkb.h>
+#undef explicit
 #include <charconv>
 #include <cstdlib>
 #include <fstream>
@@ -9,6 +17,14 @@
 
 namespace control::direct {
 namespace {
+std::optional<unsigned> linux_keycode(unsigned vk) {
+  if (vk > 0x7fff)
+    return {};
+  auto found = inputtino::keyboard::key_mappings.find(short(vk));
+  if (found == inputtino::keyboard::key_mappings.end())
+    return {};
+  return found->second.linux_code;
+}
 template <class T> using Reply = std::unique_ptr<T, decltype(&std::free)>;
 struct Native {
   xcb_connection_t *c;
@@ -48,9 +64,9 @@ Operations Operations::defaults() {
         const char *display = std::getenv("DISPLAY");
         char *host = nullptr;
         int number = 0, screen = 0;
-        if (!display || !xcb_parse_display(display, &host, &number, &screen))
-          return {};
-        std::free(host);
+        const bool parsed = display && xcb_parse_display(display, &host, &number, &screen);
+        Reply<char> owned_host(host,std::free);
+        if (!parsed) return {};
         auto raw = xcb_connect(display, nullptr);
         // Own transfer-full connection immediately, including allocation failure.
         std::unique_ptr<xcb_connection_t, decltype(&xcb_disconnect)> owned(raw, xcb_disconnect);
@@ -62,6 +78,11 @@ Operations Operations::defaults() {
             xcb_test_get_version_reply(native->c, xcb_test_get_version(native->c, 2, 2), nullptr),
             std::free);
         if (!version || xcb_connection_has_error(native->c))
+          return {};
+        Reply<xcb_xkb_use_extension_reply_t> xkb(
+            xcb_xkb_use_extension_reply(native->c, xcb_xkb_use_extension(native->c, 1, 0), nullptr),
+            std::free);
+        if (!xkb || !xkb->supported || xcb_connection_has_error(native->c))
           return {};
         return native;
       },
@@ -174,24 +195,79 @@ Operations Operations::defaults() {
         auto c = connection(p);
         return checked(c, xcb_test_fake_input_checked(c, XCB_MOTION_NOTIFY, 0, XCB_CURRENT_TIME, root, x, y, 0));
       },
-      [](void *p, bool press) {
+      [](void *p, uint8_t button, bool press) {
         auto c = connection(p);
         return checked(c,
                        xcb_test_fake_input_checked(c,
                                                    press ? XCB_BUTTON_PRESS : XCB_BUTTON_RELEASE,
-                                                   1,
+                                                   button,
                                                    XCB_CURRENT_TIME,
                                                    XCB_NONE,
                                                    0,
                                                    0,
                                                    0));
+      },
+      [](void *p, uint8_t code, bool down) {
+        auto c = connection(p);
+        return checked(c,
+                       xcb_test_fake_input_checked(c,
+                                                   down ? XCB_KEY_PRESS : XCB_KEY_RELEASE,
+                                                   code,
+                                                   XCB_CURRENT_TIME,
+                                                   XCB_NONE,
+                                                   0,
+                                                   0,
+                                                   0));
+      },
+      [](void *p) {
+        auto setup = xcb_get_setup(connection(p));
+        return std::pair<uint8_t, uint8_t>{setup->min_keycode, setup->max_keycode};
+      },
+      [](void *p) -> std::optional<Keymap> {
+        auto c = connection(p);
+        auto setup = xcb_get_setup(c);
+        const unsigned count = unsigned(setup->max_keycode) - setup->min_keycode + 1;
+        if (setup->min_keycode < 8 || count > 248)
+          return {};
+        Reply<xcb_xkb_get_state_reply_t> state(
+            xcb_xkb_get_state_reply(c, xcb_xkb_get_state(c, XCB_XKB_ID_USE_CORE_KBD), nullptr),
+            std::free);
+        Reply<xcb_get_keyboard_mapping_reply_t> map(
+            xcb_get_keyboard_mapping_reply(c, xcb_get_keyboard_mapping(c, setup->min_keycode, uint8_t(count)), nullptr),
+            std::free);
+        Reply<xcb_get_modifier_mapping_reply_t> modifiers(
+            xcb_get_modifier_mapping_reply(c, xcb_get_modifier_mapping(c), nullptr),
+            std::free);
+        if (!modifiers || modifiers->keycodes_per_modifier > 32 ||
+            xcb_get_modifier_mapping_keycodes_length(modifiers.get()) != 8 * modifiers->keycodes_per_modifier)
+          return {};
+        if (!state || !map || xcb_connection_has_error(c) || !map->keysyms_per_keycode ||
+            map->keysyms_per_keycode > 32 ||
+            xcb_get_keyboard_mapping_keysyms_length(map.get()) != int(count * map->keysyms_per_keycode))
+          return {};
+        Keymap result{setup->min_keycode,
+                      setup->max_keycode,
+                      map->keysyms_per_keycode,
+                      state->group,
+                      state->mods,
+                      state->latchedMods,
+                      state->lockedMods,
+                      state->latchedGroup,
+                      {}};
+        auto begin = xcb_get_keyboard_mapping_keysyms(map.get());
+        result.symbols.assign(begin, begin + count * map->keysyms_per_keycode);
+        auto shift = xcb_get_modifier_mapping_keycodes(modifiers.get());
+        for (unsigned i = 0; i < modifiers->keycodes_per_modifier; ++i)
+          if (shift[i])
+            result.shift_codes.set(shift[i]);
+        return result;
       }};
 }
-WindowInput::WindowInput(Spec s, Operations o) : spec_(s), ops_(std::move(o)) {}
-std::shared_ptr<WindowInput> WindowInput::bind(Spec spec, Operations ops) {
+WindowInput::WindowInput(Spec s, Operations o, bool mode) : spec_(s), ops_(std::move(o)), keyboard_mouse_(mode) {}
+std::shared_ptr<WindowInput> WindowInput::bind(Spec spec, Operations ops, bool mode) {
   if (!spec.xid || !spec.pid || !spec.root || !spec.process_start_time || spec.screen > 63)
     throw std::invalid_argument("Invalid direct window binding");
-  auto input = std::shared_ptr<WindowInput>(new WindowInput(spec, std::move(ops)));
+  auto input = std::shared_ptr<WindowInput>(new WindowInput(spec, std::move(ops), mode));
   input->connection_ = input->ops_.connect();
   if (!input->connection_ || !input->ops_.subscribe(input->connection_.get(), spec.xid) || !input->snapshot() ||
       !input->events() || !input->snapshot())
@@ -249,10 +325,17 @@ bool WindowInput::point(const Sample &s, const Geometry &g) {
     return false;
   if (!ops_.motion(connection_.get(), spec_.root, int16_t(x), int16_t(y)))
     return fail();
+  return hit(g, std::pair<int, int>{int(x), int(y)});
+}
+bool WindowInput::hit(const Geometry &g, std::optional<std::pair<int, int>> expected) {
+  auto active = ops_.property(connection_.get(), spec_.root, Property::active_window);
+  if (!active || !descendant(*active))
+    return false;
   uint32_t at = spec_.root;
   for (int i = 0; i < 32; ++i) {
     auto p = ops_.pointer(connection_.get(), at);
-    if (!p || p->x != x || p->y != y)
+    if (!p || p->x < g.x || p->y < g.y || int64_t(p->x) >= int64_t(g.x) + g.width ||
+        int64_t(p->y) >= int64_t(g.y) + g.height || (expected && (p->x != expected->first || p->y != expected->second)))
       return false;
     if (!p->child)
       return descendant(at);
@@ -262,6 +345,7 @@ bool WindowInput::point(const Sample &s, const Geometry &g) {
   }
   return false;
 }
+
 bool WindowInput::authorize(const wolf::core::sessions::ConnectionScope &source,
                             const std::shared_ptr<ControlPeer> &peer) {
   if (failed_ || !source || !peer || !peer->send)
@@ -279,25 +363,43 @@ bool WindowInput::authorize(const wolf::core::sessions::ConnectionScope &source,
   }
   return events();
 }
-bool WindowInput::release() {
-  contact_.reset();
-  sample_.reset();
-  if (!left_)
-    return true;
-  left_ = false;
-  const bool ok = ops_.button(connection_.get(), false);
+bool WindowInput::release_button(uint8_t code) {
+  if (!buttons_[code])
+    return false;
+  buttons_[code] = false;
+  bool ok = ops_.button(connection_.get(), code, false);
   if (!ok)
     failed_ = true;
   return ok;
 }
+bool WindowInput::release() {
+  contact_.reset();
+  sample_.reset();
+  return !buttons_[1] || release_button(1);
+}
 bool WindowInput::fail() {
   failed_ = true;
-  try {
-    release();
-  } catch (...) {
-  } // best effort only, never a checked-neutral receipt
+  contact_.reset();
+  sample_.reset();
+  for (uint8_t i = 1; i < 16; ++i)
+    if (buttons_[i]) {
+      try {
+        release_button(i);
+      } catch (...) {
+        buttons_[i] = false;
+      }
+    }
+  for (size_t i = 0; i < keys_.size(); ++i)
+    if (keys_[i]) {
+      keys_[i] = false;
+      try {
+        ops_.key(connection_.get(), uint8_t(i), false);
+      } catch (...) {
+      }
+    }
   return false;
 }
+
 bool WindowInput::absolute(const wolf::core::sessions::ConnectionScope &source,
                            const std::shared_ptr<ControlPeer> &peer,
                            const moonlight::control::pkts::MOUSE_MOVE_ABS_PACKET &pkt) {
@@ -319,7 +421,7 @@ bool WindowInput::absolute(const wolf::core::sessions::ConnectionScope &source,
     Sample s{uint64_t(x), uint64_t(y), uint64_t(w), uint64_t(h), g->width, g->height};
     sample_.reset();
     if (!point(s, *g)) {
-      if (left_)
+      if (buttons_[1])
         release();
       return false;
     }
@@ -337,29 +439,254 @@ bool WindowInput::button(const wolf::core::sessions::ConnectionScope &source,
   if (!call.acquired)
     return false;
   try {
-    if (!authorize(source, peer) || pkt.button != 1 || contact_)
+    if (!authorize(source, peer) || contact_ || pkt.button < 1 || pkt.button > 5 ||
+        (!keyboard_mouse_ && pkt.button != 1))
       return false;
+    uint8_t code = pkt.button <= 3 ? pkt.button : uint8_t(pkt.button + 4);
     if (pkt.type == MOUSE_BUTTON_RELEASE)
-      return left_ && release();
-    if (pkt.type != MOUSE_BUTTON_PRESS || left_ || !sample_)
+      return release_button(code);
+    if (pkt.type != MOUSE_BUTTON_PRESS || buttons_[code])
       return false;
     auto g = snapshot();
     if (!g)
       return fail();
+    if (!sample_ && keyboard_mouse_) {
+      auto p = ops_.pointer(connection_.get(), spec_.root);
+      if (!p || !hit(*g))
+        return false;
+      sample_ = Sample{uint64_t(p->x - g->x), uint64_t(p->y - g->y), g->width, g->height, g->width, g->height};
+    }
+    if (!sample_)
+      return false;
     if (g->width != sample_->width || g->height != sample_->height) {
       sample_.reset();
       return false;
     }
     if (!point(*sample_, *g))
       return false;
-    left_ = true; // uncertain checked request may already have acted; cleanup owns release
-    if (!ops_.button(connection_.get(), true))
+    buttons_[code] = true;
+    if (!ops_.button(connection_.get(), code, true))
       return fail();
     return true;
   } catch (...) {
     return fail();
   }
 }
+bool WindowInput::key(const wolf::core::sessions::ConnectionScope &source,
+                      const std::shared_ptr<ControlPeer> &peer,
+                      const moonlight::control::pkts::KEYBOARD_PACKET &pkt) {
+  using namespace moonlight::control::pkts;
+  Call call(busy_);
+  if (!call.acquired)
+    return false;
+  try {
+    if (!keyboard_mouse_ || !authorize(source, peer) || (pkt.type != KEY_PRESS && pkt.type != KEY_RELEASE) || contact_)
+      return false;
+    const uint16_t vk = boost::endian::little_to_native(pkt.key_code) & 0x7fff;
+    auto range = ops_.key_range(connection_.get());
+    auto convert = [&](uint16_t code) -> std::optional<uint8_t> {
+      auto linux = linux_keycode(code);
+      if (!linux)
+        return {};
+      unsigned native = *linux + 8;
+      if (native < range.first || native > range.second || native > 255)
+        return {};
+      return uint8_t(native);
+    };
+    auto native = convert(vk);
+    if (!native)
+      return false;
+    auto g = snapshot();
+    if (!g)
+      return fail();
+    if (!hit(*g))
+      return false;
+    if (pkt.type == KEY_RELEASE) {
+      if (!keys_[*native])
+        return false;
+      keys_[*native] = false;
+      if (!ops_.key(connection_.get(), *native, false))
+        return fail();
+      return true;
+    }
+    uint8_t held = 0;
+    for (int code : {M_SHIFT, M_LSHIFT, M_RSHIFT, M_CTRL, M_LCTRL, M_RCTRL, M_MENU, M_ALT, M_RALT, M_META, M_RMETA}) {
+      auto n = convert(code);
+      if (n && keys_[*n])
+        held |= uint8_t(::control::modifier_bit(code));
+    }
+    uint8_t transient = pkt.modifiers & ~held & ~uint8_t(::control::modifier_bit(vk));
+    if (pkt.modifiers & ~(SHIFT | CTRL | ALT | META))
+      return false;
+    std::array<uint8_t, 4> modifiers{};
+    size_t count = 0;
+    for (auto [flag, code] : {std::pair<int, int>{SHIFT, M_SHIFT}, {CTRL, M_CTRL}, {ALT, M_MENU}, {META, M_META}}) {
+      if (transient & flag) {
+        auto n = convert(code);
+        if (!n)
+          return false;
+        modifiers[count++] = *n;
+      }
+    }
+    for (size_t i = 0; i < count; ++i) {
+      keys_[modifiers[i]] = true;
+      if (!ops_.key(connection_.get(), modifiers[i], true))
+        return fail();
+    }
+    keys_[*native] = true;
+    if (!ops_.key(connection_.get(), *native, true))
+      return fail();
+    for (size_t i = 0; i < count; ++i) {
+      keys_[modifiers[i]] = false;
+      if (!ops_.key(connection_.get(), modifiers[i], false))
+        return fail();
+    }
+    return true;
+  } catch (...) {
+    return fail();
+  }
+}
+bool WindowInput::text(const wolf::core::sessions::ConnectionScope &source,
+                       const std::shared_ptr<ControlPeer> &peer,
+                       std::string_view utf8) {
+  Call call(busy_);
+  if (!call.acquired)
+    return false;
+  try {
+    if (!keyboard_mouse_ || !authorize(source, peer) || utf8.empty() ||
+        utf8.size() > moonlight::control::pkts::UTF8_TEXT_MAX_LEN || keys_.any() || buttons_.any() || contact_)
+      return false;
+    std::u32string chars;
+    try {
+      chars =
+          boost::locale::conv::utf_to_utf<char32_t>(utf8.data(), utf8.data() + utf8.size(), boost::locale::conv::stop);
+    } catch (const boost::locale::conv::conversion_error &) {
+      return false;
+    }
+    auto map = ops_.keymap(connection_.get());
+    if (!map || map->first < 8 || map->last < map->first || !map->columns || map->columns > 32 || map->group > 3 ||
+        map->latched || map->locked || map->latched_group || (map->mods & ~XCB_MOD_MASK_SHIFT) ||
+        map->symbols.size() != size_t(map->last - map->first + 1) * map->columns)
+      return false;
+    // Core base/Shift columns only. Caps/NumLock/AltGr/latches are deliberately unsupported.
+    struct Stroke {
+      uint8_t code;
+      bool shift;
+    };
+    std::array<Stroke, moonlight::control::pkts::UTF8_TEXT_MAX_LEN> strokes{};
+    size_t count = 0;
+    for (char32_t cp : chars) {
+      if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0) || count >= strokes.size())
+        return false;
+      bool found = false;
+      for (unsigned code = map->first; code <= map->last && !found; ++code)
+        for (unsigned level = 0; level < 2 && !found; ++level) {
+          if ((map->mods & XCB_MOD_MASK_SHIFT) && level == 0)
+            continue;
+          size_t column = size_t(map->group) * 2 + level;
+          if (column >= map->columns)
+            continue;
+          auto sym = map->symbols[(code - map->first) * map->columns + column];
+          if (sym && xkb_keysym_to_utf32(sym) == cp) {
+            strokes[count++] = {uint8_t(code), bool(level) && !(map->mods & XCB_MOD_MASK_SHIFT)};
+            found = true;
+          }
+        }
+      if (!found)
+        return false; // Entire packet preflight, no prefix injected for unmappable text.
+    }
+    auto shift = linux_keycode(moonlight::control::pkts::M_SHIFT);
+    if (!shift || *shift + 8 > 255 || *shift + 8 < map->first || *shift + 8 > map->last)
+      return false;
+    uint8_t shift_code = uint8_t(*shift + 8);
+    if (!map->shift_codes[shift_code])
+      return false;
+    auto send = [&](uint8_t code, bool down) {
+      keys_[code] = down;
+      return ops_.key(connection_.get(), code, down);
+    };
+    for (size_t i = 0; i < count; ++i) {
+      auto fresh = ops_.keymap(connection_.get());
+      auto g = snapshot();
+      if (!fresh || *fresh != *map || !g || !hit(*g))
+        return false;
+      if (strokes[i].shift && !send(shift_code, true))
+        return fail();
+      if (!send(strokes[i].code, true) || !send(strokes[i].code, false))
+        return fail();
+      if (strokes[i].shift && !send(shift_code, false))
+        return fail();
+    }
+    return true;
+  } catch (...) {
+    return fail();
+  }
+}
+bool WindowInput::relative(const wolf::core::sessions::ConnectionScope &source,
+                           const std::shared_ptr<ControlPeer> &peer,
+                           const moonlight::control::pkts::MOUSE_MOVE_REL_PACKET &pkt) {
+  Call call(busy_);
+  if (!call.acquired)
+    return false;
+  try {
+    if (!keyboard_mouse_ || !authorize(source, peer) || contact_)
+      return false;
+    auto g = snapshot();
+    if (!g)
+      return fail();
+    auto p = ops_.pointer(connection_.get(), spec_.root);
+    if (!p || !hit(*g))
+      return false;
+    int64_t x = int64_t(p->x) - g->x + boost::endian::big_to_native(pkt.delta_x);
+    int64_t y = int64_t(p->y) - g->y + boost::endian::big_to_native(pkt.delta_y);
+    if (x < 0 || y < 0 || x >= g->width || y >= g->height)
+      return false;
+    Sample s{uint64_t(x), uint64_t(y), g->width, g->height, g->width, g->height};
+    if (!point(s, *g))
+      return false;
+    sample_ = s;
+    return true;
+  } catch (...) {
+    return fail();
+  }
+}
+bool WindowInput::scroll(const wolf::core::sessions::ConnectionScope &source,
+                         const std::shared_ptr<ControlPeer> &peer,
+                         int amount,
+                         bool horizontal) {
+  Call call(busy_);
+  if (!call.acquired)
+    return false;
+  try {
+    if (!keyboard_mouse_ || !authorize(source, peer) || contact_ || amount < INT16_MIN || amount > INT16_MAX)
+      return false;
+    int &rest = horizontal ? horizontal_remainder_ : vertical_remainder_;
+    int sum = rest + amount, notches = sum / 120;
+    if (std::abs(notches) > 32)
+      return false;
+    auto g = snapshot();
+    if (!g)
+      return fail();
+    if (!hit(*g))
+      return false;
+    uint8_t code = horizontal ? (notches > 0 ? 7 : 6) : (notches > 0 ? 4 : 5);
+    for (int i = 0; i < std::abs(notches); ++i) {
+      g = snapshot();
+      if (!g)
+        return fail();
+      if (!hit(*g))
+        return false;
+      buttons_[code] = true;
+      if (!ops_.button(connection_.get(), code, true) || !release_button(code))
+        return fail();
+    }
+    rest = sum % 120;
+    return true;
+  } catch (...) {
+    return fail();
+  }
+}
+
 bool WindowInput::touch(const wolf::core::sessions::ConnectionScope &source,
                         const std::shared_ptr<ControlPeer> &peer,
                         const moonlight::control::pkts::TOUCH_PACKET &pkt) {
@@ -380,7 +707,7 @@ bool WindowInput::touch(const wolf::core::sessions::ConnectionScope &source,
       return release();
     }
     const bool down = pkt.event_type == TOUCH_EVENT_DOWN;
-    if ((!down && pkt.event_type != TOUCH_EVENT_MOVE) || (down && (contact_ || left_)) ||
+    if ((!down && pkt.event_type != TOUCH_EVENT_MOVE) || (down && (contact_ || buttons_.any())) ||
         (!down && (!contact_ || *contact_ != id)))
       return false;
     float x = input_float(pkt.x), y = input_float(pkt.y);
@@ -401,14 +728,14 @@ bool WindowInput::touch(const wolf::core::sessions::ConnectionScope &source,
              g->width,
              g->height};
     if (!point(s, *g)) {
-      if (left_)
+      if (buttons_[1])
         release();
       return false;
     }
     sample_ = s;
     if (down) {
-      left_ = true;
-      if (!ops_.button(connection_.get(), true))
+      buttons_[1] = true;
+      if (!ops_.button(connection_.get(), 1, true))
         return fail();
       contact_ = id;
     }

@@ -227,3 +227,30 @@ never injects input there; pause/disconnect held-input and legacy Xbox detached-
 No focus stealing. No actual target is selected or probed by author. Software tests use primitive fake
 transport/proc providers; default DISPLAY is invalid, Docker guard remains process-only ENOTDIR. Root
 owns actual fresh-target/corners/center/Xwayland/Wine/Xbox replay after independent review.
+
+### Latest explicit amendment: keyboard and mouse alongside direct touch/Xbox
+
+User additionally requested keyboard and mouse. `legacy_keyboard_mouse_trial` defaults false and
+REQUIRES the direct-touch+PadOnly binding. Original22 diagnostic cases remain byte-identical with
+this flag off. With it on, the same exact owner/target admits relative motion, buttons1..5, vertical/
+horizontal wheel, key down/up and mapped-only UTF8. No desktop fallback/focus steal/virtual keyboard
+or mouse creation. Relative motion starts only at a pointer already hitting target and refuses an
+outside result. Wheel120-unit remainders are bounded, max32notches/packet, larger requests refuse.
+Every effect revalidates focus/hit/binding; XTEST/compositor shortcut/race isolation is not promised.
+
+VK conversion reuses pinned target-exported inputtino/keyboard.hpp through existing PUBLIC Linux
+linkage, no manual include directory/map duplication/core changes. The earlier assumption that this
+header was unavailable was corrected from actual inputtino CMake evidence. Linux Xorg/Xwayland evdev
+keycode+8 is range checked; arbitrary custom keycode-domain support is not claimed. Existing modifier
+classification is shared; held remote keys are retained, temporary modifiers are released only when
+synthesized by this backend. No Wolf UI keyboard combo or legacy paste_utf fallback.
+
+UTF8 is <=32bytes, strictly decoded and ENTIRE packet preflighted against the CURRENT XKB group's
+base/Shift columns before any key effect. Actual keysyms conversion uses installed xkbcommon; XCB-XKB
+and core key/modifier map requests are read-only. No Ctrl/Alt/Meta or held remote keys; CapsLock,
+NumLock, latched/locked/unsupported modifier states conservatively refuse. Existing physical Shift is
+never released: only shifted symbols may be sent then. Synthetic Shift is verified in actual modifier
+map. Unsupported/unrepresentable/malformed text refuses without a prefix. This is NOT arbitrary Unicode,
+clipboard/paste/IME support. Map/focus changes or IO errors DURING execution may leave a prefix; no automatic
+replay/rollback claim. Current group/map/focus checked before each character; failed owned IO sticks closed.
+No raw text/key-character logs or global keymap changes. Root must test actual iPad/Wine input separately.

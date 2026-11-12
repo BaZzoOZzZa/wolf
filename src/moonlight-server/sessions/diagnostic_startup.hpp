@@ -5,12 +5,13 @@
 
 namespace wolf::core::sessions::diagnostic {
 inline void validate(const config::BaseApp &app) {
+  if (app.legacy_keyboard_mouse_trial.value_or(false) && !app.legacy_direct_touch_trial.value_or(false))
+    throw std::invalid_argument("keyboard/mouse trial requires direct touch binding");
   if (app.legacy_direct_touch_trial.value_or(false)) {
     if (!app.legacy_pad_only_trial.value_or(false) || !app.direct_window_target)
       throw std::invalid_argument("direct touch requires PadOnly and an exact target");
     const auto &t = *app.direct_window_target;
-    if (!t.xid || !t.pid || !t.root || !t.process_start_time || t.screen > 63 ||
-        (app.video && (app.video->source || app.video->video_params)))
+    if (!t.xid || !t.pid || !t.root || !t.process_start_time || t.screen > 63 || app.video.has_value())
       throw std::invalid_argument("direct touch requires a valid target and canonical full-frame video source/params");
   } else if (app.direct_window_target) {
     throw std::invalid_argument("direct target requires explicit direct touch opt-in");

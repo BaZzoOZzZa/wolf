@@ -161,7 +161,8 @@ parse_apps_direct(const std::vector<BaseApp> &apps,
         if (app.legacy_direct_touch_trial.value_or(false)) {
           direct = control::direct::WindowInput::bind(
               *app.direct_window_target,
-              direct_ops ? *direct_ops : control::direct::Operations::defaults());
+              direct_ops ? *direct_ops : control::direct::Operations::defaults(),
+              app.legacy_keyboard_mouse_trial.value_or(false));
           // SAME immutable binding drives capture and input; no arbitrary source/crop transform.
           app_video_settings.source = fmt::format("ximagesrc xid={} use-damage=false show-pointer=false "
                                                   "do-timestamp=true ! video/x-raw,framerate={{fps}}/1",
@@ -208,6 +209,7 @@ parse_apps_direct(const std::vector<BaseApp> &apps,
                         .legacy_pad_only_trial = app.legacy_pad_only_trial.value_or(false),
                         .legacy_pad_slot = app.legacy_pad_slot.value_or(0),
                         .legacy_direct_touch_trial = app.legacy_direct_touch_trial.value_or(false),
+                        .legacy_keyboard_mouse_trial = app.legacy_keyboard_mouse_trial.value_or(false),
                         .direct_window_input = direct,
                         .base = {.title = app.title,
                                  .id = generate_app_id(app),
@@ -539,6 +541,7 @@ void update_profiles(const Config &cfg, const ProfilesList &profiles) {
                                      .legacy_pad_only_trial = events::pad_only_trial(*app),
                                      .legacy_pad_slot = app->legacy_pad_slot.get(),
                                      .legacy_direct_touch_trial = app->legacy_direct_touch_trial.get(),
+                                     .legacy_keyboard_mouse_trial = app->legacy_keyboard_mouse_trial.get(),
                                      .direct_window_target =
                                          app->direct_window_input.get()
                                              ? std::optional<DirectWindowTarget>{app->direct_window_input.get()->spec()}

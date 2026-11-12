@@ -1204,6 +1204,18 @@ parse_apps(const std::vector<config::BaseApp> &,
 namespace {
 struct DirectIO {
   direct::Spec spec{.xid = 7, .pid = 9, .screen = 0, .root = 1, .process_start_time = 11};
+  std::vector<std::pair<uint8_t, bool>> buttons, keys;
+  bool key_ok = true;
+  direct::Keymap layout{8, 60, 4, 0, 0, 0, 0, 0, std::vector<uint32_t>((60 - 8 + 1) * 4)};
+  DirectIO() {
+    layout.shift_codes.set(50);
+    layout.symbols[(38 - 8) * 4] = 'a';
+    layout.symbols[(38 - 8) * 4 + 1] = 'A';
+    layout.symbols[(26 - 8) * 4] = 0xe9;
+    layout.symbols[(26 - 8) * 4 + 1] = 0xc9;
+    layout.symbols[(38 - 8) * 4 + 2] = 0x01000444;
+    layout.symbols[(38 - 8) * 4 + 3] = 0x01000424;
+  }
   int x = 3200, y = 351, w = 1280, h = 720, px = 0, py = 0, opened = 0, closed = 0, moves = 0, presses = 0,
       releases = 0, subscribed = 0;
   uint32_t focus = 7, pid = 9, root = 1;
@@ -1265,13 +1277,20 @@ struct DirectIO {
               positions.emplace_back(a, b);
               return motion_ok;
             },
-            [&](void *, bool press) {
+            [&](void *, uint8_t code, bool press) {
+              buttons.emplace_back(code, press);
               if (press)
                 ++presses;
               else
                 ++releases;
               return button_ok;
-            }};
+            },
+            [&](void *, uint8_t code, bool press) {
+              keys.emplace_back(code, press);
+              return key_ok;
+            },
+            [&](void *) { return std::pair<uint8_t, uint8_t>{8, 255}; },
+            [&](void *) -> std::optional<direct::Keymap> { return layout; }};
   }
 };
 MOUSE_MOVE_ABS_PACKET direct_abs(int x = 640, int y = 360, int w = 1280, int h = 720) {
@@ -1305,6 +1324,8 @@ TEST_CASE("Direct target actual ABS maps full client area independent of referen
   DirectIO io;
   auto backend = direct::WindowInput::bind(io.spec, io.ops());
   auto s = direct_session(backend);
+  s.display_mode.width = 640;
+  s.display_mode.height = 368; // encoded padding is not the coordinate authority
   unsigned sends = 0;
   auto peer = trial_peer(sends);
   for (auto ref : std::vector<std::pair<int, int>>{{1280, 720}, {640, 360}, {2560, 1440}}) {
@@ -1564,4 +1585,212 @@ TEST_CASE("Direct backend invalidation and failed owned release stay closed with
     CHECK(io.releases == 1);
     CHECK(io.opened == 1);
   }
+}
+
+TEST_CASE("Explicit keyboard mouse mode permits target-relative buttons wheels and denies desktop fallback",
+          "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops(), true);
+  auto s = direct_session(b);
+  s.app->legacy_keyboard_mouse_trial = true;
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  auto relative = packet<MOUSE_MOVE_REL_PACKET>(MOUSE_MOVE_REL);
+  relative.delta_x = boost::endian::native_to_big(short(11));
+  relative.delta_y = boost::endian::native_to_big(short(-7));
+  REQUIRE(control::handle_input(s, peer, bytes(relative)));
+  CHECK(io.positions.back() == std::pair<int, int>{3851, 704});
+  for (uint8_t button : {1, 2, 3, 4, 5}) {
+    auto p = packet<MOUSE_BUTTON_PACKET>(MOUSE_BUTTON_PRESS);
+    p.button = button;
+    REQUIRE(control::handle_input(s, peer, bytes(p)));
+    CHECK(io.buttons.back() == std::pair<uint8_t, bool>{button <= 3 ? button : uint8_t(button + 4), true});
+    p.type = MOUSE_BUTTON_RELEASE;
+    REQUIRE(control::handle_input(s, peer, bytes(p)));
+  }
+  auto wheel = packet<MOUSE_SCROLL_PACKET>(MOUSE_SCROLL);
+  wheel.scroll_amt1 = boost::endian::native_to_big(short(60));
+  auto count = io.buttons.size();
+  CHECK(control::handle_input(s, peer, bytes(wheel)));
+  CHECK(io.buttons.size() == count);
+  CHECK(control::handle_input(s, peer, bytes(wheel)));
+  CHECK(io.buttons.size() == count + 2);
+  CHECK(io.buttons[count] == std::pair<uint8_t, bool>{4, true});
+  CHECK(io.buttons[count + 1] == std::pair<uint8_t, bool>{4, false});
+  wheel.scroll_amt1 = boost::endian::native_to_big(short(32767));
+  count = io.buttons.size();
+  CHECK_FALSE(control::handle_input(s, peer, bytes(wheel)));
+  CHECK(io.buttons.size() == count);
+  auto horizontal = packet<MOUSE_HSCROLL_PACKET>(MOUSE_HSCROLL);
+  horizontal.scroll_amount = boost::endian::native_to_big(short(-120));
+  CHECK(control::handle_input(s, peer, bytes(horizontal)));
+  CHECK(io.buttons[io.buttons.size() - 2] == std::pair<uint8_t, bool>{6, true});
+  io.px = 0;
+  io.py = 0;
+  count = io.positions.size();
+  CHECK_FALSE(control::handle_input(s, peer, bytes(relative)));
+  CHECK(io.positions.size() == count);
+  io.px = 3840;
+  io.py = 711;
+  io.focus = 8;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(relative)));
+  CHECK_FALSE(control::handle_input(s, {}, bytes(relative)));
+  CHECK(sends == 0);
+}
+TEST_CASE("Explicit keyboard mode reuses VK conversion with held modifiers and exact target owner", "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops(), true);
+  auto s = direct_session(b);
+  s.app->legacy_keyboard_mouse_trial = true;
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  auto key = packet<KEYBOARD_PACKET>(KEY_PRESS);
+  key.key_code = boost::endian::native_to_little(short(0x8041));
+  key.modifiers = CTRL;
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys == std::vector<std::pair<uint8_t, bool>>{{37, true}, {38, true}, {37, false}});
+  key.type = KEY_RELEASE;
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys.back() == std::pair<uint8_t, bool>{38, false});
+  auto ctrl = packet<KEYBOARD_PACKET>(KEY_PRESS);
+  ctrl.key_code = boost::endian::native_to_little(short(M_CTRL));
+  ctrl.modifiers = CTRL;
+  REQUIRE(control::handle_input(s, peer, bytes(ctrl)));
+  auto before = io.keys.size();
+  key.type = KEY_PRESS;
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys.size() == before + 1); // held ctrl not synthesized/released
+  ctrl.type = KEY_RELEASE;
+  REQUIRE(control::handle_input(s, peer, bytes(ctrl)));
+  key.type = KEY_RELEASE;
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  io.focus = 8;
+  before = io.keys.size();
+  key.type = KEY_PRESS;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys.size() == before);
+  io.focus = 7;
+  auto other = trial_peer(sends);
+  CHECK_FALSE(control::handle_input(s, other, bytes(key)));
+  CHECK_FALSE(control::handle_input(s, {}, bytes(key)));
+  auto stale = s;
+  stale.connection_scope = sessions::ConnectionScope::fresh(s.session_id);
+  CHECK_FALSE(control::handle_input(stale, peer, bytes(key)));
+  s.app->legacy_keyboard_mouse_trial = false;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys.size() == before);
+  control::keyboard_key(key, s);
+  CHECK(io.keys.size() == before);
+  CHECK_FALSE(s.keyboard->has_value());
+  CHECK(sends == 0);
+}
+
+namespace {
+std::string direct_text(std::string_view text) {
+  auto p = packet<UTF8_TEXT_PACKET>(UTF8_TEXT);
+  if (text.size() > UTF8_TEXT_MAX_LEN)
+    throw std::invalid_argument("test text bound");
+  std::memcpy(p.text, text.data(), text.size());
+  p.data_size = boost::endian::native_to_big(uint32_t(sizeof(INPUT_TYPE) + text.size()));
+  p.packet_len = boost::endian::native_to_little(uint16_t(sizeof(INPUT_TYPE) + text.size() + 4));
+  return {reinterpret_cast<const char *>(&p), sizeof(INPUT_TYPE) + 8 + text.size()};
+}
+} // namespace
+TEST_CASE("Mapped UTF8 actual decoder preflights whole current layout and effective modifiers", "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops(), true);
+  auto s = direct_session(b);
+  s.app->legacy_keyboard_mouse_trial = true;
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  CHECK(control::handle_input(s, peer, direct_text("aA")));
+  CHECK(
+      io.keys ==
+      std::vector<std::pair<uint8_t, bool>>{{38, true}, {38, false}, {50, true}, {38, true}, {38, false}, {50, false}});
+  auto count = io.keys.size();
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("ab")));
+  CHECK(io.keys.size() == count); // no prefix a
+  CHECK_FALSE(control::handle_input(s, peer, direct_text(std::string("\xff", 1))));
+  CHECK(io.keys.size() == count);
+  CHECK(control::handle_input(s, peer, direct_text("é")));
+  CHECK(io.keys[io.keys.size() - 2] == std::pair<uint8_t, bool>{26, true});
+  io.layout.group = 1;
+  CHECK(control::handle_input(s, peer, direct_text("ф")));
+  CHECK(io.keys[io.keys.size() - 2] == std::pair<uint8_t, bool>{38, true});
+  io.layout.group = 0;
+  io.layout.mods = 1;
+  count = io.keys.size();
+  CHECK(control::handle_input(s, peer, direct_text("A")));
+  CHECK(io.keys.size() == count + 2); // existing Shift not released
+  count = io.keys.size();
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == count);
+  for (uint8_t state : {2, 4, 8, 16, 64}) {
+    io.layout.mods = state;
+    CHECK_FALSE(control::handle_input(s, peer, direct_text("A")));
+    CHECK(io.keys.size() == count);
+  }
+  io.layout.mods = 0;
+  io.layout.locked = 2;
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == count);
+  io.layout.locked = 0;
+  io.layout.latched = 1;
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("A")));
+  CHECK(io.keys.size() == count);
+  io.layout.latched = 0;
+  io.layout.shift_codes.reset(50);
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("A")));
+  CHECK(io.keys.size() == count);
+  io.layout.shift_codes.set(50);
+  auto key = packet<KEYBOARD_PACKET>(KEY_PRESS);
+  key.key_code = boost::endian::native_to_little(short(0x41));
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  count = io.keys.size();
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == count);
+  key.type = KEY_RELEASE;
+  REQUIRE(control::handle_input(s, peer, bytes(key)));
+  io.focus = 8;
+  count = io.keys.size();
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == count);
+  io.focus = 7;
+  CHECK_FALSE(control::handle_input(s, {}, direct_text("a")));
+  CHECK(io.keys.size() == count);
+  s.app->legacy_keyboard_mouse_trial = false;
+  CHECK_FALSE(control::handle_input(s, peer, direct_text("a")));
+  CHECK(io.keys.size() == count);
+}
+TEST_CASE("Keyboard mouse opt-in policy requires exact direct binding and keeps strict default", "[direct-window]") {
+  config::BaseApp app{.legacy_pad_only_trial = true,
+                      .legacy_keyboard_mouse_trial = true,
+                      .title = "test",
+                      .start_virtual_compositor = false,
+                      .start_audio_server = false,
+                      .runner = config::AppCMD{.run_cmd = "unused"}};
+  CHECK_THROWS(diag::validate(app));
+  app.legacy_direct_touch_trial = true;
+  CHECK_THROWS(diag::validate(app));
+  app.direct_window_target = DirectIO{}.spec;
+  CHECK_NOTHROW(diag::validate(app));
+  app.video = config::BaseAppVideoOverride{.h264_encoder = "videoflip ! x264enc"};
+  CHECK_THROWS(diag::validate(app));
+  app.video.reset();
+  app.legacy_keyboard_mouse_trial = false;
+  CHECK_NOTHROW(diag::validate(app));
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(b);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  s.app->legacy_keyboard_mouse_trial = true; // flag cannot upgrade immutable backend
+  auto key = packet<KEYBOARD_PACKET>(KEY_PRESS);
+  key.key_code = boost::endian::native_to_little(short(0x41));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(key)));
+  CHECK(io.keys.empty());
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<MOUSE_MOVE_REL_PACKET>(MOUSE_MOVE_REL))));
 }
