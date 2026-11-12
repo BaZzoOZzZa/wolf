@@ -218,3 +218,84 @@ mocks pass. Source runtime and its new tests are blocked on the above concrete a
 no Cargo rerun is warranted for this doc-only delta. Request a narrow next source grant for the
 spec+bridge producer boundary before implementing effectful lifecycle. Provisioning and physical
 start remain separate later approvals. No users/rules/ACLs/prefix/graphics/network/game changes.
+
+
+## Architecture decision: reuse reviewed native DockerRunner (supersedes bridge proposal)
+
+**Decision: choose native guest ownership + small Rust outer supervisor.** The preceding
+Rust-sole-guest-creator / SessionReady bridge section is HISTORICAL and superseded. It must not
+be used to require a new readiness/IPC/attestation subsystem. The schema1 docker-create argv is
+also historical proposal output, never an executable path for the new supervisor. No code or
+provisioning is enabled by this doc.
+
+Use the reviewed e1 native artifact, NOT the C++ develop source in this Rust worktree:
+`e1fdfd2e12b79bfd30e6a776478ead29ce958e67` in `mirror-wow-wolf-handoff-fix`.
+Its RunDocker differs by 80 additions/38 deletions from develop0e3710b; fake-udev source is identical.
+Actual dynamic compositor/Pulse paths, scoped RunScope/device queue, guest create/start and
+ContainerSupervision remain native-owned. Rust reserves outer domain/prefix lease, starts/stops
+only its exact native Wolf child, and observes guest exit using read-only Docker inspection.
+No second create/start/stop/remove controller, guessed socket/device, or producer bridge.
+
+### Fixed config boundary sufficient for the intended supervised threat model
+
+- One app/allowed client, real virtual compositor + private Gamescope/Xwayland; no desktop
+  XTEST/X11 socket/runtime/home or whole host /dev/input bind. Private guest /dev and IPC/network
+  namespaces; only render devices plus Wolf-created scoped virtual devices/fake-udev metadata.
+  All automatically appended native mounts/devices must be validated too, not just TOML literals.
+- Remote host UID/private udev group/seat, no desktop input ACL or inherited/open FD, still require
+  separate provisioning/fresh-node proof. Minecraft keeps the desktop UID/physical devices.
+  Administrators/root/docker remain trusted. Shared GPU performance is not isolated.
+- The earlier all-container-CapDrop-ALL plan is NOT usable unchanged: e1 docker.cpp302–310 executes
+  `mknod ... && chmod ... && fake-udev` as root. MKNOD must remain available to that trusted helper;
+  CapDrop ALL alone makes pad hotplug fail. Source configuration.adoc230 documents the helper
+  candidate allowlist NET_RAW/MKNOD/NET_ADMIN; fake-udev uses netlink bind/sendmsg (hpp17–47).
+  This does not prove all three are minimal or sufficient on the deployed kernel/seccomp profile.
+  Do not add SYS_ADMIN/privileged/host IPC as a shortcut; validate the helper separately later.
+- Wine must run as remote non-root UID with effective/permitted/inheritable/ambient caps cleared,
+  no-new-privileges, no setuid/file-cap escalation path, no daemon socket. A fixed reviewed image
+  entrypoint enforces this per Wine process. Container-level helper capability allowance is NOT
+  Wine permission. Do not assume PUID env or `User` alone proves the process capability state.
+  Such image/entrypoint evidence and later actual process inspection are still missing, not a
+  boolean readiness flag. No blanket chmod of host nodes: native chmod777 applies to newly mknod
+  nodes inside the private guest /dev. Native broad input/hidraw cgroup majors are not by themselves
+  host-node visibility; trust only scoped helper events + absent physical nodes + capless Wine.
+
+### No new native adapter needed for the conservative first supervisor
+
+`core/.../docker.cpp:250–264` preserves custom create JSON fields, including Labels. Fixed per-launch
+nonce/profile-digest labels in the single app's base_create_json identify the native-created domain;
+Rust reads exact returned CID/labels/image/config, never adopts by name/PID/title. Keep
+`WOLF_STOP_CONTAINER_ON_EXIT=FALSE` so an exited guest remains inspectable rather than disappearing
+before the observer sees its ID. Native runner remains the sole guest mutator and handles root
+helper/device queue. Native create conflict/Unknown is not permission to replace.
+
+Rust stop requests SIGINT only through its retained native child handle, not an arbitrary PID or
+Unix numeric-session endpoint. e1 wolf.cpp232–264 sends captured GameStopRequest scopes and joins
+control, but explicitly does not prove completion of all detached subsystems. Thus native exit0,
+log text or a one-time empty label list MUST NOT release the lease. Release only after exact native
+child wait AND positively observed exact guest exit with a conclusive native-creation history.
+Missing CID, ambiguous/delayed create, daemon loss, unexpected extra labeled guests or incomplete
+history => Unknown + retained journal/lease, no replacement. In particular a POST accepted before
+child exit may finish later: one empty enumeration cannot prove no pending create. This conservative
+Unknown outcome satisfies the current scope; do not invent a completion ACK to avoid it. A later
+small completion ledger/observer adapter is optional only if automatic recovery from that Unknown
+is actually required, not a prerequisite for first usable foreground supervision.
+
+### Exact smallest next source scope
+
+Only tools/wolf-isolated/** + this doc, no e1 edits: add one outer runtime controller and a small
+Linux child/journal adapter; fixed config validation binding reviewed e1 binary/image/entrypoint,
+per-launch labels, config/prefix paths and private state. Inspect known image locally before spawn;
+refuse missing image (native API can pull on404, so no guarantee against an administrator removing
+it concurrently). Never use this worktree's develop Wolf binary. No arbitrary exec/config passthrough.
+Foreground owner reserves exclusive domain+working-prefix lease before child spawn, stores boot/
+PID/starttime/nonce/config digest, uses exact owned child wait and bounded read-only engine
+observations. Stop has no guest-mutation fallback; timeout => Unknown. No original-prefix flock
+claim: clean stop/backup/migration to the separately leased working prefix still needs approval.
+
+Software tests: busy lease/no spawn; malformed config/forbidden mounts/no effects; helper versus
+Wine-capability policy distinguished; child spawn failure; same CID exit proof versus daemon/
+create-history Unknown; foreign/ABA stop refusal; native exit alone never Stopped; no Docker mutation
+operation in outer adapter; concurrent launch blocked; unowned Minecraft identities untouched.
+Existing eleven foundation cases remain intact. Native/helper/image/physical checks are future
+explicit grants, not part of this read-only decision. No build/runtime/device/game/system changes.
