@@ -487,3 +487,22 @@ Probe ownership resets on lifecycle owner after worker join, while full State re
 reentrant destruction, before State field teardown. Actual test schedules use no external strong H1
 handle/validator owner and retain all gates through joins. Exact semantic RED/GREEN/test hashes and
 final native evidence are in `/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/report/MWOW9-F16.md`.
+
+## 12. RTSP write lifetime prerequisite (design before implementation)
+
+The current send_message serializes into a local string, passes a non-owning Asio buffer and
+retains only on_sent. Its public signature and wire/error callback behavior will remain unchanged.
+A protected internal writer seam will share the actual serializer/completion path: the production
+provider calls asio::async_write on the same socket/buffer; test providers defer only completion.
+The immutable serialized string is immediately RAII-owned. GREEN completion retains that owner
+and shared_from_this until provider completion-handler destruction, including cancellation/error.
+No locks, strand, worker or socket opening is added. Initiation exceptions propagate as before;
+local/handler RAII covers rollback, and an already-retained provider handler keeps its owners.
+Callback exceptions also propagate; completion ownership releases on unwind. Callback invocation
+on error still reports transferred bytes, never delivery proof. Callback captures themselves must
+not install an external self-cycle. Existing overlapping-write serialization is not fixed here.
+
+RED will retain old unowned-completion behavior after mechanical helper extraction; tests inspect
+weak owners before any dereference, so expected failures do not require UAF or sanitizer abort.
+Only net.hpp, new testRTSPWriteLifetime.cpp, appended isolated CMake target and this doc are owned.
+3C3 remains read-only planning; WoW needs a new explicit launch command after readiness.

@@ -292,3 +292,10 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-protected-runtime-tests COMMAND wolf-protected-runtime-tests)
     set_tests_properties(wolf-protected-runtime-tests PROPERTIES LABELS "authority;isolated" TIMEOUT 90)
 endif ()
+
+# Actual RTSP serialization/completion lifetime; unopened socket objects only.
+add_executable(wolf-rtsp-write-lifetime-tests testRTSPWriteLifetime.cpp)
+target_compile_features(wolf-rtsp-write-lifetime-tests PRIVATE cxx_std_20)
+target_link_libraries(wolf-rtsp-write-lifetime-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+add_test(NAME wolf-rtsp-write-lifetime-tests COMMAND wolf-rtsp-write-lifetime-tests)
+set_tests_properties(wolf-rtsp-write-lifetime-tests PROPERTIES LABELS "rtsp;isolated" TIMEOUT 30)
