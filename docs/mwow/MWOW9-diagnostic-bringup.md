@@ -101,7 +101,7 @@ AES defaults, key/IV use, RTP/FEC and wire behavior are unchanged. No encryption
 New isolated tests instantiate the ACTUAL custom audio GType, properties, repeated dispose and finalize,
 observe real RS owner expiration, then run a bounded real appsrc → statically registered custom audio
 payloader → appsink pipeline. Four dummy encoded buffers exercise AES roundtrip plus two FEC outputs;
-invalid-key production split helper remains fail-closed. This deliberately expands earlier core-only
+the invalid-IV production split catch/drop path is exercised separately. This deliberately expands earlier core-only
 fixtures: linked app types and the custom static plugin are exercised, registry scanning disabled; no
 external plugin, socket, sound device, main or live session. Existing ten diagnostic test bodies preserved.
 Software output is not actual audio/video network delivery; Manager replay after review remains required.
