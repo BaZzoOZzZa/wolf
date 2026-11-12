@@ -333,3 +333,122 @@ TEST_CASE("Actual mDNS dispatch exact FALSE skips whole worker without dependenc
   diag::dispatch_mdns("", [&] { ++launches; });
   CHECK(launches == 2);
 }
+
+#include <rest/helpers.hpp>
+namespace endpoints::https {
+std::optional<moonlight::DisplayMode> parse_run_display_mode(const SimpleWeb::CaseInsensitiveMultimap &, bool, bool);
+std::shared_ptr<events::StreamSession> create_run_session(const SimpleWeb::CaseInsensitiveMultimap &,
+                                                          const std::string &,
+                                                          const state::PairedClient &,
+                                                          immer::box<state::AppState>,
+                                                          const events::App &);
+} // namespace endpoints::https
+
+TEST_CASE("Actual launch mode parsing owns SSO and bounded token storage", "[diagnostic][launch-mode]") {
+  namespace https = endpoints::https;
+  auto fallback = https::parse_run_display_mode({}, true, false);
+  REQUIRE(fallback);
+  CHECK(fallback->width == 1920);
+  CHECK(fallback->height == 1080);
+  CHECK(fallback->refreshRate == 60);
+  CHECK(fallback->hevc_supported);
+  CHECK_FALSE(fallback->av1_supported);
+  for (auto mode :
+       {std::string("640x360x30"), std::string("1920x1080x60"), std::string("2147483647x2147483647x2147483647")}) {
+    auto parsed = https::parse_run_display_mode({{"mode", mode}}, false, true);
+    REQUIRE(parsed);
+    mode.assign(512, 'z'); // caller/provider storage is gone; result has owned values
+    CHECK_FALSE(parsed->hevc_supported);
+    CHECK(parsed->av1_supported);
+    CHECK(parsed->width > 0);
+    CHECK(parsed->height > 0);
+    CHECK(parsed->refreshRate > 0);
+  }
+  auto small = https::parse_run_display_mode({{"mode", std::string("640x360x30")}}, false, false);
+  REQUIRE(small);
+  CHECK(small->width == 640);
+  CHECK(small->height == 360);
+  CHECK(small->refreshRate == 30);
+  for (const auto &bad : std::vector<std::string>{"",
+                                                  "640",
+                                                  "640x360",
+                                                  "640x360x30x1",
+                                                  "x360x30",
+                                                  "640xx30",
+                                                  "640x360x",
+                                                  "0x360x30",
+                                                  "640x-1x30",
+                                                  "640x360x+30",
+                                                  " 640x360x30",
+                                                  "640x360x30junk",
+                                                  "2147483648x360x30",
+                                                  "640x360x2147483648",
+                                                  std::string(33, '1'),
+                                                  std::string("640x360x30\0junk", 15)}) {
+    CHECK_FALSE(https::parse_run_display_mode({{"mode", bad}}, true, true));
+  }
+}
+
+TEST_CASE("Actual create_run_session rejects bad mode before directories scopes or publication",
+          "[diagnostic][launch-mode]") {
+  namespace https = endpoints::https;
+  // Owned temporary filesystem fixture only. No server, runner, device, or socket.
+  struct Directory {
+    std::filesystem::path path = std::filesystem::temp_directory_path() /
+                                 ("wolf-launch-mode-" + crypto::str_to_hex(crypto::random(8)));
+    Directory() {
+      std::filesystem::create_directory(path);
+    }
+    ~Directory() {
+      std::error_code ec;
+      std::filesystem::remove_all(path, ec);
+    }
+  } dir;
+  auto bus = std::make_shared<events::EventBusType>();
+  unsigned streams = 0, runners = 0;
+  auto stream_handler = bus->register_handler<immer::box<events::StreamSession>>(
+      [&](const immer::box<events::StreamSession> &) { ++streams; });
+  auto runner_handler = bus->register_handler<immer::box<events::StartRunner>>(
+      [&](const immer::box<events::StartRunner> &) { ++runners; });
+  auto running = std::make_shared<immer::atom<immer::vector<events::StreamSession>>>();
+  auto state = immer::box<state::AppState>{
+      state::AppState{.config = immer::box<state::Config>{state::Config{.support_hevc = false, .support_av1 = false}},
+                      .host = immer::box<state::Host>{state::Host{.host_base_state_folder = dir.path.string(),
+                                                                  .local_base_state_folder = dir.path.string()}},
+                      .event_bus = bus,
+                      .running_sessions = running}};
+  const auto app = events::App{.base = {.title = "mode-fixture", .id = "1", .support_hdr = false}};
+  const auto client = state::PairedClient{.client_cert = "fixture-not-TLS", .app_state_folder = "client"};
+  for (const auto &bad : {"", "640", "640xx30", "640x360x30x1", "640x360x2147483648"}) {
+    CHECK_FALSE(https::create_run_session({{"mode", bad}}, "127.0.0.1", client, state, app));
+    CHECK(std::filesystem::is_empty(dir.path));
+    CHECK(running->load()->empty());
+    CHECK(streams == 0);
+    CHECK(runners == 0);
+  }
+  const SimpleWeb::CaseInsensitiveMultimap headers{{"mode", "640x360x30"},
+                                                   {"rikey", "00112233445566778899aabbccddeeff"},
+                                                   {"rikeyid", "1"}};
+  auto created = https::create_run_session(headers, "127.0.0.1", client, state, app);
+  REQUIRE(created);
+  CHECK(created->display_mode.width == 640);
+  CHECK(created->display_mode.height == 360);
+  CHECK(created->display_mode.refreshRate == 30);
+  CHECK(bool(created->connection_scope));
+  CHECK(bool(created->run_scope));
+  CHECK(created->ip == "127.0.0.1");
+  CHECK(std::filesystem::is_directory(dir.path / "client" / "mode-fixture"));
+  CHECK(running->load()->empty()); // construction alone never publishes or starts anything
+  CHECK(streams == 0);
+  CHECK(runners == 0);
+}
+
+#include <cstddef>
+#include <enet/protocol.h>
+TEST_CASE("Pinned actual ENet header offset and wire layout remain unchanged", "[diagnostic][enet-offset]") {
+  static_assert(offsetof(ENetProtocolHeader, sentTime) == 2);
+  static_assert(sizeof(ENetProtocolHeader) == 4);
+  CHECK(offsetof(ENetProtocolHeader, peerID) == 0);
+  CHECK(offsetof(ENetProtocolHeader, sentTime) == sizeof(enet_uint16));
+  CHECK(sizeof(ENetProtocolHeader) == 2 * sizeof(enet_uint16));
+}

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <control/control.hpp>
 #include <crypto/crypto.hpp>
 #include <curl/curl.h>
@@ -388,17 +389,40 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
   }
 }
 
-auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
-                        const std::string &client_ip,
-                        const state::PairedClient &current_client,
-                        immer::box<state::AppState> state,
-                        const events::App &run_app) {
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
-  moonlight::DisplayMode display_mode = {std::stoi(display_mode_str[0].data()),
-                                         std::stoi(display_mode_str[1].data()),
-                                         std::stoi(display_mode_str[2].data()),
-                                         state->config->support_hevc,
-                                         state->config->support_av1};
+// Own the header value across splitting; no returned views or null-terminated
+// reads of individual fields. The cap admits three positive int fields exactly.
+std::optional<moonlight::DisplayMode>
+parse_run_display_mode(const SimpleWeb::CaseInsensitiveMultimap &headers, bool hevc, bool av1) {
+  const auto it = headers.find("mode");
+  if (it != headers.end() && it->second.size() > 32)
+    return {};
+  const std::string mode = get_header(headers, "mode").value_or("1920x1080x60");
+  if (mode.empty() || mode.front() == 'x' || mode.back() == 'x' || mode.find("xx") != std::string::npos ||
+      std::count(mode.begin(), mode.end(), 'x') != 2)
+    return {};
+  const auto fields = utils::split(mode, 'x');
+  if (fields.size() != 3)
+    return {};
+  std::array<int, 3> values{};
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto field = fields[i];
+    if (field.empty() || field.size() > 10 || field.front() < '0' || field.front() > '9')
+      return {};
+    const auto [end, error] = std::from_chars(field.data(), field.data() + field.size(), values[i]);
+    if (error != std::errc{} || end != field.data() + field.size() || values[i] <= 0)
+      return {};
+  }
+  return moonlight::DisplayMode{values[0], values[1], values[2], hevc, av1};
+}
+
+std::shared_ptr<events::StreamSession> create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
+                                                          const std::string &client_ip,
+                                                          const state::PairedClient &current_client,
+                                                          immer::box<state::AppState> state,
+                                                          const events::App &run_app) {
+  const auto display_mode = parse_run_display_mode(headers, state->config->support_hevc, state->config->support_av1);
+  if (!display_mode)
+    return {};
 
   auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
   int channelCount = surround_info & (0xffff /* last 16 bits */);
@@ -406,7 +430,7 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
   auto base_session = create_stream_session(state,
                                             run_app,
                                             current_client,
-                                            display_mode,
+                                            *display_mode,
                                             channelCount,
                                             get_header(headers, "rikey").value(),
                                             get_header(headers, "rikeyid").value());
@@ -450,6 +474,10 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
+  if (!new_session) {
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
   state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
@@ -470,6 +498,10 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   if (old_session) {
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    if (!new_session) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
     new_session->run_scope = old_session->run_scope;
     new_session->audio_sink = old_session->audio_sink;
     new_session->held_modifiers = old_session->held_modifiers;

@@ -50,3 +50,35 @@ WOLF_USE_ZERO_COPY=FALSE, WOLF_ALLOW_PULSE_CONTAINER=FALSE, WOLF_ENABLE_MDNS=FAL
 PULSE_SERVER=unix:/run/user/1000/pulse/native and the isolated runtime/state. Exact config field name is
 `device_free_diagnostic`; pipeline source overrides remain under `video.source`/`audio.source`.
 Manual IP connection uses192.168.88.54. This trial tests video/audio only, not game/device readiness.
+
+## Actual live launch failure correction (after b136 review)
+
+Manager's same-binary sanitized repro identified stack-use-after-scope in
+rest/endpoints.hpp:create_run_session: split returned views into the temporary string from
+get_header(mode).value_or(...); that owner died at the preceding semicolon. The subsequent
+stoi(view.data()) also assumed null-terminated individual fields. The full trace identifies
+ref.tmp at line396, read at397; the audio dispatch nested call appears only in thread creation.
+No remote video/ANNOUNCE/StartRunner occurred in that failed attempt. This is inherited REST code,
+not a demonstrated new audio callback-lifetime defect. Manager separately reproduced two ENet
+null-base offsetof UBSan diagnostics; the third identical outgoing expression is source-confirmed,
+not separately live-reproduced.
+
+The actual REST parser now retains the mode string, checks at most32bytes before copying, exactly
+three nonempty fields and complete positive int conversions with bounded from_chars. No returned
+views. Default1920x1080x60 and valid640x360x30 are preserved. This is a representation bound,
+not a claim that arbitrary INT_MAX dimensions are physically supported. Invalid mode returns no
+session before directories/scopes/registry/event effects; launch/resume return existing400 response
+before mutation. Parsing other request fields is not broadly redesigned. surroundAudioInfo stoi
+and rikey/rikeyid references are consumed within their full expression; create_stream_session
+copies the latter into owned strings. Their existing missing/invalid-field exception policy remains.
+
+ENet fullpin44c85e16279553d9c052e572bcbfcd745fb74abf is unchanged. Tracked patch changes only three
+null-base sentTime offset expressions to offsetof and adds stddef.h. Header/wire layout unchanged.
+CMake PATCH_COMMAND includes patch SHA for ordinary stamp invalidation; driver accepts only exact
+original or known-patched protocol.c plus exact unchanged protocol.h, verifies Git HEAD when metadata
+exists, and rejects unknown/partial states. Archive fixtures have content-hash provenance, not a fake
+Git identity. Source overrides are verify-only after MakeAvailable: pristine/unknown/partial reject,
+knownpatched accepted without mutation. No direct fetched source edits, sanitizer suppression or PIC
+change. Safe tests exercise actual parser/session creation (owned temporary directory only) and actual
+pinned ENet layout; no sockets/devices/runner. Actual multicast/control/network replay still belongs
+to Manager after review. D29-1 protected-test scheduling follow-up remains separate/open.

@@ -85,12 +85,22 @@ target_link_libraries_system(wolf_runner PUBLIC mdns_cpp::mdns_cpp)
 
 
 # Enet
+file(SHA256 "${PROJECT_SOURCE_DIR}/cmake/patches/enet-offsetof.patch" ENET_PATCH_REVISION)
 set(CMAKE_PROJECT_INCLUDE_BEFORE "${PROJECT_SOURCE_DIR}/cmake/EnableCMP0048.cmake")
 FetchContent_Declare(
         enet
         GIT_REPOSITORY https://github.com/cgutman/enet
-        GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf)
+        GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf
+        PATCH_COMMAND ${CMAKE_COMMAND}
+            -DENET_SOURCE_DIR=<SOURCE_DIR> -DENET_PATCH_REVISION=${ENET_PATCH_REVISION}
+            -P ${PROJECT_SOURCE_DIR}/cmake/PatchENetOffsetof.cmake)
 FetchContent_MakeAvailable(enet)
+if (FETCHCONTENT_SOURCE_DIR_ENET)
+    execute_process(COMMAND ${CMAKE_COMMAND}
+        -DENET_SOURCE_DIR=${enet_SOURCE_DIR} -DENET_VERIFY_ONLY=ON
+        -P ${PROJECT_SOURCE_DIR}/cmake/PatchENetOffsetof.cmake
+        COMMAND_ERROR_IS_FATAL ANY)
+endif ()
 if (BUILD_SHARED_LIBS)
     # The pinned ENet builds a static archive consumed by the shared wolf_runner.
     set_target_properties(enet PROPERTIES POSITION_INDEPENDENT_CODE ON)
