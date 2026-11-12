@@ -410,8 +410,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           settle_join(join_lobby_event, "Lobby or session not found");
           return;
         }
-        if (diagnostic::disabled(*session)) {
-          settle_join(join_lobby_event, "Diagnostic app cannot join lobbies");
+        if (diagnostic::isolated(*session) || diagnostic::isolated_target(*lobby, *sessions)) {
+          settle_join(join_lobby_event,
+                      diagnostic::disabled(*session) ? "Diagnostic app cannot join lobbies"
+                                                     : "Isolated app cannot join lobbies");
           return;
         }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
@@ -558,10 +560,12 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
         if (!source ||
             !sessions::targets(source->run_scope, plug_device_event->run_scope.get(), plug_device_event->session_id))
           return;
-        if (diagnostic::disabled(*source))
+        if (diagnostic::isolated(*source))
           return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_for_session(lobbies, *source)) {
+          if (diagnostic::isolated_target(*lobby, *app_state->running_sessions->load()))
+            return;
           logs::log(logs::info,
                     "[LOBBY] adding device to session {} in lobby {}",
                     plug_device_event->session_id,
@@ -585,8 +589,12 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
                                           unplug_device_event->run_scope.get(),
                                           unplug_device_event->session_id))
           return;
+        if (diagnostic::isolated(*source))
+          return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_for_session(lobbies, *source)) {
+          if (diagnostic::isolated_target(*lobby, *app_state->running_sessions->load()))
+            return;
           logs::log(logs::debug, "[LOBBY] Unplug device for session {}", unplug_device_event->session_id);
           app_state->event_bus->fire_event(immer::box<events::UnplugDeviceEvent>{
               events::UnplugDeviceEvent{.session_id = lobby->id,

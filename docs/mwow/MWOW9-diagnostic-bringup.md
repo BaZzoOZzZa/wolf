@@ -121,3 +121,57 @@ implicitly recover by later property assignment. Fresh encryption=false behavior
 The negative GObject virtual-method test now exercises this actual boundary; a separate valid-key/invalid-IV
 case exercises the existing catch/drop helper. This is not a fix to all crypto helper callers. Initial fixture
 compile namespace ambiguity and static-registration C linkage errors are preserved as build failures, not RED.
+
+## Supervised legacy PadOnly trial — source checkpoint (not enabled or tested live)
+
+`legacy_pad_only_trial` is a separate app opt-in, absent=false; `legacy_pad_slot` is absent=0,
+validated 0..15. Config parsing rejects diagnostic+trial, compositor, audio-server or non-process
+runner combinations before constructing app effects. Runtime flags are Skip fields, not client wire
+settings. Config save projection preserves both opt-ins and the selected slot. Existing video/audio
+override save limitations are not fixed: no operator config/API mutation during the trial.
+
+The actual startup helper suppresses Mouse/Keyboard/Wayland/VSink construction and socket wait for
+this mode, then invokes the existing runner once. Ordinary no-compositor and compositor readiness
+paths remain; device_free_diagnostic still rejects ALL input. App policy must be chosen before a
+fresh stream/host, never changed on a session that already has devices.
+
+The actual common dispatcher permits only selected-slot ARRIVAL/MULTI with a non-null ControlPeer
+and sender, valid captured scopes and existing packet bounds. Unix input supplies a null peer and
+is refused. **ControlPeer is not an authentication capability by itself**: the unchanged actual
+ControlLoop::State::dispatch checks current connection/run, key possession, V2 replay/nonce and
+current generation again before this call. Direct internal typed entry points require that same
+trusted serialized caller; no invented per-request approved bool or probing send with an empty
+payload. The appended actual-loop fixture replaces only host/service IO and exercises same-ID
+connection replacement before input dispatch, reused raw peer allocation, stale sender refusal and
+fresh authentication. It uses inactive MULTI even on a regression, never a device-opening packet.
+
+The common device type selector forces Xbox despite PS/motion/client overrides. Only the selected
+slot is retained in session.joypads; a nonempty incompatible inventory is refused. Active MULTI can
+create it before ARRIVAL; inactive MULTI with no pad is a no-op. Repeated ARRIVAL and mask cycles
+reuse it. Inactive masks call existing buttons/sticks/triggers setters with zeroes, keep the pad,
+and do not perform kernel delivery verification. Trial frames have no UI combo handling. Non-pad
+common/typed/lazy paths refuse mouse/keyboard/text/pen/touch/motion/battery and other pad extensions;
+no rumble/LED/adaptive callbacks or motion requests are registered/sent for the trial pad. Plug/Unplug
+relay and Join refuse isolated sources and available isolated targets (matching running RunScope or
+retained lobby members); Lobby has no standalone App policy. Existing exact membership guards remain.
+The host desktop Wine path needs no Docker hotplug/Wayland alias; no trial udev-event lookup/relay.
+
+`control::detail::TrialPadIO` is a synchronous, per-call internal factory/lookup/setter boundary,
+never stored or configured publicly. Production supplies the actual session inventory and common
+Xbox factory; tests replace only IO after real dispatcher validation. `apply_trial_frame` is the same
+production setter mapping exercised by recording IO. Normal input does not construct this IO adapter.
+The actual type selector is separately exercised for PS/motion/overrides and unchanged normal behavior.
+No fake device or stub inputtino replaces production. New regression cases are **prepared, not run**
+in the source-only phase; all original 14 diagnostic test bodies remain byte-identical. Native
+compile/SAN/tests and independent review require Manager's separate build grant after live host stop.
+No runtime PASS, enablement, device creation, Wine mapping or fresh build claim accompanies this commit.
+
+Boundary of “one”: ONE selected pad in ONE supervised trusted iPad stream, not an enforced process-wide
+singleton/GameACL or all-routes policy. No parallel launch/client, no handoff, no privileged Unix mutation
+in the trial. Protected InputSeat/Handoff/checked backend remain unwired. Legacy Xbox uses uinput,
+not uhid, but still starts its existing detached FF listener internally even with feedback callback
+unset. Void setters/cache and inactive-mask neutral do not prove kernel acceptance, joined retirement
+or neutral on pause/disconnect. Release controls before disconnect; Manager owns supervised cleanup.
+No new worker, global singleton or reaper was added. `/dev/uinput` ACL alone does not prove Wine access
+to newly created event/js nodes or game hotplug/mapping; those remain separate supervised runtime checks.
+No `/dev/uhid` permission is needed/requested. Current game/prefix and deployed binaries remain untouched.

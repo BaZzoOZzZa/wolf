@@ -5,6 +5,13 @@
 
 namespace wolf::core::sessions::diagnostic {
 inline void validate(const config::BaseApp &app) {
+  const int slot = app.legacy_pad_slot.value_or(0);
+  if (slot < 0 || slot >= moonlight::control::CONTROL_SLOT_COUNT)
+    throw std::invalid_argument("legacy_pad_slot must be in 0..15");
+  if (app.legacy_pad_only_trial.value_or(false) &&
+      (app.device_free_diagnostic.value_or(false) || app.start_virtual_compositor.value_or(true) ||
+       app.start_audio_server.value_or(true) || !rfl::holds_alternative<config::AppCMD>(app.runner.variant())))
+    throw std::invalid_argument("legacy_pad_only_trial requires no diagnostic/compositor/audio and a process runner");
   if (app.device_free_diagnostic.value_or(false) &&
       (app.start_virtual_compositor.value_or(true) || app.start_audio_server.value_or(true) ||
        !rfl::holds_alternative<config::AppCMD>(app.runner.variant())))
@@ -13,14 +20,34 @@ inline void validate(const config::BaseApp &app) {
 inline bool disabled(const events::StreamSession &session) {
   return session.app && events::device_free(*session.app);
 }
+inline bool pad_only(const events::StreamSession &session) {
+  return session.app && events::pad_only_trial(*session.app);
+}
+// Both opt-ins forbid non-pad input, startup devices and device/lobby aliasing.
+// Only device_free forbids the selected trial Xbox input as well.
+inline bool isolated(const events::StreamSession &session) {
+  return disabled(session) || pad_only(session);
+}
+inline bool isolated_target(const events::Lobby &lobby, const immer::vector<events::StreamSession> &running) {
+  for (const auto &s : running)
+    if (s.run_scope.matches(lobby.run_scope) && isolated(s))
+      return true;
+  for (const auto &[id, member] : *lobby.members->load())
+    if (member && isolated(*member))
+      return true;
+  return false;
+}
 inline bool queue_device(const immer::box<events::PlugDeviceEvent> &event,
                          const immer::vector<events::StreamSession> &running,
                          const immer::vector<events::Lobby> &lobbies,
                          const RunScope &run,
                          const std::shared_ptr<events::devices_atom_queue> &queue) {
   auto source = state::get_session_by_scope(running, event->connection_scope.get());
-  if (!source || disabled(*source))
+  if (!source || isolated(*source))
     return false;
+  for (const auto &target : running)
+    if (target.run_scope.matches(run) && isolated(target))
+      return false;
   return state::queue_own_session_device(event, running, lobbies, run, queue);
 }
 // Trusted owned operations; production passes actual factories and captured session.
@@ -33,7 +60,10 @@ struct StartupOps {
   std::function<void()> runner, failed;
 };
 inline boost::future<void> start(const events::App &app, StartupOps ops) {
-  if (events::device_free(app) && (app.start_virtual_compositor || app.start_audio_server)) {
+  const bool restricted = events::device_free(app) || events::pad_only_trial(app);
+  if ((restricted && (app.start_virtual_compositor || app.start_audio_server)) ||
+      (events::pad_only_trial(app) && (events::device_free(app) || app.legacy_pad_slot.get() < 0 ||
+                                       app.legacy_pad_slot.get() >= moonlight::control::CONTROL_SLOT_COUNT))) {
     ops.failed();
     return {};
   }
@@ -41,7 +71,7 @@ inline boost::future<void> start(const events::App &app, StartupOps ops) {
   if (app.start_virtual_compositor) {
     ready = ops.compositor();
   } else {
-    if (!events::device_free(app)) {
+    if (!restricted) {
       ops.mouse();
       ops.keyboard();
     }

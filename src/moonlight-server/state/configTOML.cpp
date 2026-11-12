@@ -189,6 +189,8 @@ parse_apps(const std::vector<BaseApp> &apps,
 
         return immer::box<events::App>{
             events::App{.device_free_diagnostic = app.device_free_diagnostic.value_or(false),
+                        .legacy_pad_only_trial = app.legacy_pad_only_trial.value_or(false),
+                        .legacy_pad_slot = app.legacy_pad_slot.value_or(0),
                         .base = {.title = app.title,
                                  .id = generate_app_id(app),
                                  .support_hdr = false,
@@ -486,7 +488,10 @@ void update_profiles(const Config &cfg, const ProfilesList &profiles) {
                        .pin = p->pin,
                        .apps = p->apps->load().get() | //
                                ranges::views::transform([](const immer::box<events::App> &app) {
-                                 return BaseApp{.title = app->base.title,
+                                 return BaseApp{.device_free_diagnostic = events::device_free(*app),
+                                                .legacy_pad_only_trial = events::pad_only_trial(*app),
+                                                .legacy_pad_slot = app->legacy_pad_slot.get(),
+                                                .title = app->base.title,
                                                 .icon_png_path = app->base.icon_png_path,
                                                 .render_node = app->render_node,
                                                 .start_virtual_compositor = app->start_virtual_compositor,

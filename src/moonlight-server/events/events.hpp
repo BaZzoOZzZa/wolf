@@ -70,6 +70,8 @@ struct Runner {
 
 struct App {
   rfl::Skip<bool> device_free_diagnostic = false;
+  rfl::Skip<bool> legacy_pad_only_trial = false;
+  rfl::Skip<int> legacy_pad_slot = 0;
   moonlight::App base;
 
   std::string video_producer_buffer_caps;
@@ -88,6 +90,10 @@ struct App {
 
 inline bool device_free(const App &app) {
   return app.device_free_diagnostic.get();
+}
+
+inline bool pad_only_trial(const App &app) {
+  return app.legacy_pad_only_trial.get();
 }
 
 struct Profile {

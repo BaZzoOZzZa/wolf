@@ -118,6 +118,8 @@ struct BaseAppAudioOverride {
 
 struct BaseApp {
   std::optional<bool> device_free_diagnostic;
+  std::optional<bool> legacy_pad_only_trial;
+  std::optional<int> legacy_pad_slot;
   std::string title;
   std::optional<std::string> icon_png_path;
   std::optional<std::string> render_node;
