@@ -112,3 +112,12 @@ size limits, property concurrency, general callback exception safety and output 
 claimed audited/closed by this lifetime change. Manager's orphan sleep600 inheriting listener FDs is a
 SEPARATE observed process-runner residual: no process.cpp fix here; diagnostic wrapper cleanup remains
 Manager-owned. D29-1, mDNS alignment mitigation and previous live/physical/isolation gates remain open.
+
+The new negative short-key test exposed a separate inherited CBC size-validation gap (one-byte key
+produced a packet; three assertions failed, preserved as evidence). Manager approved a narrow additional
+boundary in the owned actual generate_output: reject encrypted keys of length other than16 BEFORE split/
+OpenSSL; clear output, retire the transferred input once, set sticky encrypt_failed. Failed instances cannot
+implicitly recover by later property assignment. Fresh encryption=false behavior remains unchanged.
+The negative GObject virtual-method test now exercises this actual boundary; a separate valid-key/invalid-IV
+case exercises the existing catch/drop helper. This is not a fix to all crypto helper callers. Initial fixture
+compile namespace ambiguity and static-registration C linkage errors are preserved as build failures, not RED.

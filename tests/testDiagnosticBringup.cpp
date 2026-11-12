@@ -608,10 +608,48 @@ TEST_CASE("Actual static audio payloader pipeline encrypts four buffers and emit
   CHECK(rs.expired());
 }
 
-TEST_CASE("Actual audio payloader keeps encryption failure closed", "[diagnostic][audio-lifetime]") {
+TEST_CASE("Actual audio GObject output rejects invalid AES key before consuming crypto and stays closed",
+          "[diagnostic][audio-lifetime]") {
   diagnostic_audio_gst();
-  AudioObject object{
-      GST_ELEMENT(g_object_new(gst_TYPE_rtp_moonlight_pay_audio, "aes-key", "00", "aes-iv", "17", nullptr))};
+  for (const auto &key : {std::string{}, std::string("00"), std::string(30, '1'), std::string(34, '1')}) {
+    unsigned input_releases = 0;
+    AudioObject object{
+        GST_ELEMENT(g_object_new(gst_TYPE_rtp_moonlight_pay_audio, "aes-key", key.c_str(), "aes-iv", "17", nullptr))};
+    auto pay = gst_rtp_moonlight_pay_audio(object.value);
+    auto trans = GST_BASE_TRANSFORM(object.value);
+    auto invoke = [&] {
+      auto input = gst_buffer_new_and_fill(16, 1);
+      gst_mini_object_weak_ref(
+          GST_MINI_OBJECT(input),
+          [](gpointer data, GstMiniObject *) { ++*static_cast<unsigned *>(data); },
+          &input_releases);
+      trans->queued_buf = input; // transfer-full, actual generate_output must retire it once.
+      GstBuffer *out = input;    // sentinel: callback must overwrite, never dereferenced afterward.
+      auto result = GST_BASE_TRANSFORM_GET_CLASS(trans)->generate_output(trans, &out);
+      CHECK(out == nullptr);
+      CHECK(trans->queued_buf == nullptr);
+      return result;
+    };
+    CHECK(invoke() == GST_FLOW_ERROR);
+    CHECK(input_releases == 1);
+    CHECK(pay->encrypt);
+    CHECK(pay->encrypt_failed);
+    CHECK(pay->cur_seq_number == 0);
+    g_object_set(object.value, "aes-key", "00112233445566778899aabbccddeeff", nullptr);
+    CHECK(invoke() == GST_FLOW_ERROR); // fixing the property does not reopen failed instance.
+    CHECK(input_releases == 2);
+    CHECK(pay->cur_seq_number == 0);
+  }
+}
+
+TEST_CASE("Actual audio split keeps invalid IV encryption failure closed", "[diagnostic][audio-lifetime]") {
+  diagnostic_audio_gst();
+  AudioObject object{GST_ELEMENT(g_object_new(gst_TYPE_rtp_moonlight_pay_audio,
+                                              "aes-key",
+                                              "00112233445566778899aabbccddeeff",
+                                              "aes-iv",
+                                              "not-a-number",
+                                              nullptr))};
   auto pay = gst_rtp_moonlight_pay_audio(object.value);
   auto buffer = gst_buffer_new_and_fill(16, 1);
   std::unique_ptr<GstBuffer, decltype(&gst_buffer_unref)> owner(buffer, gst_buffer_unref);

@@ -255,6 +255,7 @@ void gst_rtp_moonlight_pay_audio_finalize(GObject *object) {
 static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransform *trans, GstBuffer **outbuf) {
   gst_rtp_moonlight_pay_audio *rtpmoonlightpay_audio = gst_rtp_moonlight_pay_audio(trans);
   GstBuffer *inbuf;
+  *outbuf = nullptr;
 
   /* Retrieve stashed input buffer, if the default submit_input_buffer was run. Takes ownership back from there */
   inbuf = trans->queued_buf;
@@ -264,6 +265,14 @@ static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransfor
   if (inbuf == nullptr)
     return GST_FLOW_OK;
 
+  if (rtpmoonlightpay_audio->encrypt_failed ||
+      (rtpmoonlightpay_audio->encrypt && rtpmoonlightpay_audio->aes_key.size() != 16)) {
+    if (!rtpmoonlightpay_audio->encrypt_failed)
+      GST_ERROR_OBJECT(rtpmoonlightpay_audio, "Invalid AES-128 audio key length; refusing output");
+    rtpmoonlightpay_audio->encrypt_failed = true;
+    gst_buffer_unref(inbuf);
+    return GST_FLOW_ERROR;
+  }
   if (!rtpmoonlightpay_audio->packets_buffer || !rtpmoonlightpay_audio->rs) {
     gst_buffer_unref(inbuf);
     return GST_FLOW_ERROR;
@@ -276,7 +285,6 @@ static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransfor
   gst_buffer_unref(inbuf);
 
   /* Setting outbuf to NULL and returning GST_BASE_TRANSFORM_FLOW_DROPPED will signal that we finished doing business */
-  outbuf = nullptr;
   return GST_BASE_TRANSFORM_FLOW_DROPPED;
 }
 
