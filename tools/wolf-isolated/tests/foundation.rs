@@ -130,3 +130,81 @@ fn runtime_commands_explicitly_unsupported_without_effects() {
         assert_eq!(v["error"], "runtime_stage_not_implemented");
     }
 }
+
+#[test]
+fn game_tree_overlap_both_directions_and_sibling() {
+    let mut accepted = Vec::new();
+    for source in [
+        "/home",
+        "/home/desktop",
+        "/home/desktop/games",
+        "/srv",
+        "/srv/wolf-wow",
+        "/srv/wolf-wow/games",
+        "/APPROVAL_REQUIRED",
+        "/APPROVAL_REQUIRED/original-prefix",
+        "/APPROVAL_REQUIRED/original-prefix/games",
+    ] {
+        let mut p = profile();
+        p.game_data = source.into();
+        if validate(&p).is_empty() || inspect(&p, true).proposal.is_some() {
+            accepted.push(source);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "overlapping game trees accepted: {accepted:?}"
+    );
+    for source in [
+        "/home/desktop-games",
+        "/srv/wolf-wow-games",
+        "/APPROVAL_REQUIRED/original-prefix-games",
+    ] {
+        let mut p = profile();
+        p.game_data = source.into();
+        assert!(
+            validate(&p).is_empty(),
+            "distinct sibling refused: {source}"
+        );
+        assert!(inspect(&p, true).proposal.is_some());
+    }
+}
+
+#[test]
+fn cli_plan_refuses_ancestor_mounts_but_keeps_distinct_sibling_proposal() {
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").unwrap());
+    let file = root.join(format!("r37-profile-{}.json", std::process::id()));
+    assert!(!file.exists());
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).unwrap();
+        }
+    }
+    std::fs::write(&file, b"").unwrap();
+    let _cleanup = Cleanup(file.clone());
+    let mut accepted = Vec::new();
+    for source in ["/home", "/srv", "/APPROVAL_REQUIRED", "/home/desktop-games"] {
+        let mut p = profile();
+        p.game_data = source.into();
+        std::fs::write(&file, serde_json::to_vec(&p).unwrap()).unwrap();
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_wolf-isolated"))
+            .arg("plan")
+            .arg(&file)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2)); // placeholders remain unprovisioned
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["runtime_supported"], false);
+        if source == "/home/desktop-games" {
+            assert_eq!(report["manifest_valid"], true);
+            assert!(report["proposal"].is_object());
+        } else if report["manifest_valid"] != false || !report["proposal"].is_null() {
+            accepted.push(source);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "CLI proposed ancestor mounts: {accepted:?}"
+    );
+}
