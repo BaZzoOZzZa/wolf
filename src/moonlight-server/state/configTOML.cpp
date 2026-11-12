@@ -1,5 +1,4 @@
 #include <events/events.hpp>
-#include <sessions/diagnostic_startup.hpp>
 #include <events/reflectors.hpp>
 #include <fstream>
 #include <gst/gstelementfactory.h>
@@ -7,6 +6,7 @@
 #include <platforms/hw.hpp>
 #include <range/v3/view.hpp>
 #include <rfl/toml.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <state/config.hpp>
 
 namespace state {

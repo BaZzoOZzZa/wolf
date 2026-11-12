@@ -4,11 +4,11 @@
 #include <boost/locale.hpp>
 #include <control/input_dispatch.hpp>
 #include <control/input_handler.hpp>
-#include <sessions/diagnostic_startup.hpp>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
 #include <immer/box.hpp>
 #include <platforms/input.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <string>
 
 namespace control {

@@ -1,7 +1,7 @@
-#include <sessions/diagnostic_startup.hpp>
 #include <immer/vector_transient.hpp>
 #include <rfl/json.hpp>
 #include <sessions/common.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <sessions/handlers.hpp>
 #include <sessions/lifecycle.hpp>
 #include <state/config.hpp>
