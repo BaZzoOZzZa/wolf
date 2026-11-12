@@ -82,3 +82,7 @@ knownpatched accepted without mutation. No direct fetched source edits, sanitize
 change. Safe tests exercise actual parser/session creation (owned temporary directory only) and actual
 pinned ENet layout; no sockets/devices/runner. Actual multicast/control/network replay still belongs
 to Manager after review. D29-1 protected-test scheduling follow-up remains separate/open.
+
+The tracked ENet diff uses zero context to avoid whitespace-only context lines in the patch artifact;
+--unidiff-zero is allowed only after the complete pristine-file SHA check, then exact post-hash verification.
+No fuzzy or unknown-source application is permitted.

@@ -13,7 +13,7 @@ if(EXISTS "${ENET_SOURCE_DIR}/.git")
 endif()
 set(patch "${CMAKE_CURRENT_LIST_DIR}/patches/enet-offsetof.patch")
 file(SHA256 "${patch}" patch_hash)
-if(NOT patch_hash STREQUAL "6441d03d0fae5e00e0e8ef0830c0587954c3f57cf4a59141977ff8a3278fad42")
+if(NOT patch_hash STREQUAL "4f570f4cd51a0cfe50af4d0da5845a63a9c0e72fb7fb25aee920112c383308d2")
     message(FATAL_ERROR "Unexpected ENet tracked patch content")
 endif()
 if(DEFINED ENET_PATCH_REVISION AND NOT ENET_PATCH_REVISION STREQUAL patch_hash)
@@ -38,12 +38,12 @@ endif()
 if(ENET_VERIFY_ONLY)
     message(FATAL_ERROR "ENet source override requires tracked offsetof correction; verify-only")
 endif()
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check "${patch}"
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --check --unidiff-zero "${patch}"
                 WORKING_DIRECTORY "${ENET_SOURCE_DIR}" RESULT_VARIABLE result)
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "ENet offsetof patch preflight failed")
 endif()
-execute_process(COMMAND "${GIT_EXECUTABLE}" apply "${patch}"
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --unidiff-zero "${patch}"
                 WORKING_DIRECTORY "${ENET_SOURCE_DIR}" RESULT_VARIABLE result)
 if(NOT result EQUAL 0)
     message(FATAL_ERROR "ENet offsetof patch failed")
