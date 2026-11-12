@@ -123,3 +123,98 @@ Actual validator and CLI regression tests reproduced all three ancestor proposal
 identical test bytes on GREEN. Original tests remain unchanged. No runtime, udev, ACL or prefix
 effects were added. Updated template ordering remains a proposal requiring later override review
 and fresh node/ACL/FD proof before any separate installation approval.
+
+
+## Owned runtime contract checkpoint — blocked before effectful code
+
+The accepted schema-1 profile is NOT sufficient to implement an honest start. This is an
+artifact/interface gap, not a request for permission to run anything. No runtime implementation
+or provisioning is claimed by this checkpoint; existing inspect/plan and Unsupported commands
+remain unchanged. Source-derived dependencies:
+
+- `wolf.cpp:177–205` starts the actual monolithic server from `WOLF_CFG_FILE`/key/cert state;
+  schema1 pins a binary, but has no exact reviewed isolated Wolf configuration or state binding.
+- `sessions/moonlight.cpp:90–119,162–190` creates the private compositor **on StreamSession**,
+  learns its real socket from the plugin, then fires StartRunner. The static plan's
+  `/run/user/UID/wolf-wayland` is a proposal, NOT a produced/owned readiness receipt.
+- `sessions/common.cpp:19–45,69–84` forwards actual session/environment/socket/device data into
+  Runner. `runners/process.cpp:14–40` receives but does not forward the device queue/paths as a
+  typed handshake; environment text is not a node-allocation proof.
+- `runners/docker.cpp:181–197` itself creates/starts a guest after StartRunner. Using that runner
+  AND an independent Rust create would introduce two guest owners. Rust must be the sole guest
+  creator; choose a fixed process-runner bridge, not a second Docker runner or desktop fallback.
+
+### Exact additive interface proposed for the next source grant
+
+Keep schema1 inspect/plan and its eleven tests intact. Add a separately bounded schema-1
+`RuntimeSpec` parsed only by `start PROFILE --runtime SPEC` (32KiB max, deny unknown fields):
+
+```text
+RuntimeSpec {
+  profile_sha256,
+  wolf_config: { canonical_path, sha256 },
+  private_state_dir: { canonical_path, owner_uid, dev, ino },
+  working_prefix: { dev, ino, migration_manifest_sha256 },
+  image_layout_manifest: { canonical_path, sha256 },
+  host_bridge: { canonical_path, sha256, protocol: 1 },
+  control_directory: { canonical_path, owner_uid, dev, ino }
+}
+```
+
+No `approved=true`, `ready=true`, caller-supplied PID or passive JSON can authorize effects.
+The migration manifest must come from the later explicitly approved clean-stop/backup/clone
+operation; it cannot be minted by inspect. Original unmanaged Wine does not honor our new lock:
+flocking its path alone cannot prove it is idle. Current manual WoW remains untouched.
+Image-layout manifest must bind the image digest to actual guest Wine/Gamescope/entrypoint/plugin
+locations/hashes and their build provenance; the six host artifact hashes do not establish this.
+The approved guest entrypoint must take the exact shared working-prefix lease before Wine;
+otherwise do not start. Neither artifact/provider currently exists in this crate.
+
+One pinned host bridge executable (inside tools/wolf-isolated, future explicit source grant) runs
+as the fixed native Wolf app ProcessRunner, NOT as a generic command. A private owned Unix channel
+must bind peer credentials + boot/PID/starttime + per-launch fresh nonce to the native child and
+expected config/app. It transfers a bounded typed `SessionReadyV1` with actual source session,
+Wayland/Pulse socket identities and fresh Xbox node devnum/inode/generation. Raw inherited env,
+name/VID/PID or current static event path alone cannot seal this record. Resolve how the bridge
+obtains exact initial/hotplug device metadata from the actual Runner queue before implementation;
+if the existing process runner cannot expose it safely, request a narrow C++ adapter separately.
+No broad protected-stage work is required, but no fabricated readiness receipt is acceptable.
+
+### Minimal lifecycle algorithm after that bridge contract is reviewed
+
+Reserve a private process/domain AND migrated-prefix journal/OS lock before child/engine effects.
+Journal contains profile/spec digest, launch nonce, boot ID, owner PID/starttime and exact child/
+container identities; no keys/account/environment. Run foreground in an explicitly provisioned
+remote-UID service context; do not silently setuid/create a user. One owner, no background daemon.
+Verify all prerequisites first, start the fixed native Wolf child with explicit clean environment,
+then wait for real bridge readiness (AwaitingSession is not game-ready). Only this owner creates
+one guest with the fixed inspected mount/cap/device arguments. Never invoke Wolf's Docker runner
+as a second owner. Each effect is preceded by its journal obligation; uncertain create retains
+nonce/label and Unknown even if no CID was returned. Recover only by exact nonce+profile identity,
+never by a generic container name/global PID scan.
+
+Status/stop require the exact current private journal/boot/owner identity. Status absence is not
+Stopped. Stop requests exact owned container/child only, then requires actual engine inspect-exit
+AND child wait/join (including bridge shutdown) before lease release. Deadline/daemon loss/child
+exit alone => Unknown, retained journal/lease, no replacement/remove/broad kill. No callback/IO or
+last arbitrary capture destruction under the bookkeeping gate. Recovery/reconciliation is explicit,
+not successful cleanup inferred from CLI exit. Cross-boot journals require reconciliation, not PID
+reuse. No Minecraft identity is a permissible stop target.
+
+### Next bounded implementation and actual test matrix
+
+After approving the additive spec/bridge producer contract, own only existing
+`tools/wolf-isolated/{src,tests,profiles}/**` + this doc: one `runtime.rs` controller, one small
+journal helper and fixed bridge mode; no generic executor/framework. Inject primitive engine,
+process, clock and journal IO in tests, while production controller performs all identity/state
+checks. Cover busy lease before effects; missing spec/plugin/image-layout/migration/device proof;
+exact partial-create rollback; uncertain create/start/inspect/child exit retains Unknown; exact
+verified exits release; foreign/stale/boot/PID reuse stop denial; concurrent reserve refusal;
+Minecraft/unowned IDs untouched; cleanup reentry outside gates. Pure CLI refusal tests must assert
+zero effect calls, not accept a fake success bool. Existing foundation tests remain byte-identical.
+
+**Current checkpoint limitation:** no controller/bridge/attestation producer was invented to make
+mocks pass. Source runtime and its new tests are blocked on the above concrete artifact handshake;
+no Cargo rerun is warranted for this doc-only delta. Request a narrow next source grant for the
+spec+bridge producer boundary before implementing effectful lifecycle. Provisioning and physical
+start remain separate later approvals. No users/rules/ACLs/prefix/graphics/network/game changes.
