@@ -577,18 +577,18 @@ TEST_CASE("Actual static audio payloader pipeline encrypts four buffers and emit
     REQUIRE(buffer);
     const auto bytes = gst_buffer_copy_content(buffer);
     if (i < 4) {
-      REQUIRE(bytes.size() > audio::RTP_HEADER_SIZE);
-      audio::AudioRTPHeaders header{};
+      REQUIRE(bytes.size() > ::audio::RTP_HEADER_SIZE);
+      ::audio::AudioRTPHeaders header{};
       memcpy(&header, bytes.data(), sizeof(header));
       CHECK(header.rtp.packetType == 97);
       CHECK(boost::endian::big_to_native(header.rtp.sequenceNumber) == i);
       CHECK(boost::endian::big_to_native(header.rtp.timestamp) == i * 5);
-      const std::string ciphertext(bytes.begin() + audio::RTP_HEADER_SIZE, bytes.end());
+      const std::string ciphertext(bytes.begin() + ::audio::RTP_HEADER_SIZE, bytes.end());
       CHECK(ciphertext != payload);
       CHECK(crypto::aes_decrypt_cbc(ciphertext, key, derive_iv("17", i), true) == payload);
     } else {
-      REQUIRE(bytes.size() > audio::FEC_HEADER_SIZE);
-      audio::AudioFECPacket header{};
+      REQUIRE(bytes.size() > ::audio::FEC_HEADER_SIZE);
+      ::audio::AudioFECPacket header{};
       memcpy(&header, bytes.data(), sizeof(header));
       CHECK(header.rtp.packetType == 127);
       CHECK(header.fec_header.fecShardIndex == i - 4);
@@ -613,7 +613,7 @@ TEST_CASE("Actual audio payloader keeps encryption failure closed", "[diagnostic
   auto pay = gst_rtp_moonlight_pay_audio(object.value);
   auto buffer = gst_buffer_new_and_fill(16, 1);
   std::unique_ptr<GstBuffer, decltype(&gst_buffer_unref)> owner(buffer, gst_buffer_unref);
-  auto packets = audio::split_into_rtp(pay, buffer);
+  auto packets = ::audio::split_into_rtp(pay, buffer);
   std::unique_ptr<GstBufferList, decltype(&gst_buffer_list_unref)> packet_owner(packets, gst_buffer_list_unref);
   CHECK(gst_buffer_list_length(packets) == 0);
   CHECK(pay->encrypt);
