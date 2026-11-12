@@ -317,3 +317,10 @@ if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
     add_test(NAME wolf-protected-pairing-tests COMMAND wolf-protected-pairing-tests)
     set_tests_properties(wolf-protected-pairing-tests PROPERTIES LABELS "security;isolated" TIMEOUT 90)
 endif ()
+
+# Actual diagnostic startup/input decisions with injected IO; no devices/network/main.
+add_executable(wolf-diagnostic-bringup-tests testDiagnosticBringup.cpp)
+target_compile_features(wolf-diagnostic-bringup-tests PRIVATE cxx_std_20)
+target_link_libraries(wolf-diagnostic-bringup-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+add_test(NAME wolf-diagnostic-bringup-tests COMMAND wolf-diagnostic-bringup-tests)
+set_tests_properties(wolf-diagnostic-bringup-tests PROPERTIES LABELS "diagnostic;isolated" TIMEOUT 60)

@@ -4,6 +4,7 @@
 #include <boost/locale.hpp>
 #include <control/input_dispatch.hpp>
 #include <control/input_handler.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <events/events.hpp>
 #include <helpers/logger.hpp>
 #include <immer/box.hpp>
@@ -23,6 +24,8 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
                                                        int controller_number,
                                                        CONTROLLER_TYPE requested_type,
                                                        uint8_t capabilities) {
+  if (sessions::diagnostic::disabled(session))
+    return {};
 
   auto on_rumble_fn = ([connected_client, controller_number](int low_freq, int high_freq) {
     auto rumble_pkt = ControlRumblePacket{
@@ -218,6 +221,8 @@ std::shared_ptr<events::JoypadTypes> create_new_joypad(const events::StreamSessi
  * will also trigger a PlugDeviceEvent
  */
 bool create_pen_tablet(events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return false;
   logs::log(logs::debug, "[INPUT] Creating new pen tablet");
   auto tablet = PenTablet::create();
   if (!tablet) {
@@ -245,6 +250,8 @@ bool create_pen_tablet(events::StreamSession &session) {
  * will also trigger a PlugDeviceEvent
  */
 bool create_touch_screen(events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return false;
   logs::log(logs::debug, "[INPUT] Creating new touch screen");
   auto touch = TouchScreen::create();
   if (!touch) {
@@ -276,6 +283,8 @@ static inline float deg2rad(float degree) {
 }
 
 void mouse_move_rel(const MOUSE_MOVE_REL_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (session.mouse->has_value()) {
     auto pointer_acceleration = session.client_settings->mouse_acceleration;
     auto delta_x = static_cast<float>(boost::endian::big_to_native(pkt.delta_x)) * pointer_acceleration;
@@ -287,6 +296,8 @@ void mouse_move_rel(const MOUSE_MOVE_REL_PACKET &pkt, events::StreamSession &ses
 }
 
 void mouse_move_abs(const MOUSE_MOVE_ABS_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (session.mouse->has_value()) {
     auto pointer_acceleration = session.client_settings->mouse_acceleration;
     float x = boost::endian::big_to_native(pkt.x);
@@ -309,6 +320,8 @@ void mouse_move_abs(const MOUSE_MOVE_ABS_PACKET &pkt, events::StreamSession &ses
 }
 
 void mouse_button(const MOUSE_BUTTON_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (session.mouse->has_value()) {
     if (std::holds_alternative<state::input::Mouse>(session.mouse->value())) {
       Mouse::MOUSE_BUTTON btn_type;
@@ -348,6 +361,8 @@ void mouse_button(const MOUSE_BUTTON_PACKET &pkt, events::StreamSession &session
 }
 
 void mouse_scroll(const MOUSE_SCROLL_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (session.mouse->has_value()) {
     std::visit(
         [session, scroll_amount = boost::endian::big_to_native(pkt.scroll_amt1)](auto &mouse) {
@@ -361,6 +376,8 @@ void mouse_scroll(const MOUSE_SCROLL_PACKET &pkt, events::StreamSession &session
 }
 
 void mouse_h_scroll(const MOUSE_HSCROLL_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (session.mouse->has_value()) {
     std::visit(
         [session, scroll_amount = boost::endian::big_to_native(pkt.scroll_amount)](auto &mouse) {
@@ -396,6 +413,8 @@ static char modifier_bit(short moonlight_key) {
 }
 
 void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   // moonlight always sets the high bit; not sure why but mask it off here
   short moonlight_key = (short)boost::endian::little_to_native(pkt.key_code) & (short)0x7fff;
 
@@ -470,6 +489,8 @@ void keyboard_key(const KEYBOARD_PACKET &pkt, events::StreamSession &session) {
 }
 
 void utf8_text(const UTF8_TEXT_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   auto data_size = boost::endian::big_to_native(pkt.data_size);
   if (data_size <= sizeof(INPUT_TYPE) || data_size > sizeof(INPUT_TYPE) + UTF8_TEXT_MAX_LEN)
     return;
@@ -496,6 +517,8 @@ void utf8_text(const UTF8_TEXT_PACKET &pkt, events::StreamSession &session) {
 }
 
 void touch(const TOUCH_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (!valid_input_fields(pkt))
     return;
   bool has_touch_device = session.touch_screen->has_value();
@@ -570,6 +593,8 @@ void touch(const TOUCH_PACKET &pkt, events::StreamSession &session) {
 }
 
 void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (!valid_input_fields(pkt))
     return;
   bool has_pen_device = session.pen_tablet->has_value();
@@ -636,6 +661,8 @@ void pen(const PEN_PACKET &pkt, events::StreamSession &session) {
 void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
                         events::StreamSession &session,
                         immer::box<std::shared_ptr<ControlPeer>> connected_client) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   auto joypads = session.joypads->load();
   if (joypads->find(pkt.controller_number)) {
     // TODO: should we replace it instead?
@@ -654,6 +681,8 @@ void controller_arrival(const CONTROLLER_ARRIVAL_PACKET &pkt,
 void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
                       events::StreamSession &session,
                       immer::box<std::shared_ptr<ControlPeer>> connected_client) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (pkt.controller_number < 0 || pkt.controller_number >= CONTROL_SLOT_COUNT)
     return;
   auto joypads = session.joypads->load();
@@ -706,6 +735,8 @@ void controller_multi(const CONTROLLER_MULTI_PACKET &pkt,
 }
 
 void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (!valid_input_fields(pkt))
     return;
   auto joypads = session.joypads->load();
@@ -716,6 +747,8 @@ void controller_touch(const CONTROLLER_TOUCH_PACKET &pkt, events::StreamSession 
 }
 
 void controller_motion(const CONTROLLER_MOTION_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (!valid_input_fields(pkt))
     return;
   auto joypads = session.joypads->load();
@@ -726,6 +759,8 @@ void controller_motion(const CONTROLLER_MOTION_PACKET &pkt, events::StreamSessio
 }
 
 void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSession &session) {
+  if (sessions::diagnostic::disabled(session))
+    return;
   if (!valid_input_fields(pkt))
     return;
   auto joypads = session.joypads->load();
@@ -744,6 +779,8 @@ bool handle_input(events::StreamSession &session,
     logs::log(logs::warning, "[INPUT] Invalid input packet ({} bytes)", bytes.size());
     return false;
   }
+  if (sessions::diagnostic::disabled(session))
+    return false;
   switch (read_packet<INPUT_PKT>(bytes).type) {
   case MOUSE_MOVE_REL:
     mouse_move_rel(read_packet<MOUSE_MOVE_REL_PACKET>(bytes), session);

@@ -117,6 +117,7 @@ struct BaseAppAudioOverride {
 };
 
 struct BaseApp {
+  std::optional<bool> device_free_diagnostic;
   std::string title;
   std::optional<std::string> icon_png_path;
   std::optional<std::string> render_node;

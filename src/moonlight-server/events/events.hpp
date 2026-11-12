@@ -69,6 +69,7 @@ struct Runner {
 };
 
 struct App {
+  rfl::Skip<bool> device_free_diagnostic = false;
   moonlight::App base;
 
   std::string video_producer_buffer_caps;
@@ -84,6 +85,10 @@ struct App {
   bool start_audio_server;
   std::shared_ptr<Runner> runner;
 };
+
+inline bool device_free(const App &app) {
+  return app.device_free_diagnostic.get();
+}
 
 struct Profile {
   const std::string id;

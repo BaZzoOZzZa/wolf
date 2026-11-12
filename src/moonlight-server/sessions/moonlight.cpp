@@ -3,6 +3,7 @@
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
 #include <sessions/common.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <sessions/handlers.hpp>
 #include <state/sessions.hpp>
 #include <streaming/consumer_events.hpp>
@@ -79,11 +80,11 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           const immer::box<events::PlugDeviceEvent> &hotplug_ev) {
         auto queues = plugged_devices_queue->load();
         if (auto entry = queues->find(hotplug_ev->session_id)) {
-          state::queue_own_session_device(hotplug_ev,
-                                          app_state->running_sessions->load(),
-                                          lobbies->load(),
-                                          entry->scope,
-                                          entry->queue);
+          diagnostic::queue_device(hotplug_ev,
+                                   app_state->running_sessions->load(),
+                                   lobbies->load(),
+                                   entry->scope,
+                                   entry->queue);
         }
       }));
 
@@ -99,105 +100,114 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
           return map.set(std::to_string(session->session_id), OwnedDeviceQueue{session->run_scope, devices_q});
         });
 
-        std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
-            std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
+        // The same production decision/continuation is exercised with injected IO in safe tests.
+        auto startup = diagnostic::start(
+            *session->app,
+            diagnostic::StartupOps{
+                .compositor =
+                    [session, gst_context = app_state->gst_context]() {
+                      auto on_ready = std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
+                      auto future = on_ready->get_future();
+                      // Start Gstreamer producer pipeline
+                      std::thread([session, on_ready, gst_context]() {
+                        streaming::start_video_producer(session->run_scope,
+                                                        session->app->video_producer_buffer_caps,
+                                                        session->app->render_node,
+                                                        {.width = session->display_mode.width,
+                                                         .height = session->display_mode.height,
+                                                         .refreshRate = session->display_mode.refreshRate},
+                                                        gst_context,
+                                                        on_ready,
+                                                        session->event_bus);
+                      }).detach();
 
-        if (session->app->start_virtual_compositor) {
-          logs::log(logs::debug, "[STREAM_SESSION] Create wayland compositor");
+                      return future;
+                    },
+                .mouse =
+                    [session, devices_q] {
+                      auto mouse = input::Mouse::create();
+                      if (!mouse) {
+                        logs::log(logs::error, "Failed to create mouse: {}", mouse.getErrorMessage());
+                      } else {
+                        auto mouse_ptr = input::Mouse(std::move(*mouse));
+                        devices_q->push(immer::box<events::PlugDeviceEvent>(
+                            events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
+                                                    .udev_events = mouse_ptr.get_udev_events(),
+                                                    .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries(),
+                                                    .run_scope = session->run_scope,
+                                                    .connection_scope = session->connection_scope}));
+                        session->mouse->emplace(std::move(mouse_ptr));
+                      }
+                    },
+                .keyboard =
+                    [session, devices_q] {
+                      auto keyboard = input::Keyboard::create();
+                      if (!keyboard) {
+                        logs::log(logs::error, "Failed to create keyboard: {}", keyboard.getErrorMessage());
+                      } else {
+                        auto keyboard_ptr = input::Keyboard(std::move(*keyboard));
+                        devices_q->push(immer::box<events::PlugDeviceEvent>(
+                            events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
+                                                    .udev_events = keyboard_ptr.get_udev_events(),
+                                                    .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries(),
+                                                    .run_scope = session->run_scope,
+                                                    .connection_scope = session->connection_scope}));
+                        session->keyboard->emplace(std::move(keyboard_ptr));
+                      }
+                    },
+                .audio =
+                    [session, audio_server] {
+                      /* Create audio virtual sink */
+                      logs::log(logs::debug, "[STREAM_SESSION] Create virtual audio sink");
+                      auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, session->session_id);
+                      std::shared_ptr<audio::VSink> v_device;
+                      if (session->app->start_audio_server && audio_server && audio_server->server) {
+                        v_device = audio::create_virtual_sink(
+                            audio_server->server,
+                            audio::AudioDevice{.sink_name = pulse_sink_name,
+                                               .mode = state::get_audio_mode(session->audio_channel_count, true)});
+                        session->audio_sink->store(v_device);
 
-          // Start Gstreamer producer pipeline
-          std::thread([session, on_ready, gst_context = app_state->gst_context]() {
-            streaming::start_video_producer(session->run_scope,
-                                            session->app->video_producer_buffer_caps,
-                                            session->app->render_node,
-                                            {.width = session->display_mode.width,
-                                             .height = session->display_mode.height,
-                                             .refreshRate = session->display_mode.refreshRate},
-                                            gst_context,
-                                            on_ready,
-                                            session->event_bus);
-          }).detach();
-        } else {
-          // Create virtual devices
-          auto mouse = input::Mouse::create();
-          if (!mouse) {
-            logs::log(logs::error, "Failed to create mouse: {}", mouse.getErrorMessage());
-          } else {
-            auto mouse_ptr = input::Mouse(std::move(*mouse));
-            devices_q->push(immer::box<events::PlugDeviceEvent>(
-                events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = mouse_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries(),
-                                        .run_scope = session->run_scope,
-                                        .connection_scope = session->connection_scope}));
-            session->mouse->emplace(std::move(mouse_ptr));
-          }
+                        std::thread([session, audio_server = audio_server->server]() {
+                          auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
+                          streaming::start_audio_producer(session->run_scope,
+                                                          session->event_bus,
+                                                          session->audio_channel_count,
+                                                          sink_name,
+                                                          audio::get_server_name(audio_server));
+                        }).detach();
+                      }
+                    },
+                .bind_wayland =
+                    [session](const streaming::WaylandDisplayReady &ready) {
+                      auto wl_state =
+                          virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
+                      // Set the wayland display
+                      session->wayland_display->store(wl_state);
 
-          auto keyboard = input::Keyboard::create();
-          if (!keyboard) {
-            logs::log(logs::error, "Failed to create keyboard: {}", keyboard.getErrorMessage());
-          } else {
-            auto keyboard_ptr = input::Keyboard(std::move(*keyboard));
-            devices_q->push(immer::box<events::PlugDeviceEvent>(
-                events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = keyboard_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries(),
-                                        .run_scope = session->run_scope,
-                                        .connection_scope = session->connection_scope}));
-            session->keyboard->emplace(std::move(keyboard_ptr));
-          }
-          on_ready->set_value({});
-        }
-
-        /* Create audio virtual sink */
-        logs::log(logs::debug, "[STREAM_SESSION] Create virtual audio sink");
-        auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, session->session_id);
-        std::shared_ptr<audio::VSink> v_device;
-        if (session->app->start_audio_server && audio_server && audio_server->server) {
-          v_device = audio::create_virtual_sink(
-              audio_server->server,
-              audio::AudioDevice{.sink_name = pulse_sink_name,
-                                 .mode = state::get_audio_mode(session->audio_channel_count, true)});
-          session->audio_sink->store(v_device);
-
-          std::thread([session, audio_server = audio_server->server]() {
-            auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
-            streaming::start_audio_producer(session->run_scope,
-                                            session->event_bus,
-                                            session->audio_channel_count,
-                                            sink_name,
-                                            audio::get_server_name(audio_server));
-          }).detach();
-        }
-
-        // TODO: timeout? What if the wayland display is never ready?
-        auto w_display_ready = on_ready->get_future().then([session, runtime_dir](auto fut) {
-          streaming::WaylandDisplayReady ready = fut.get();
-
-          auto wl_state = virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
-          // Set the wayland display
-          session->wayland_display->store(wl_state);
-
-          // Set virtual devices
-          session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
-          session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
-          session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
-
-          if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name)) {
-            logs::log(logs::error,
-                      "[STREAM_SESSION] Wayland socket {} was not ready, aborting runner startup",
-                      ready.wayland_socket_name);
-            session->event_bus->fire_event(immer::box<events::RunEnded>(
-                events::RunEnded{.session_id = std::to_string(session->session_id), .run_scope = session->run_scope}));
-            return;
-          }
-
-          logs::log(logs::debug, "[STREAM_SESSION] Start runner");
-          session->event_bus->fire_event(immer::box<events::StartRunner>(
-              events::StartRunner{.stop_stream_when_over = true,
-                                  .runner = session->app->runner,
-                                  .stream_session = std::make_shared<events::StreamSession>(*session)}));
-        });
+                      // Set virtual devices
+                      session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
+                      session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
+                      session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
+                    },
+                .wait_wayland =
+                    [runtime_dir](const streaming::WaylandDisplayReady &ready) {
+                      return wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name);
+                    },
+                .runner =
+                    [session] {
+                      logs::log(logs::debug, "[STREAM_SESSION] Start runner");
+                      session->event_bus->fire_event(immer::box<events::StartRunner>(
+                          events::StartRunner{.stop_stream_when_over = true,
+                                              .runner = session->app->runner,
+                                              .stream_session = std::make_shared<events::StreamSession>(*session)}));
+                    },
+                .failed =
+                    [session] {
+                      session->event_bus->fire_event(immer::box<events::RunEnded>(
+                          events::RunEnded{.session_id = std::to_string(session->session_id),
+                                           .run_scope = session->run_scope}));
+                    }});
       }));
 
   /* Start runner */

@@ -3,6 +3,7 @@
 #include <api/api.hpp>
 #include <atomic>
 #include <audio/pulse_router.hpp>
+#include <audio/startup.hpp>
 #include <boost/asio.hpp>
 #include <chrono>
 #include <control/control.hpp>
@@ -20,6 +21,7 @@
 #include <memory>
 #include <rest/rest.hpp>
 #include <rtsp/net.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <sessions/handlers.hpp>
 #include <state/config.hpp>
 #include <streaming/streaming.hpp>
@@ -122,60 +124,6 @@ auto initialize(std::string_view config_file, std::string_view pkey_filename, st
   return immer::box<state::AppState>(state);
 }
 
-/**
- * We first try to connect to a running PulseAudio server
- * if that fails, we run our own PulseAudio container and connect to it
- * if that fails, we can't return an AudioServer, hence the optional!
- */
-std::optional<sessions::AudioServer> setup_audio_server(const std::string &host_runtime_dir,
-                                                        const std::string &runtime_dir) {
-  auto audio_server = audio::connect();
-  if (audio::connected(audio_server)) {
-    return {{.server = audio_server}};
-  } else {
-    logs::log(logs::info, "Starting PulseAudio docker container");
-    docker::DockerAPI docker_api(utils::get_env("WOLF_DOCKER_SOCKET", "/var/run/docker.sock"));
-    auto pulse_socket = fmt::format("{}/pulse-socket", runtime_dir);
-
-    /* Cleanup old leftovers, Pulse will fail to start otherwise */
-    try {
-      std::filesystem::remove(pulse_socket);
-      std::filesystem::remove_all(fmt::format("{}/pulse", runtime_dir));
-    } catch (const std::filesystem::filesystem_error &e) {
-      logs::log(logs::warning, "Failed to remove old PulseAudio socket: {}", e.what());
-    }
-
-    auto container = docker_api.create(
-        docker::Container{
-            .id = "",
-            .name = "WolfPulseAudio",
-            .image = utils::get_env("WOLF_PULSE_IMAGE", "ghcr.io/games-on-whales/pulseaudio:master"),
-            .status = docker::CREATED,
-            .ports = {},
-            .mounts = {docker::MountPoint{.source = host_runtime_dir, .destination = "/tmp/pulse/", .mode = "rw"}},
-            .env = {"XDG_RUNTIME_DIR=/tmp/pulse/", "UNAME=retro", "UID=1000", "GID=1000", "HOME=/home/retro"}},
-        // The following is needed when using podman (or any container that uses SELINUX). This way we can access the
-        // socket that is created by PulseAudio from other containers (including this one).
-        R"({
-                  "HostConfig" : {
-                    "SecurityOpt" : ["label=disable"]
-                  }
-            })");
-    if (container && docker_api.start_by_id(container.value().id)) {
-      auto ms = std::stoi(utils::get_env("WOLF_PULSE_CONTAINER_TIMEOUT_MS", "2000"));
-      std::this_thread::sleep_for(std::chrono::milliseconds(ms)); // TODO: Better way of knowing when ready?
-      return {{.server = audio::connect(fmt::format("{}/pulse-socket", runtime_dir)), .container = container}};
-    }
-  }
-
-  logs::log(logs::warning, "Failed to connect to any PulseAudio server, audio will not be available!");
-
-  return {};
-}
-
-/**
- * @brief here's where the magic starts
- */
 void run() {
   streaming::init(); // Need to initialise gstreamer once
   control::init();   // Need to initialise enet once
@@ -191,121 +139,130 @@ void run() {
   auto local_state = initialize(config_file, p_key_file, p_cert_file);
 
   auto consumers = sessions::make_consumer_composition(local_state->running_sessions);
-  auto audio_server = setup_audio_server(local_state->host->host_xdg_runtime_dir, runtime_dir);
-  // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
-  auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
-  auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
-  // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
-  auto moonlight_sess_handlers =
-      sessions::setup_moonlight_handlers(local_state, runtime_dir, audio_server, sessions::consumer_runtime(consumers));
-  // Setup event handlers for player Lobbies
-  auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
+  auto audio_ops = audio::startup::defaults(local_state->host->host_xdg_runtime_dir, runtime_dir);
+  auto audio_server = audio::startup::setup(utils::get_env("WOLF_ALLOW_PULSE_CONTAINER", "TRUE"), audio_ops);
+  audio::startup::dispatch(audio_server, audio_ops, [&] {
+    // PulseAudio sink-input router (hostname -> session_id -> virtual_sink_<session>)
+    auto pulse_router_state = std::make_shared<audio::PulseAudioRouterState>(audio_server->server);
+    auto pulse_router_handlers = audio::setup_pulseaudio_router_handlers(local_state, pulse_router_state);
+    // Setup event handlers for Moonlight related events (Start/Stop stream, hotplug, etc)
+    auto moonlight_sess_handlers = sessions::setup_moonlight_handlers(local_state,
+                                                                      runtime_dir,
+                                                                      audio_server,
+                                                                      sessions::consumer_runtime(consumers));
+    // Setup event handlers for player Lobbies
+    auto lobbies_handlers = sessions::setup_lobbies_handlers(local_state, runtime_dir, audio_server);
 
-  // Owned control loop: handlers already exist; other ingress is not published
-  // before actual control host/registry/owner readiness. No protected seat attach.
-  control::loop::ControlLoopDomain control_domain;
-  control::loop::Config control_config;
-  control_config.port = state::get_port(state::CONTROL_PORT);
-  auto control_owner = control_domain.start(control_config, local_state->running_sessions, local_state->event_bus);
-  if (!control_owner) {
-    logs::log(logs::error, "Control startup refused; other ingress was not started");
-    return;
-  }
-  while (true) {
-    auto status = control_owner->status();
-    if (status.failed || status.unknown || status.exited || shutdown_requested.load()) {
-      logs::log(logs::error, "Control startup failed/Unknown; retaining owner until actual exit and join");
-      control_owner->request_stop();
-      while (control_owner->join_when_exited() != control::loop::JoinResult::Joined)
-        std::this_thread::sleep_for(10ms);
+    // Owned control loop: handlers already exist; other ingress is not published
+    // before actual control host/registry/owner readiness. No protected seat attach.
+    control::loop::ControlLoopDomain control_domain;
+    control::loop::Config control_config;
+    control_config.port = state::get_port(state::CONTROL_PORT);
+    auto control_owner = control_domain.start(control_config, local_state->running_sessions, local_state->event_bus);
+    if (!control_owner) {
+      logs::log(logs::error, "Control startup refused; other ingress was not started");
       return;
     }
-    if (status.ready)
-      break;
-    std::this_thread::sleep_for(10ms);
-  }
-
-  // HTTP APIs
-  std::thread([local_state]() {
-    HttpServer server = HttpServer();
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
-  }).detach();
-
-  // HTTPS APIs
-  std::thread([local_state, p_key_file, p_cert_file]() {
-    HttpsServer server = HttpsServer(p_cert_file, p_key_file);
-    HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
-  }).detach();
-
-  // RTSP
-  std::thread([sessions = local_state->running_sessions]() {
-    rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions);
-  }).detach();
-
-  // RTP
-  rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
-                      state::get_port(state::AUDIO_PING_PORT),
-                      local_state->event_bus);
-  // Wolf API server
-  std::thread([local_state, runtime_dir]() { wolf::api::start_server(runtime_dir, local_state); }).detach();
-
-  // mDNS
-  std::thread([hostname = local_state->config->hostname]() {
-    logs::log(logs::info, "Starting mDNS service");
-    try {
-      mdns_cpp::Logger::setLoggerSink([](const std::string &msg) {
-        // msg here will include a /n at the end, so we remove it
-        logs::log(logs::trace, "mDNS: {}", msg.substr(0, msg.size() - 1));
-      });
-      mdns_cpp::mDNS mdns;
-      mdns.setServiceName("_nvstream._tcp.local.");
-      mdns.setServiceHostname(hostname);
-      mdns.setServicePort(state::get_port(state::HTTP_PORT));
-      mdns.startService(false);
-    } catch (const std::exception &e) {
-      logs::log(logs::error, "mDNS error: {}", e.what());
+    while (true) {
+      auto status = control_owner->status();
+      if (status.failed || status.unknown || status.exited || shutdown_requested.load()) {
+        logs::log(logs::error, "Control startup failed/Unknown; retaining owner until actual exit and join");
+        control_owner->request_stop();
+        while (control_owner->join_when_exited() != control::loop::JoinResult::Joined)
+          std::this_thread::sleep_for(10ms);
+        return;
+      }
+      if (status.ready)
+        break;
+      std::this_thread::sleep_for(10ms);
     }
-  }).detach();
 
-  // Park the main thread until a termination signal arrives. supervisord sends
-  // SIGINT on container stop (stopsignal=INT) and waits stopwaitsecs for us to
-  // exit, so we use that window to tear everything down cleanly.
-  while (!shutdown_requested.load(std::memory_order_relaxed)) {
-    std::this_thread::sleep_for(200ms);
-  }
+    // HTTP APIs
+    std::thread([local_state]() {
+      HttpServer server = HttpServer();
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTP_PORT));
+    }).detach();
 
-  control_owner->request_stop(); // out-of-band: not queued behind transport cleanup
-  logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
+    // HTTPS APIs
+    std::thread([local_state, p_key_file, p_cert_file]() {
+      HttpsServer server = HttpsServer(p_cert_file, p_key_file);
+      HTTPServers::startServer(&server, local_state, state::get_port(state::HTTPS_PORT));
+    }).detach();
 
-  // Stop lobbies first: each one makes its connected sessions leave gracefully.
-  for (const auto &lobby : local_state->lobbies->load().get()) {
-    local_state->event_bus->fire_event(
-        immer::box<events::StopLobbyEvent>(events::StopLobbyEvent{.lobby_id = lobby.id, .run_scope = lobby.run_scope}));
-  }
+    // RTSP
+    std::thread([sessions = local_state->running_sessions]() {
+      rtsp::run_server(state::get_port(state::RTSP_SETUP_PORT), sessions);
+    }).detach();
 
-  // Then stop any remaining standalone streams.
-  for (const auto &session : local_state->running_sessions->load().get()) {
-    local_state->event_bus->fire_event(immer::box<events::GameStopRequest>(
-        events::GameStopRequest{.session_id = std::to_string(session.session_id), .run_scope = session.run_scope}));
-  }
+    // RTP
+    rtp::start_rtp_ping(state::get_port(state::VIDEO_PING_PORT),
+                        state::get_port(state::AUDIO_PING_PORT),
+                        local_state->event_bus);
+    // Wolf API server
+    std::thread([local_state, runtime_dir]() { wolf::api::start_server(runtime_dir, local_state); }).detach();
 
-  // fire_event is synchronous, but container/pipeline teardown can still settle
-  // asynchronously; wait (bounded) for the state to drain before we exit.
-  for (int i = 0;
-       i < 100 && (!local_state->running_sessions->load().get().empty() || !local_state->lobbies->load().get().empty());
-       i++) {
-    std::this_thread::sleep_for(100ms);
-  }
+    // Upstream mDNS alignment UB remains a residual; opt-out skips the entire worker.
+    sessions::diagnostic::dispatch_mdns(utils::get_env("WOLF_ENABLE_MDNS", "TRUE"), [&] {
+      std::thread([hostname = local_state->config->hostname]() {
+        logs::log(logs::info, "Starting mDNS service");
+        try {
+          mdns_cpp::Logger::setLoggerSink([](const std::string &msg) {
+            // msg here will include a /n at the end, so we remove it
+            logs::log(logs::trace, "mDNS: {}", msg.substr(0, msg.size() - 1));
+          });
+          mdns_cpp::mDNS mdns;
+          mdns.setServiceName("_nvstream._tcp.local.");
+          mdns.setServiceHostname(hostname);
+          mdns.setServicePort(state::get_port(state::HTTP_PORT));
+          mdns.startService(false);
+        } catch (const std::exception &e) {
+          logs::log(logs::error, "mDNS error: {}", e.what());
+        }
+      }).detach();
+    });
 
-  bool reported_control_unknown = false;
-  while (control_owner->join_when_exited() != control::loop::JoinResult::Joined) {
-    if (control_owner->status().unknown && !reported_control_unknown) {
-      reported_control_unknown = true;
-      logs::log(logs::warning, "Control shutdown Unknown; waiting for actual owner exit/join without forced teardown");
+    // Park the main thread until a termination signal arrives. supervisord sends
+    // SIGINT on container stop (stopsignal=INT) and waits stopwaitsecs for us to
+    // exit, so we use that window to tear everything down cleanly.
+    while (!shutdown_requested.load(std::memory_order_relaxed)) {
+      std::this_thread::sleep_for(200ms);
     }
-    std::this_thread::sleep_for(10ms);
-  }
-  logs::log(logs::info, "Control owner joined; other detached subsystem completion is not proven by the bounded wait");
+
+    control_owner->request_stop(); // out-of-band: not queued behind transport cleanup
+    logs::log(logs::info, "Received shutdown signal, stopping all sessions and lobbies");
+
+    // Stop lobbies first: each one makes its connected sessions leave gracefully.
+    for (const auto &lobby : local_state->lobbies->load().get()) {
+      local_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(
+          events::StopLobbyEvent{.lobby_id = lobby.id, .run_scope = lobby.run_scope}));
+    }
+
+    // Then stop any remaining standalone streams.
+    for (const auto &session : local_state->running_sessions->load().get()) {
+      local_state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+          events::GameStopRequest{.session_id = std::to_string(session.session_id), .run_scope = session.run_scope}));
+    }
+
+    // fire_event is synchronous, but container/pipeline teardown can still settle
+    // asynchronously; wait (bounded) for the state to drain before we exit.
+    for (int i = 0; i < 100 && (!local_state->running_sessions->load().get().empty() ||
+                                !local_state->lobbies->load().get().empty());
+         i++) {
+      std::this_thread::sleep_for(100ms);
+    }
+
+    bool reported_control_unknown = false;
+    while (control_owner->join_when_exited() != control::loop::JoinResult::Joined) {
+      if (control_owner->status().unknown && !reported_control_unknown) {
+        reported_control_unknown = true;
+        logs::log(logs::warning,
+                  "Control shutdown Unknown; waiting for actual owner exit/join without forced teardown");
+      }
+      std::this_thread::sleep_for(10ms);
+    }
+    logs::log(logs::info,
+              "Control owner joined; other detached subsystem completion is not proven by the bounded wait");
+  });
 }
 
 int main(int argc, char *argv[]) try {

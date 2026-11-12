@@ -1,3 +1,4 @@
+#include <sessions/diagnostic_startup.hpp>
 #include <immer/vector_transient.hpp>
 #include <rfl/json.hpp>
 #include <sessions/common.hpp>
@@ -409,6 +410,10 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
           settle_join(join_lobby_event, "Lobby or session not found");
           return;
         }
+        if (diagnostic::disabled(*session)) {
+          settle_join(join_lobby_event, "Diagnostic app cannot join lobbies");
+          return;
+        }
         logs::log(logs::info, "[LOBBY] Session {} joining lobby {}", session->session_id, lobby->id);
 
         auto ticket = lifecycle->find(lobby->id);
@@ -552,6 +557,8 @@ setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
             state::get_session_by_scope(app_state->running_sessions->load(), plug_device_event->connection_scope.get());
         if (!source ||
             !sessions::targets(source->run_scope, plug_device_event->run_scope.get(), plug_device_event->session_id))
+          return;
+        if (diagnostic::disabled(*source))
           return;
         immer::vector<events::Lobby> lobbies = app_state->lobbies->load();
         if (auto lobby = state::get_lobby_for_session(lobbies, *source)) {

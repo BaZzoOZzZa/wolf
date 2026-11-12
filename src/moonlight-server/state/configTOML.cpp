@@ -1,4 +1,5 @@
 #include <events/events.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <events/reflectors.hpp>
 #include <fstream>
 #include <gst/gstelementfactory.h>
@@ -141,6 +142,7 @@ parse_apps(const std::vector<BaseApp> &apps,
   auto parsed_apps =
       apps |                                             //
       ranges::views::transform([&](const BaseApp &app) { //
+        sessions::diagnostic::validate(app);
         auto app_render_node = app.render_node.value_or(default_app_render_node);
         if (app_render_node != default_gst_render_node) {
           logs::log(logs::warning,
@@ -186,7 +188,8 @@ parse_apps(const std::vector<BaseApp> &apps,
             app_audio_settings.sink.value_or(default_audio_settings.sink.value()));
 
         return immer::box<events::App>{
-            events::App{.base = {.title = app.title,
+            events::App{.device_free_diagnostic = app.device_free_diagnostic.value_or(false),
+                        .base = {.title = app.title,
                                  .id = generate_app_id(app),
                                  .support_hdr = false,
                                  .icon_png_path = app.icon_png_path},
