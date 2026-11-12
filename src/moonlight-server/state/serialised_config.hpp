@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <helpers/utils.hpp>
 #include <rfl.hpp>
 #include <string>
@@ -116,10 +117,17 @@ struct BaseAppAudioOverride {
   std::optional<std::string> sink;
 };
 
+struct DirectWindowTarget {
+  uint32_t xid = 0, pid = 0, screen = 0, root = 0;
+  uint64_t process_start_time = 0;
+};
+
 struct BaseApp {
   std::optional<bool> device_free_diagnostic;
   std::optional<bool> legacy_pad_only_trial;
   std::optional<int> legacy_pad_slot;
+  std::optional<bool> legacy_direct_touch_trial;
+  std::optional<DirectWindowTarget> direct_window_target;
   std::string title;
   std::optional<std::string> icon_png_path;
   std::optional<std::string> render_node;

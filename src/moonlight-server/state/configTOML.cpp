@@ -1,3 +1,4 @@
+#include <control/direct_window_input.hpp>
 #include <events/events.hpp>
 #include <events/reflectors.hpp>
 #include <fstream>
@@ -128,16 +129,17 @@ std::string generate_app_id(const BaseApp &app) {
 }
 
 std::shared_ptr<immer::atom<immer::vector<immer::box<events::App>>>>
-parse_apps(const std::vector<BaseApp> &apps,
-           const std::string &default_app_render_node,
-           const std::string &default_gst_render_node,
-           const BaseAppVideoOverride &default_video_settings,
-           const std::string &h264_video_params,
-           const std::string &hevc_video_params,
-           const std::string &av1_video_params,
-           const BaseAppAudioOverride &default_audio_settings,
-           SessionsAtoms running_sessions,
-           const std::shared_ptr<events::EventBusType> &ev_bus) {
+parse_apps_direct(const std::vector<BaseApp> &apps,
+                  const std::string &default_app_render_node,
+                  const std::string &default_gst_render_node,
+                  const BaseAppVideoOverride &default_video_settings,
+                  const std::string &h264_video_params,
+                  const std::string &hevc_video_params,
+                  const std::string &av1_video_params,
+                  const BaseAppAudioOverride &default_audio_settings,
+                  SessionsAtoms running_sessions,
+                  const std::shared_ptr<events::EventBusType> &ev_bus,
+                  const control::direct::Operations *direct_ops) {
 
   auto parsed_apps =
       apps |                                             //
@@ -154,6 +156,20 @@ parse_apps(const std::vector<BaseApp> &apps,
         }
         auto app_video_settings = app.video.value_or(default_video_settings);
         auto app_audio_settings = app.audio.value_or(default_audio_settings);
+
+        std::shared_ptr<control::direct::WindowInput> direct;
+        if (app.legacy_direct_touch_trial.value_or(false)) {
+          direct = control::direct::WindowInput::bind(
+              *app.direct_window_target,
+              direct_ops ? *direct_ops : control::direct::Operations::defaults());
+          // SAME immutable binding drives capture and input; no arbitrary source/crop transform.
+          app_video_settings.source = fmt::format("ximagesrc xid={} use-damage=false show-pointer=false "
+                                                  "do-timestamp=true ! video/x-raw,framerate={{fps}}/1",
+                                                  direct->spec().xid);
+          app_video_settings.video_params =
+              "videoconvertscale add-borders=false ! "
+              "video/x-raw,format=I420,width={width},height={height},pixel-aspect-ratio=1/1";
+        }
 
         auto h264_gst_pipeline = fmt::format(
             "{} !\n{} !\n{} !\n{}", //
@@ -191,6 +207,8 @@ parse_apps(const std::vector<BaseApp> &apps,
             events::App{.device_free_diagnostic = app.device_free_diagnostic.value_or(false),
                         .legacy_pad_only_trial = app.legacy_pad_only_trial.value_or(false),
                         .legacy_pad_slot = app.legacy_pad_slot.value_or(0),
+                        .legacy_direct_touch_trial = app.legacy_direct_touch_trial.value_or(false),
+                        .direct_window_input = direct,
                         .base = {.title = app.title,
                                  .id = generate_app_id(app),
                                  .support_hdr = false,
@@ -209,6 +227,34 @@ parse_apps(const std::vector<BaseApp> &apps,
       ranges::to<immer::vector<immer::box<events::App>>>(); //
 
   return std::make_shared<immer::atom<immer::vector<immer::box<events::App>>>>(parsed_apps);
+}
+
+std::shared_ptr<immer::atom<immer::vector<immer::box<events::App>>>>
+parse_apps(const std::vector<BaseApp> &apps,
+           const std::string &render,
+           const std::string &gst_render,
+           const BaseAppVideoOverride &video,
+           const std::string &h264,
+           const std::string &hevc,
+           const std::string &av1,
+           const BaseAppAudioOverride &audio,
+           SessionsAtoms sessions,
+           const std::shared_ptr<events::EventBusType> &bus) {
+  return parse_apps_direct(apps, render, gst_render, video, h264, hevc, av1, audio, sessions, bus, nullptr);
+}
+std::shared_ptr<immer::atom<immer::vector<immer::box<events::App>>>>
+parse_apps(const std::vector<BaseApp> &apps,
+           const std::string &render,
+           const std::string &gst_render,
+           const BaseAppVideoOverride &video,
+           const std::string &h264,
+           const std::string &hevc,
+           const std::string &av1,
+           const BaseAppAudioOverride &audio,
+           SessionsAtoms sessions,
+           const std::shared_ptr<events::EventBusType> &bus,
+           const control::direct::Operations &ops) {
+  return parse_apps_direct(apps, render, gst_render, video, h264, hevc, av1, audio, sessions, bus, &ops);
 }
 
 Config load_or_default(const std::string &source,
@@ -488,15 +534,21 @@ void update_profiles(const Config &cfg, const ProfilesList &profiles) {
                        .pin = p->pin,
                        .apps = p->apps->load().get() | //
                                ranges::views::transform([](const immer::box<events::App> &app) {
-                                 return BaseApp{.device_free_diagnostic = events::device_free(*app),
-                                                .legacy_pad_only_trial = events::pad_only_trial(*app),
-                                                .legacy_pad_slot = app->legacy_pad_slot.get(),
-                                                .title = app->base.title,
-                                                .icon_png_path = app->base.icon_png_path,
-                                                .render_node = app->render_node,
-                                                .start_virtual_compositor = app->start_virtual_compositor,
-                                                .start_audio_server = app->start_audio_server,
-                                                .runner = app->runner->serialize()};
+                                 return BaseApp{
+                                     .device_free_diagnostic = events::device_free(*app),
+                                     .legacy_pad_only_trial = events::pad_only_trial(*app),
+                                     .legacy_pad_slot = app->legacy_pad_slot.get(),
+                                     .legacy_direct_touch_trial = app->legacy_direct_touch_trial.get(),
+                                     .direct_window_target =
+                                         app->direct_window_input.get()
+                                             ? std::optional<DirectWindowTarget>{app->direct_window_input.get()->spec()}
+                                             : std::nullopt,
+                                     .title = app->base.title,
+                                     .icon_png_path = app->base.icon_png_path,
+                                     .render_node = app->render_node,
+                                     .start_virtual_compositor = app->start_virtual_compositor,
+                                     .start_audio_server = app->start_audio_server,
+                                     .runner = app->runner->serialize()};
                                }) | //
                                ranges::to_vector,
                    };

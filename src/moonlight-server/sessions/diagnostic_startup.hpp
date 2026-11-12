@@ -5,6 +5,16 @@
 
 namespace wolf::core::sessions::diagnostic {
 inline void validate(const config::BaseApp &app) {
+  if (app.legacy_direct_touch_trial.value_or(false)) {
+    if (!app.legacy_pad_only_trial.value_or(false) || !app.direct_window_target)
+      throw std::invalid_argument("direct touch requires PadOnly and an exact target");
+    const auto &t = *app.direct_window_target;
+    if (!t.xid || !t.pid || !t.root || !t.process_start_time || t.screen > 63 ||
+        (app.video && (app.video->source || app.video->video_params)))
+      throw std::invalid_argument("direct touch requires a valid target and canonical full-frame video source/params");
+  } else if (app.direct_window_target) {
+    throw std::invalid_argument("direct target requires explicit direct touch opt-in");
+  }
   const int slot = app.legacy_pad_slot.value_or(0);
   if (slot < 0 || slot >= moonlight::control::CONTROL_SLOT_COUNT)
     throw std::invalid_argument("legacy_pad_slot must be in 0..15");
@@ -61,6 +71,10 @@ struct StartupOps {
   std::function<void()> runner, failed;
 };
 inline boost::future<void> start(const events::App &app, StartupOps ops) {
+  if (app.legacy_direct_touch_trial.get() && (!events::pad_only_trial(app) || !app.direct_window_input.get())) {
+    ops.failed();
+    return {};
+  }
   const bool restricted = events::device_free(app) || events::pad_only_trial(app);
   if ((restricted && (app.start_virtual_compositor || app.start_audio_server)) ||
       (events::pad_only_trial(app) && (events::device_free(app) || app.legacy_pad_slot.get() < 0 ||

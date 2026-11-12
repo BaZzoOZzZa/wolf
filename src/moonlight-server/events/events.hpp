@@ -24,6 +24,10 @@
 #include <state/serialised_config.hpp>
 #include <string_view>
 
+namespace control::direct {
+class WindowInput;
+}
+
 namespace wolf::core::events {
 
 struct StreamSession;
@@ -72,6 +76,8 @@ struct App {
   rfl::Skip<bool> device_free_diagnostic = false;
   rfl::Skip<bool> legacy_pad_only_trial = false;
   rfl::Skip<int> legacy_pad_slot = 0;
+  rfl::Skip<bool> legacy_direct_touch_trial = false;
+  rfl::Skip<std::shared_ptr<control::direct::WindowInput>> direct_window_input;
   moonlight::App base;
 
   std::string video_producer_buffer_caps;

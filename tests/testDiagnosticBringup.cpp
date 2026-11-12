@@ -1183,3 +1183,385 @@ TEST_CASE("PadOnly trial actual control owner retires stale connection before in
   CHECK_FALSE(loop->status().unknown);
   CHECK(s.joypads->load()->empty()); // only inactive MULTI, no device factory even on regression
 }
+
+#include <bit>
+#include <control/direct_window_input.hpp>
+namespace direct = control::direct;
+namespace state {
+std::shared_ptr<immer::atom<immer::vector<immer::box<events::App>>>>
+parse_apps(const std::vector<config::BaseApp> &,
+           const std::string &,
+           const std::string &,
+           const config::BaseAppVideoOverride &,
+           const std::string &,
+           const std::string &,
+           const std::string &,
+           const config::BaseAppAudioOverride &,
+           SessionsAtoms,
+           const std::shared_ptr<events::EventBusType> &,
+           const direct::Operations &);
+}
+namespace {
+struct DirectIO {
+  direct::Spec spec{.xid = 7, .pid = 9, .screen = 0, .root = 1, .process_start_time = 11};
+  int x = 3200, y = 351, w = 1280, h = 720, px = 0, py = 0, opened = 0, closed = 0, moves = 0, presses = 0,
+      releases = 0, subscribed = 0;
+  uint32_t focus = 7, pid = 9, root = 1;
+  uint64_t start = 11;
+  bool visible = true, input_output = true, occluded = false, connect_ok = true, subscribe_ok = true, motion_ok = true,
+       button_ok = true;
+  bool throw_motion = false;
+  std::deque<direct::Event> events;
+  std::vector<std::pair<int, int>> positions;
+  direct::Operations ops() {
+    return {[&]() -> std::shared_ptr<void> {
+              ++opened;
+              if (!connect_ok)
+                return {};
+              return {new int(0), [this](void *p) {
+                        delete static_cast<int *>(p);
+                        ++closed;
+                      }};
+            },
+            [&](void *, uint32_t screen) -> std::optional<uint32_t> {
+              if (screen)
+                return {};
+              return root;
+            },
+            [&](void *, uint32_t xid) {
+              ++subscribed;
+              return subscribe_ok && xid == spec.xid;
+            },
+            [&](void *, uint32_t) -> std::optional<direct::Attributes> {
+              return direct::Attributes{visible, input_output};
+            },
+            [&](void *, uint32_t xid) -> std::optional<direct::Geometry> {
+              if (xid == root)
+                return direct::Geometry{root, 0, 0, 5120, 1440};
+              return direct::Geometry{root, 0, 0, uint32_t(w), uint32_t(h)};
+            },
+            [&](void *, uint32_t, uint32_t) -> std::optional<direct::Pointer> { return direct::Pointer{0, x, y}; },
+            [&](void *, uint32_t, direct::Property p) -> std::optional<uint32_t> {
+              return p == direct::Property::pid ? pid : focus;
+            },
+            [&](uint32_t) -> std::optional<uint64_t> { return start; },
+            [&](void *, uint32_t) -> std::optional<direct::Tree> { return direct::Tree{root, root}; },
+            [&](void *, uint32_t at) -> std::optional<direct::Pointer> {
+              return direct::Pointer{at == root ? (occluded ? 8u : spec.xid) : 0u, px, py};
+            },
+            [&](void *) {
+              if (events.empty())
+                return direct::Event{direct::Event::none};
+              auto e = events.front();
+              events.pop_front();
+              return e;
+            },
+            [&](void *, uint32_t, int16_t a, int16_t b) {
+              ++moves;
+              if (throw_motion)
+                throw std::runtime_error("injected request");
+              px = a;
+              py = b;
+              positions.emplace_back(a, b);
+              return motion_ok;
+            },
+            [&](void *, bool press) {
+              if (press)
+                ++presses;
+              else
+                ++releases;
+              return button_ok;
+            }};
+  }
+};
+MOUSE_MOVE_ABS_PACKET direct_abs(int x = 640, int y = 360, int w = 1280, int h = 720) {
+  auto p = packet<MOUSE_MOVE_ABS_PACKET>(MOUSE_MOVE_ABS);
+  p.x = boost::endian::native_to_big(short(x));
+  p.y = boost::endian::native_to_big(short(y));
+  p.width = boost::endian::native_to_big(short(w));
+  p.height = boost::endian::native_to_big(short(h));
+  return p;
+}
+TOUCH_PACKET direct_touch(TOUCH_EVENT_TYPE type, uint32_t id, float x, float y) {
+  auto p = packet<TOUCH_PACKET>(TOUCH);
+  p.event_type = type;
+  p.pointer_id = boost::endian::native_to_little(id);
+  auto a = boost::endian::native_to_little(std::bit_cast<uint32_t>(x));
+  auto b = boost::endian::native_to_little(std::bit_cast<uint32_t>(y));
+  std::memcpy(p.x, &a, 4);
+  std::memcpy(p.y, &b, 4);
+  return p;
+}
+events::StreamSession direct_session(const std::shared_ptr<direct::WindowInput> &backend) {
+  auto s = trial_session();
+  s.app->legacy_direct_touch_trial = true;
+  s.app->direct_window_input = backend;
+  return s;
+}
+} // namespace
+
+TEST_CASE("Direct target actual ABS maps full client area independent of reference and encoded dimensions",
+          "[direct-window]") {
+  DirectIO io;
+  auto backend = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(backend);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  for (auto ref : std::vector<std::pair<int, int>>{{1280, 720}, {640, 360}, {2560, 1440}}) {
+    CHECK(control::handle_input(s, peer, bytes(direct_abs(ref.first / 2, ref.second / 2, ref.first, ref.second))));
+    CHECK(io.positions.back() == std::pair<int, int>{3840, 711});
+    CHECK(control::handle_input(s, peer, bytes(direct_abs(0, 0, ref.first, ref.second))));
+    CHECK(io.positions.back() == std::pair<int, int>{3200, 351});
+    CHECK(control::handle_input(s, peer, bytes(direct_abs(ref.first, ref.second, ref.first, ref.second))));
+    CHECK(io.positions.back() == std::pair<int, int>{4479, 1070});
+  }
+  CHECK(sends == 0);
+  CHECK(io.presses == 0);
+  CHECK_FALSE(s.mouse->has_value());
+  CHECK_FALSE(s.keyboard->has_value());
+}
+TEST_CASE("Direct left click reprojects movement requires fresh sample after resize and refuses occlusion",
+          "[direct-window]") {
+  DirectIO io;
+  auto backend = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(backend);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  auto press = packet<MOUSE_BUTTON_PACKET>(MOUSE_BUTTON_PRESS);
+  press.button = 1;
+  auto release = press;
+  release.type = MOUSE_BUTTON_RELEASE;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(press)));
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  io.x = 3000;
+  io.y = 100;
+  REQUIRE(control::handle_input(s, peer, bytes(press)));
+  CHECK(io.positions.back() == std::pair<int, int>{3640, 460});
+  CHECK(io.presses == 1);
+  CHECK(control::handle_input(s, peer, bytes(release)));
+  CHECK(io.releases == 1);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  io.w = 1000;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(press)));
+  CHECK(io.presses == 1);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  io.occluded = true;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(press)));
+  CHECK(io.presses == 1);
+  io.occluded = false;
+  io.focus = 8;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+  io.focus = 7;
+  press.button = 3;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(press)));
+  CHECK(io.presses == 1);
+}
+TEST_CASE("Direct actual binding rejects invalid identity and retires partially initialized connection",
+          "[direct-window]") {
+  for (int fault = 0; fault < 8; ++fault) {
+    DirectIO io;
+    if (fault == 0)
+      io.spec.xid = 0;
+    if (fault == 1)
+      io.connect_ok = false;
+    if (fault == 2)
+      io.subscribe_ok = false;
+    if (fault == 3)
+      io.pid = 99;
+    if (fault == 4)
+      io.start = 12;
+    if (fault == 5)
+      io.visible = false;
+    if (fault == 6)
+      io.input_output = false;
+    if (fault == 7)
+      io.root = 2;
+    CHECK_THROWS(direct::WindowInput::bind(io.spec, io.ops()));
+    CHECK(io.closed == ((fault == 0 || fault == 1) ? 0 : 1));
+    CHECK(io.moves + io.presses == 0);
+  }
+  DirectIO io;
+  {
+    auto b = direct::WindowInput::bind(io.spec, io.ops());
+    CHECK(io.closed == 0);
+  }
+  CHECK(io.closed == 1);
+  // Process DISPLAY is explicitly invalid for this native fixture: default adapter must not connect.
+  CHECK_THROWS(direct::WindowInput::bind(io.spec));
+}
+TEST_CASE("Direct input refuses malformed coordinates stale peer scope target reuse and provider errors",
+          "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(b);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  for (auto p : std::vector<MOUSE_MOVE_ABS_PACKET>{direct_abs(-1),
+                                                   direct_abs(1281),
+                                                   direct_abs(1, 1, 0, 720),
+                                                   direct_abs(1, 1, 1280, -1)})
+    CHECK_FALSE(control::handle_input(s, peer, bytes(p)));
+  CHECK(io.moves == 0);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+  auto replacement = s;
+  replacement.connection_scope = sessions::ConnectionScope::fresh(s.session_id);
+  CHECK_FALSE(control::handle_input(replacement, peer, bytes(direct_abs())));
+  auto fresh_peer = trial_peer(sends);
+  CHECK_FALSE(control::handle_input(s, fresh_peer, bytes(direct_abs())));
+  CHECK_FALSE(control::handle_input(s, {}, bytes(direct_abs())));
+  io.events.push_back({direct::Event::destroyed, io.spec.xid});
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+  CHECK(io.moves == 1); // same values/XID cannot reopen
+  DirectIO throwing;
+  auto bad = direct::WindowInput::bind(throwing.spec, throwing.ops());
+  auto t = direct_session(bad);
+  throwing.throw_motion = true;
+  CHECK_FALSE(control::handle_input(t, peer, bytes(direct_abs())));
+  throwing.throw_motion = false;
+  CHECK_FALSE(control::handle_input(t, peer, bytes(direct_abs())));
+  CHECK(throwing.moves == 1);
+}
+TEST_CASE("Direct single contact shares mapping and owns cancellation without a virtual touchscreen",
+          "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(b);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  REQUIRE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_DOWN, 4, 0.5f, 0.5f))));
+  CHECK(io.positions.back() == std::pair<int, int>{3840, 711});
+  CHECK(io.presses == 1);
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_DOWN, 5, 1, 1))));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_UP, 5, 0, 0))));
+  REQUIRE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_MOVE, 4, 1, 1))));
+  CHECK(io.positions.back() == std::pair<int, int>{4479, 1070});
+  CHECK(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_CANCEL, 4, 0, 0))));
+  CHECK(io.releases == 1);
+  for (float bad : {-0.1f, 1.1f, std::numeric_limits<float>::quiet_NaN(), std::numeric_limits<float>::infinity()})
+    CHECK_FALSE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_DOWN, 4, bad, 0))));
+  REQUIRE(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_DOWN, 7, 0, 0))));
+  CHECK(control::handle_input(s, peer, bytes(direct_touch(TOUCH_EVENT_CANCEL_ALL, 0, 0, 0))));
+  CHECK(io.releases == 2);
+  CHECK_FALSE(s.touch_screen->has_value());
+  CHECK_FALSE(s.pen_tablet->has_value());
+  CHECK_FALSE(s.mouse->has_value());
+}
+TEST_CASE("Direct config uses one validated binding for source and input and rejects arbitrary transforms",
+          "[direct-window]") {
+  DirectIO io;
+  config::BaseApp app{.legacy_pad_only_trial = true,
+                      .legacy_direct_touch_trial = true,
+                      .direct_window_target = io.spec,
+                      .title = "test",
+                      .start_virtual_compositor = false,
+                      .start_audio_server = false,
+                      .runner = config::AppCMD{.run_cmd = "unused"}};
+  auto parse = [&] {
+    return state::parse_apps(
+        {app},
+        "",
+        "",
+        {.source = "unused", .sink = "sink", .producer_buffer_caps = "caps", .h264_encoder = "enc"},
+        "unused",
+        "",
+        "",
+        {.source = "audio", .audio_params = "params", .opus_encoder = "opus", .sink = "sink"},
+        std::make_shared<immer::atom<immer::vector<events::StreamSession>>>(),
+        std::make_shared<events::EventBusType>(),
+        io.ops());
+  };
+  auto parsed = parse()->load()->front();
+  REQUIRE(parsed->direct_window_input.get());
+  CHECK(parsed->direct_window_input.get()->spec().xid == io.spec.xid);
+  CHECK(parsed->h264_gst_pipeline.find("ximagesrc xid=7 ") != std::string::npos);
+  CHECK(parsed->h264_gst_pipeline.find("add-borders=false") != std::string::npos);
+  CHECK(parsed->h264_gst_pipeline.find("width={width},height={height}") != std::string::npos);
+  CHECK(rfl::json::write(*parsed).find("direct_window") == std::string::npos);
+  Startup startup;
+  auto done = diag::start(*parsed, startup.ops());
+  CHECK(startup.runner == 1);
+  CHECK(startup.mouse + startup.keyboard + startup.compositor + startup.audio == 0);
+  app.video = config::BaseAppVideoOverride{.source = "ximagesrc xid=8"};
+  CHECK_THROWS(parse());
+  app.video = config::BaseAppVideoOverride{.video_params = "videocrop left=1"};
+  CHECK_THROWS(parse());
+  app.video.reset();
+  app.legacy_pad_only_trial = false;
+  CHECK_THROWS(parse());
+  app.legacy_pad_only_trial = true;
+  app.device_free_diagnostic = true;
+  CHECK_THROWS(parse());
+  app.device_free_diagnostic = false;
+  app.direct_window_target.reset();
+  CHECK_THROWS(parse());
+}
+TEST_CASE("Direct opt-in keeps Xbox and common typed forbidden routes denied", "[direct-window]") {
+  DirectIO io;
+  auto b = direct::WindowInput::bind(io.spec, io.ops());
+  auto s = direct_session(b);
+  unsigned sends = 0;
+  auto peer = trial_peer(sends);
+  TrialIO pad;
+  auto ops = pad.ops();
+  auto arrival = packet<CONTROLLER_ARRIVAL_PACKET>(CONTROLLER_ARRIVAL);
+  arrival.controller_type = PS;
+  REQUIRE(control::handle_input(s, peer, bytes(arrival), ops));
+  CHECK(pad.factories == 1);
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<MOUSE_MOVE_REL_PACKET>(MOUSE_MOVE_REL))));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<MOUSE_SCROLL_PACKET>(MOUSE_SCROLL))));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<KEYBOARD_PACKET>(KEY_PRESS))));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<PEN_PACKET>(PEN))));
+  CHECK_FALSE(control::handle_input(s, peer, bytes(packet<CONTROLLER_MOTION_PACKET>(CONTROLLER_MOTION))));
+  control::mouse_move_abs(direct_abs(), s);
+  control::touch(direct_touch(TOUCH_EVENT_DOWN, 0, 0, 0), s);
+  control::keyboard_key(packet<KEYBOARD_PACKET>(KEY_PRESS), s);
+  CHECK(io.moves + io.presses + sends == 0);
+  CHECK_FALSE(s.mouse->has_value());
+  CHECK_FALSE(s.keyboard->has_value());
+  s.app->legacy_direct_touch_trial = false;
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+  s.app->legacy_direct_touch_trial = true;
+  s.app->direct_window_input = std::shared_ptr<direct::WindowInput>{};
+  CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+  Startup startup;
+  auto done = diag::start(*s.app, startup.ops());
+  CHECK(startup.failed == 1);
+  CHECK(startup.runner == 0);
+}
+
+TEST_CASE("Direct backend invalidation and failed owned release stay closed without replacement", "[direct-window]") {
+  for (int failure : {0, 1, 2, 3}) {
+    DirectIO io;
+    auto b = direct::WindowInput::bind(io.spec, io.ops());
+    auto s = direct_session(b);
+    unsigned sends = 0;
+    auto peer = trial_peer(sends);
+    REQUIRE(control::handle_input(s, peer, bytes(direct_abs())));
+    auto press = packet<MOUSE_BUTTON_PACKET>(MOUSE_BUTTON_PRESS);
+    press.button = 1;
+    REQUIRE(control::handle_input(s, peer, bytes(press)));
+    if (failure == 0)
+      io.start = 12;
+    if (failure == 1)
+      io.motion_ok = false;
+    if (failure == 2)
+      for (int i = 0; i < 64; ++i)
+        io.events.push_back({direct::Event::changed});
+    if (failure == 3) {
+      io.button_ok = false;
+      auto release = press;
+      release.type = MOUSE_BUTTON_RELEASE;
+      CHECK_FALSE(control::handle_input(s, peer, bytes(release)));
+    } else
+      CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+    io.start = 11;
+    io.motion_ok = true;
+    io.button_ok = true;
+    io.events.clear();
+    CHECK_FALSE(control::handle_input(s, peer, bytes(direct_abs())));
+    CHECK(io.presses == 1);
+    CHECK(io.releases == 1);
+    CHECK(io.opened == 1);
+  }
+}

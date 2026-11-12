@@ -17,6 +17,9 @@ bool handle_input(events::StreamSession &session,
                   immer::box<std::shared_ptr<ControlPeer>> connected_client,
                   std::string_view bytes);
 
+// Peer-aware direct path; old typed helpers intentionally keep isolated-mode deny.
+bool handle_direct_input(events::StreamSession &, immer::box<std::shared_ptr<ControlPeer>>, std::string_view);
+
 namespace detail {
 // The common factory uses this selector (including legacy override behavior).
 wolf::config::ControllerType selected_joypad_type(const events::StreamSession &session,

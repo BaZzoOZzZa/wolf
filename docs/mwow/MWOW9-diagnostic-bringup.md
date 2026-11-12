@@ -189,3 +189,41 @@ same inherited constructor probe; full-suite execution needs an explicitly appro
 Docker socket environment guard. Raw first run remains preserved; no container mutation was attempted.
 Final native/SAN status is recorded in the accompanying thread-storage report, not inferred from this
 historical source checkpoint or from a green assertion count alone.
+
+## Direct iPad pointing + selected Xbox trial (new explicit user preference)
+
+The separate opt-in `legacy_direct_touch_trial=true` REQUIRES legacy_pad_only_trial, no diagnostic,
+no compositor/audio-server, process runner and exact `direct_window_target` fields: xid, pid, screen,
+root, process_start_time (Linux /proc/PID/stat field22 ticks, not wall-clock). Root supplies FRESH
+identities after launch; previous WoW PID/XID are obsolete. Default-off retains strict PadOnly.
+App video.source and video.video_params must be absent: parser constructs full uncropped ximagesrc
+from the SAME validated immutable binding and canonical videoconvertscale add-borders=false/I420/full
+width/height/PAR1. No independent capture string, crop/rotation/letterbox guesses. App stores hidden
+backend owner; parse binding failure prevents app publication. Save projection preserves these facts.
+
+Owned checked XCB/XTEST connection initializes before publication; Xlib/global handlers/threads are
+not added. Primitive XCB/proc Operations are the only test injection. Subscribe-before-snapshot,
+viewable InputOutput/PID/starttime/root/screen/client origin+size checks and bounded event draining
+protect a retained binding; destroy/error/backlog invalidates it permanently. Input calls are serial,
+try-admitted with an atomic flag, from one actual control owner; other thread/peer/connection refused.
+Exact retained connection and weak peer allocation identity latch on first authorized call, without
+strong callback inspection or automatic takeover/reconnect grant. Fresh connection/peer needs a new
+app binding/host lifecycle under this supervised trial. There is no new protected authority or singleton.
+
+Only ABS, left press/release, single TOUCH contact and the prior selected Xbox ARRIVAL/MULTI route.
+Common dispatcher retains existing auth/current/replay/bounds chain; Unix nullpeer refused; old typed
+mouse/touch helpers still deny trial. ABS normalizes bounded reference coordinates using wide integer
+arithmetic, no acceleration, endpoints last pixel. Button requires exact-owner prior sample, fresh
+geometry and current active target/descendant hit; movement reprojects, resize needs fresh ABS. Raw
+TOUCH finite0..1 DOWN/MOVE/UP/CANCEL uses the same mapping and bounded one-contact state, no virtual
+TouchScreen. Existing server advertisement unchanged; actual iPad packet mode is not assumed. No
+keyboard/text/pen/motion/scroll/relative/feedback/device relay and no Mouse/Keyboard/TouchScreen factories.
+
+XTEST is global server input: active/hit checks cannot make compositor/occlusion races atomic or prove
+Wine delivery/isolation. Synchronous XCB checked replies can block on a stuck server; no bounded physical
+latency/termination guarantee. Only actually owned left press is best-effort released on cancel/error;
+release failure is sticky, not a checked-neutral receipt. Destruction on lifecycle thread disconnects,
+never injects input there; pause/disconnect held-input and legacy Xbox detached-listener limits remain.
+No focus stealing. No actual target is selected or probed by author. Software tests use primitive fake
+transport/proc providers; default DISPLAY is invalid, Docker guard remains process-only ENOTDIR. Root
+owns actual fresh-target/corners/center/Xwayland/Wine/Xbox replay after independent review.

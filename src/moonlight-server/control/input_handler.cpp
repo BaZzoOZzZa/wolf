@@ -1,4 +1,5 @@
 #include "state/sessions.hpp"
+#include <control/direct_window_input.hpp>
 
 #include <boost/endian/conversion.hpp>
 #include <boost/locale.hpp>
@@ -876,6 +877,28 @@ void controller_battery(const CONTROLLER_BATTERY_PACKET &pkt, events::StreamSess
   }
 }
 
+bool handle_direct_input(events::StreamSession &session,
+                         immer::box<std::shared_ptr<ControlPeer>> peer,
+                         std::string_view bytes) {
+  if (!session.app || !session.app->legacy_direct_touch_trial.get() ||
+      !trial_admitted(session, peer, session.app->legacy_pad_slot.get()) || !valid_input_packet(bytes))
+    return false;
+  auto backend = session.app->direct_window_input.get();
+  if (!backend)
+    return false;
+  switch (read_packet<INPUT_PKT>(bytes).type) {
+  case MOUSE_MOVE_ABS:
+    return backend->absolute(session.connection_scope, *peer, read_packet<MOUSE_MOVE_ABS_PACKET>(bytes));
+  case MOUSE_BUTTON_PRESS:
+  case MOUSE_BUTTON_RELEASE:
+    return backend->button(session.connection_scope, *peer, read_packet<MOUSE_BUTTON_PACKET>(bytes));
+  case TOUCH:
+    return backend->touch(session.connection_scope, *peer, read_packet<TOUCH_PACKET>(bytes));
+  default:
+    return false;
+  }
+}
+
 namespace {
 bool handle_input_impl(events::StreamSession &session,
                        immer::box<std::shared_ptr<ControlPeer>> connected_client,
@@ -892,6 +915,11 @@ bool handle_input_impl(events::StreamSession &session,
   if (sessions::diagnostic::pad_only(session)) {
     auto route = [&](const detail::TrialPadIO &io) {
       switch (read_packet<INPUT_PKT>(bytes).type) {
+      case MOUSE_MOVE_ABS:
+      case MOUSE_BUTTON_PRESS:
+      case MOUSE_BUTTON_RELEASE:
+      case TOUCH:
+        return handle_direct_input(session, connected_client, bytes);
       case CONTROLLER_ARRIVAL:
         return trial_arrival(read_packet<CONTROLLER_ARRIVAL_PACKET>(bytes), session, connected_client, io);
       case CONTROLLER_MULTI:
