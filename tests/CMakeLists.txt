@@ -299,3 +299,12 @@ target_compile_features(wolf-rtsp-write-lifetime-tests PRIVATE cxx_std_20)
 target_link_libraries(wolf-rtsp-write-lifetime-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
 add_test(NAME wolf-rtsp-write-lifetime-tests COMMAND wolf-rtsp-write-lifetime-tests)
 set_tests_properties(wolf-rtsp-write-lifetime-tests PROPERTIES LABELS "rtsp;isolated" TIMEOUT 30)
+
+# Disabled HTTPS identity adapter; real cert primitives and unopened TLS objects only.
+if (UNIX AND NOT APPLE AND TARGET inputtino::libinputtino)
+    add_executable(wolf-protected-identity-tests testProtectedIdentity.cpp)
+    target_compile_features(wolf-protected-identity-tests PRIVATE cxx_std_20)
+    target_link_libraries(wolf-protected-identity-tests PRIVATE wolf::runner Catch2::Catch2WithMain)
+    add_test(NAME wolf-protected-identity-tests COMMAND wolf-protected-identity-tests)
+    set_tests_properties(wolf-protected-identity-tests PROPERTIES LABELS "security;isolated" TIMEOUT 45)
+endif ()

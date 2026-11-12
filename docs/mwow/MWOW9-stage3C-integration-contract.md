@@ -657,3 +657,32 @@ diagnostic exception: its actual destruction must be included in a bounded gate 
 before any later grant, with exact retained old/current identities. A queue flag or worker status
 alone cannot add that proof. This requires a concrete narrow Handoff/Seat accounting proposal before
 implementing the bridge; it cannot be hidden in ControlLoop-only code.
+
+## 13. Stage3C3A identity capture — design before implementation
+
+Only a disabled HTTPS identity adapter and minimal null-safe peer-certificate getter are authorized.
+Proposed internal `PairedSnapshot::seal(PairedClientList, PairingRevision)` freezes exact canonical
+Leaf records and lookup indexes. Revision must be supplied by the trusted owner, never minted by
+seal/capture. `VerifiedHttpsIdentity::capture(RequestPtr, snapshot, expectedRevision)` uses the real
+HTTPS getter by default; an explicit synchronous trusted provider seam replaces only peer retrieval
+in socket-free tests. A private constructor prevents caller-selected Principal/approved-bool identity.
+Output contains only immutable Leaf/Principal data and retained PairingRevision, no X509 mutable
+aliases, request, connection, provider or arbitrary callback resource. Foreign/null expected revision
+fails closed before getter/verification. This is historical evidence, never current grant authority.
+
+Limits reuse 3A: ≤64 paired records, ≤24KiB PEM/16KiB DER per cert and ≤256KiB total input PEM plus
+≤256KiB total canonical DER. PEM count/individual/sum sizes are checked over the owned immutable
+legacy snapshot BEFORE parsing/copying. Each existing Leaf parser checks DER extent before copying;
+aggregate DER is checked before record publication. The conservative PEM total also bounds the
+aggregate base64-derived DER. Fixed/bounded output, no mutable config alias. All records are checked:
+exact duplicates, numeric-index collision or digest collision deny snapshot publication, not hash-only
+acceptance. Presented same-key reissued leaf must match an explicit exact paired DER or be denied.
+
+No mutex held during parsing/crypto/provider/destruction, no Seat/Loop/Runtime dependency calls.
+Current pairing epoch coordination is NOT installed: the caller must capture paired snapshot+revision
+under its owner protocol and future authority must serialize close-before-mutation. Capturing freshly
+minted local revision as a substitute is forbidden. No protected live endpoint call in this step.
+Provider exceptions/parse failures fail closed; bad_alloc reported separately where catchable, no
+claim to recover upstream noexcept allocation aborts. Null/expired request guard tests against the old
+getter would intentionally dereference null; do not mislabel a crash as semantic RED. Feature tests
+and source comparison are the honest evidence unless a safe deterministic RED is found.
