@@ -69,15 +69,18 @@ an image build contract, not evidence the image already contains them. No generi
    UID with 0700 ancestors. Runtime must be established using a reviewed service/logind mechanism;
    merely creating `/run/user/UID` is not a login/session proof. Launcher daemon access remains
    separate trusted lifecycle authority, never passed into Wine. No local desktop account changes.
-2. Review `provisioning/90-wolf-wow.rules.in`: exact actual name/VID/PID from
+2. Review `provisioning/72-wolf-wow.rules.in`: exact actual name/VID/PID from
    `src/moonlight-server/control/input_handler.cpp:109–112`, inputtino
    `fd136cfe492b4375b4507718bcca1f044588fc6f` (develop CMake currently abbreviates `fd136cf`).
    Only that Xbox event/js class gets the private group/0660/seat-wolf-wow; only remote service gets
    uinput writer group. NO uhid/blanket input grant. Names identify a device class, not a session:
    initial supported topology is one remote domain; later runtime must retain exact node/devnum/
    generation and reject reused nodes. The source pin must be fully resolved/verified at artifact build.
-3. Rules are an uninstalled template. Review actual udev rule order/seat/uaccess behavior before
-   installing: TAG removal does not revoke existing ACLs/open FDs and other rules can override it.
+3. Rules are an uninstalled template: proposed filename72 follows 70-uaccess tagging and precedes
+   73-seat-late queuing RUN builtin uaccess. The former filename90 was too late to infer that
+   queued RUN was excluded. This is not a demonstrated leak. Review actual rule order, later
+   overrides and both event/js aliases before installing: TAG removal does not revoke existing
+   ACLs/open FDs and other rules can override it.
    Snapshot exact prior ACL/rule state, create a fresh device generation after the approved restart,
    verify no desktop read ACL/open FD, then pass only that node. Never blanket `setfacl -b`/chmod
    `/dev/input/*`. Current temporary UID1000 uinput ACL is not silently removed by this proposal.
@@ -111,3 +114,12 @@ services remain untouched. Rust foundation is incomplete and cannot start an iso
 
 Checks and immutable failure/provenance manifests are in the author's thread-storage
 `checks/rust-isolation-foundation`; first test compile failure is retained, not semantic RED.
+
+## R37-1 correction (foundation only)
+
+Game-data must be disjoint in **both** directions from desktop home, remote home and source prefix:
+equal, ancestor and descendant paths are refused; distinct component siblings remain valid.
+Actual validator and CLI regression tests reproduced all three ancestor proposals on RED, then use
+identical test bytes on GREEN. Original tests remain unchanged. No runtime, udev, ACL or prefix
+effects were added. Updated template ordering remains a proposal requiring later override review
+and fresh node/ACL/FD proof before any separate installation approval.

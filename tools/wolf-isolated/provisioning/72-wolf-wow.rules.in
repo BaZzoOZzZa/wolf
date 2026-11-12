@@ -2,6 +2,9 @@
 # inputtino fd136cfe492b4375b4507718bcca1f044588fc6f, Wolf input_handler.cpp.
 # One remote domain only. Name/VID/PID select a class, NOT an allocation/lease.
 # Group must be provisioned separately; desktop UID must NOT be a member.
+# Proposed order: after 70-uaccess tagging, BEFORE 73-seat-late queues uaccess RUN.
+# Review later overrides and both aliases; filename/TAG alone is NOT ACL proof.
+# Require fresh-node final seat/tag/ACL + no inherited/open desktop FD proof.
 # TAG removal does not revoke existing ACLs or already-open FDs.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="Wolf X-Box One (virtual) pad", ATTRS{id/vendor}=="045e", ATTRS{id/product}=="02ea", GROUP="wolf-wow-input", MODE="0660", ENV{ID_SEAT}="seat-wolf-wow", TAG-="uaccess"
 SUBSYSTEM=="input", KERNEL=="js*", ATTRS{name}=="Wolf X-Box One (virtual) pad", ATTRS{id/vendor}=="045e", ATTRS{id/product}=="02ea", GROUP="wolf-wow-input", MODE="0660", ENV{ID_SEAT}="seat-wolf-wow", TAG-="uaccess"

@@ -192,9 +192,9 @@ pub fn validate(p: &Profile) -> Vec<String> {
             e.push("forbidden host mount source".into());
         }
     }
-    if within(&p.game_data, &p.remote_home)
-        || within(&p.game_data, &p.prefix.source)
-        || within(&p.game_data, &p.desktop_home)
+    if [&p.desktop_home, &p.remote_home, &p.prefix.source]
+        .iter()
+        .any(|isolated| within(&p.game_data, isolated) || within(isolated, &p.game_data))
     {
         e.push("game-data must be a separate read-only tree, not desktop home/prefix".into());
     }
