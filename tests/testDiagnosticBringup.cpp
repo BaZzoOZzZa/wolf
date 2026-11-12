@@ -809,7 +809,7 @@ TEST_CASE("PadOnly trial common factory selection overrides PS motion and per-cl
   for (auto override : {config::ControllerType::PS, config::ControllerType::NINTENDO, config::ControllerType::AUTO}) {
     s.client_settings = config::ClientSettings{.controllers_override = {override},
                                                .motion_controller_override = config::ControllerType::PS};
-    for (auto advertised : {PS, NINTENDO, XBOX, UNKNOWN}) {
+    for (auto advertised : {PS, NINTENDO, XBOX, moonlight::control::pkts::UNKNOWN}) {
       CHECK(control::detail::selected_joypad_type(s, 0, advertised, GYRO | ACCELEROMETER | RUMBLE) ==
             config::ControllerType::XBOX);
     }
@@ -827,9 +827,12 @@ TEST_CASE("PadOnly trial actual decrypted dispatch keeps one pad across arrival 
     auto s = trial_session(selected);
     unsigned sends = 0, plugs = 0, unplugs = 0, combos = 0;
     auto peer = trial_peer(sends);
-    auto p = s.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>([&](const auto &) { ++plugs; });
-    auto u = s.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>([&](const auto &) { ++unplugs; });
-    auto c = s.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>([&](const auto &) { ++combos; });
+    auto p = s.event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
+        [&](const immer::box<events::PlugDeviceEvent> &) { ++plugs; });
+    auto u = s.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+        [&](const immer::box<events::UnplugDeviceEvent> &) { ++unplugs; });
+    auto c = s.event_bus->register_handler<immer::box<events::ClientWolfUIComboEvent>>(
+        [&](const immer::box<events::ClientWolfUIComboEvent> &) { ++combos; });
     auto multi = packet<CONTROLLER_MULTI_PACKET>(CONTROLLER_MULTI);
     multi.controller_number = boost::endian::native_to_little(short(selected));
     CHECK(control::handle_input(s, peer, bytes(multi), ops)); // inactive before arrival: no factory
@@ -1017,8 +1020,8 @@ TEST_CASE("PadOnly trial actual lobby handlers refuse source and retained target
     state->lobbies->store(immer::vector<events::Lobby>{lobby});
     auto handlers = sessions::setup_lobbies_handlers(state, "", {});
     unsigned relayed_unplug = 0;
-    auto unplug_handler =
-        source.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>([&](const auto &event) {
+    auto unplug_handler = source.event_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
+        [&](const immer::box<events::UnplugDeviceEvent> &event) {
           if (event->session_id == "L")
             ++relayed_unplug;
         });
