@@ -32,7 +32,8 @@ inline bool isolated_target(const events::Lobby &lobby, const immer::vector<even
   for (const auto &s : running)
     if (s.run_scope.matches(lobby.run_scope) && isolated(s))
       return true;
-  for (const auto &[id, member] : *lobby.members->load())
+  auto members = lobby.members->load();
+  for (const auto &[id, member] : *members)
     if (member && isolated(*member))
       return true;
   return false;
