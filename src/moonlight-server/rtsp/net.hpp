@@ -206,16 +206,21 @@ protected:
   void send_message_with_writer(const rtsp::RTSP_PACKET &response,
                                 const std::function<void(int)> &on_sent,
                                 Writer &&writer) {
+    // Separate immutable owner; no move from it in writer arguments (evaluation order).
+    // Completion owns both storage and socket object until provider retirement.
     auto raw_response = std::make_shared<const std::string>(rtsp::to_string(response));
     logs::log(logs::trace, "[RTSP] sending reply: \n{}", *raw_response);
-    std::forward<Writer>(
-        writer)(socket(), raw_response, [on_sent](boost::system::error_code error_code, std::size_t bytes_transferred) {
-      if (error_code) {
-        logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
-      }
-      logs::log(logs::trace, "[RTSP] sent reply of size: {}", bytes_transferred);
-      on_sent(bytes_transferred);
-    });
+    std::forward<Writer>(writer)(
+        socket(),
+        raw_response,
+        [self = shared_from_this(), raw_response, on_sent](boost::system::error_code error_code,
+                                                           std::size_t bytes_transferred) {
+          if (error_code) {
+            logs::log(logs::error, "[RTSP] error during transmission: {}", error_code.message());
+          }
+          logs::log(logs::trace, "[RTSP] sent reply of size: {}", bytes_transferred);
+          on_sent(bytes_transferred);
+        });
   }
 
   explicit tcp_connection(boost::asio::io_context &io_context, state::SessionsAtoms stream_sessions)

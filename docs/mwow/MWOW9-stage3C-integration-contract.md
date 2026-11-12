@@ -506,3 +506,154 @@ RED will retain old unowned-completion behavior after mechanical helper extracti
 weak owners before any dereference, so expected failures do not require UAF or sanitizer abort.
 Only net.hpp, new testRTSPWriteLifetime.cpp, appended isolated CMake target and this doc are owned.
 3C3 remains read-only planning; WoW needs a new explicit launch command after readiness.
+
+### 12.1 Implemented write boundary and remaining adjacent issues
+
+`send_message` delegates to the same protected templated initiation seam used by the fixture.
+A `shared_ptr<const string>` owns serialization immediately; completion copies it and a retained
+`shared_from_this()`. No move from the string owner occurs among unspecified-order call arguments.
+The default provider still invokes actual `asio::async_write(socket, buffer(*storage), completion)`.
+The socket member's address is not enough: self explicitly keeps the entire connection alive.
+Serialization/allocation/callback-copy failure occurs before scheduling and unwinds owned locals;
+scheduling throw unwinds local completion, while any provider-retained copy still owns resources.
+On success/error/cancellation the owners survive callback invocation and release only with its
+handler copies. A provider that never completes/destroys its handler legitimately retains them;
+this is not a permanent self-cycle inside tcp_connection. io_context must outlive its sockets and
+pending operations, as before. Arbitrary on_sent exceptions still propagate; bytes on error are
+not delivery confirmation. No new mutex, thread, retry, socket opening or request-bound change.
+
+RED extraction intentionally did not capture self/storage. The two owners then expired before a
+deferred callback; weak probes short-circuit buffer access. Four unchanged test cases exercise
+caller response/facade destruction, intact serialization, explicit close plus cancelled/error
+completion, callback-capture retirement, initiation throws before/after provider retention,
+provider abandonment and callback throw. The provider replaces only initiation/completion timing,
+not the production serialization or completion algorithm. This is software lifetime evidence,
+not TCP/Moonlight interoperability. Exact results/SHAs live in the separate RTSP-write report.
+
+Adjacent inherited gates, not changed: concurrent send_message calls have no per-connection write
+serialization; receive_message still converts Content-length with stoi and accumulates prev_read_
+separately from the 2048-byte streambuf (lines 155–177), so that streambuf limit alone does not prove
+an aggregate request bound. get_session still permits payload/fake-IP and legacy real-IP selection.
+These need separate reviewed ownership/tests before claiming protected RTSP ingress safe. This
+patch neither expands nor certifies existing request bounds or protocol authentication.
+
+### 12.2 Incremental 3C3 preparation after accepted 3C2/F16 (proposal only)
+
+Current pinned local sources/ranges/hashes are in thread-storage
+`checks/RTSP-write/3C3-inventory.json` and `3C3-source-ranges.txt`; no broad old inventory is replaced.
+Base 56c1f539 is accepted only for its disabled internal composition. Proposed ownership below is
+NOT an implementation grant. No real protected TLS route, GameACL config, Loop command or media
+adapter is installed by this prerequisite.
+
+| Existing concrete site/type | Small required integration delta / test seam |
+| --- | --- |
+| `rest/servers.cpp:99–104,154–178`, `state/config.hpp:42–61` | `get_client_if_paired` discards presented X509 and finds first matching record. New internal HTTPS identity adapter must retain the real presented leaf plus the uniquely paired exact leaf, use existing `x509::verification_error`, then `Principal::capture(VerifiedIdentitySource)`. Full DER comparison remains mandatory; same-key reissue/ambiguous matches deny. |
+| `protected_access.hpp:32–70`, `protected_authority.hpp:30–71,189–219` | Reuse `Leaf`, `VerifiedLeafSnapshot`, `Principal`, `Facts`, `Permit`, `begin_update/close_exact/publish_prepared`. TLS verification and pairing revision are independent from per-game policy. Current owner wrapper does not expose operator updates: a narrow versioned forwarding interface will be needed, not a second store/mutex/permission evaluator. |
+| `rest/endpoints.hpp:390–518` | Protected branch must occur before create_run_session/launch resume delegation and before running_sessions mutation. Return current protocol launch/resume fields for a transport-only candidate; never call legacy create_stream_session, StreamSession event, GameStop or transfer old device handles. Resume lacking appid uses only one exact retained selection for this TLS principal. |
+| `rtsp/net.hpp:63–121`, `rtsp/commands.hpp:166–285` | Candidate resolver must precede legacy get_session, refuse protected missing/ambiguous correlator without IP fallback; ANNOUNCE needs a pure validated descriptor result before event publication. Existing announce negotiates crypto then directly emits A/V: extraction must preserve legacy branch while protected branch stages only descriptors. |
+| `control/control_loop.cpp:181–190,371–472,551–598` | Actual CONNECT mints PeerToken. Inject bounded candidate/current resolver into THIS State, bypass numeric owners exclusion only for protected exact identities; use SAME keys/decrypt/replay/bounds. Suppress protected ResumeStream and handle_input until real grant. pump_feedback needs protected exact snapshot instead of current_control_session(id). |
+| `protected_feedback.cpp:384–418`, `control_loop.hpp:60–92` | `cancel_for_transfer(OwnerPeerView, retained Pending TransferHandle)` exists, but Loop offers no command slot. Add one bounded exact cancellation cell to owned loop; construct view only on owner thread and wrap reset in existing owner frames. No raw peer crosses threads. |
+| `protected_runtime.hpp:12–30,73–136`, `.cpp:6–22,295–345` | One ConsumerComposition and private bounded transport snapshot exist. Owner submit takes RuntimeJob and charges fixed cells; status drives poll_deadline without queue→Seat. transfer() is external ownership, so a future cancellation slot retaining it must remain charged through actual owner-side destruction, not just an ACK flag. |
+| `sessions/moonlight.cpp:259–311`, `streaming/streaming.cpp:385–494`, `wolf.cpp:193–242` | Wolf already passes the SAME real Runtime into handlers. Legacy media constructs Work using prepare_stream_consumer; protected Work must explicitly retain source S/T descriptor and destination L producer, then use existing start_streaming_video/audio + real ConsumerJob. No direct event/admit bypass. |
+
+**Smallest next increment recommended: sealed HTTPS identity capture, still disabled.** Proposed
+paths: NEW `sessions/protected_identity.hpp/.cpp`, narrow `rest/servers.cpp` and declaration header
+`rest/rest.hpp` if needed, NEW `tests/testProtectedIdentity.cpp`, appended isolated target and this
+doc. The actual server declarations are in rest/rest.hpp (there is no servers.hpp). No endpoints/config/state
+writes. A separately explicit minimal rest/custom-https.cpp expansion is needed for safe certificate
+retrieval: its get_client_cert currently dereferences request->connection.lock() without checking
+expiry (lines 76–79). Retain/check that connection and a nonnull peer cert; preserve the existing
+handshake/verification policy. This is a concrete later ownership proposal, not part of this fix. Internal signature proposal:
+
+```cpp
+// Construct only from the real HTTPS request/certificate getter and an owned
+// paired snapshot. No public wire bool or caller-chosen principal constructor.
+std::optional<VerifiedHttpsIdentity> capture_https_identity(
+    const HttpsRequest&, const PairedSnapshot&, PairingRevision);
+// VerifiedHttpsIdentity owns presented+paired canonical leaves, Principal and
+// retained pairing revision; it is historical evidence, not a grant capability.
+```
+
+The adapter calls existing PUBLIC verifier/DER primitives. Resolve all bounded paired candidates,
+reject ambiguity before publishing; no first numeric/hash match authority. Limit cert bytes/count
+before copying (use accepted 3A limits, refuse an oversized legacy snapshot for protected capture).
+Prepare outside Seat/loop/queue locks. Tests invoke actual adapter with certificate retrieval seam,
+real local cert/DER parsing/verification and reissued-same-key/duplicate/foreign/null cases; no fake
+boolean verification. Actual TLS handshake possession remains a later integration/interop gate.
+The revision comes from an owner-held pairing epoch; close-before-paired-state mutation is required
+in the later update ingress. This facts adapter alone cannot serialize revocation with a grant.
+
+**Subsequent separately reviewed milestones:**
+
+1. Bounded transport selection/staging (proposed NEW `sessions/protected_transport.hpp/.cpp`, narrow
+   `rest/endpoints.hpp`, `rest/servers.cpp`, `rtsp/net.hpp`, `rtsp/commands.hpp`, owner wrapper only if
+   needed). One current+candidate including Unknown; fresh ConnectionScope, existing-format correlators,
+   no process/device/prefix/directory creation. Keep old lifetime until actual request saves old ticket.
+   Exact normalized retry tuple = presented DER + retained game/L/binding + existing rikey/rikeyid +
+   transport params; conflict Busy, identical intent idempotent. No new wire epoch, no key history.
+   ANNOUNCE must negotiate candidate V2 and stage ≤one Audio/Video before encrypted key proof. The
+   prior fresh-key retry proposal is NOT accepted interop behavior: verify actual client transcripts
+   and same-key registry rules before deciding. Fail closed rather than infer identity from IP.
+2. Actual Loop resolver/cancellation bridge (proposed `control_loop.hpp/.cpp`, `protected_runtime.hpp/.cpp`
+   plus bounded transport module, tests). `resolve_connect(correlator)` returns retained transport data,
+   not permission; real loop then supplies its fresh PeerToken. `submit_cancel(exact Pending handle)`
+   reserves one cell before copy, returns acceptance only. Close/revoke flags are out-of-band. Owner
+   dispatch rechecks exact old grant/connection/peer/device/L/ticket and calls real cancel_for_transfer,
+   then actual reset/free/enclosing-stack/capture retirement completes the obligation. A popped slot
+   and retained handle remain charged; no last payload release under queue/Seat/control locks. A stale
+   F13 operation cannot fault T; F14 occupied receive cell still forbids reuse. No second key registry.
+3. Real Work adapter + periodic driver (proposed NEW `sessions/protected_media.hpp/.cpp`, narrow
+   moonlight/handlers/streaming exposure only if necessary, and owned-loop lifecycle tick site).
+   `prepare_media_work(SealedDescriptor, ExactSource, ExactProducerL, OwnedMediaDeps)` returns bounded
+   Work for actual owner.submit Audio/Video; it does not admit or create a pipeline while staging.
+   Existing start_streaming_* validates source job scopes and producer_scope; preserve that check.
+   Destination audio sink must be captured from L, not formatted from source ID by legacy fallback.
+   Admission remains serial actual Handoff/F12/F15, same Runtime; A failure after A/V partial admission
+   revokes candidate with retained exact ticket, never partial readiness. A periodic owned event-loop
+   tick calls owner.status/poll_deadline outside all locks; a blocked event loop still cannot promise
+   autonomous wall-clock notification. Do not create a per-transfer timer/thread or reset 5s deadline.
+
+Dependency order: RTSP prerequisite review → sealed TLS capture → bounded candidate/ANNOUNCE staging
+→ same Loop proof/cancellation bridge → Work/tick integration → full protected route closure review
+→ separate provisioning/readiness/interoperability gates. During all intermediate milestones keep
+feature disabled. Initial ProtectedRuntimeOwner bootstrap requires a real PeerToken and proven fresh
+PadOnly inventory: do not construct it early with a fabricated peer or empty-held-set readiness.
+
+Tests for later integration must drive actual handler/dispatcher seams: same-client old/new scopes,
+identical/conflicting retries, ANNOUNCE before key proof, aborted/capped staging, replay/tag/V2 direction,
+wrong exact DER/game, pairing revoke on both sides of final commit, exact ticket before replacement,
+Pending cancel with queued/ENet-owned feedback, old notice against new T, F12 payload cleanup and F16
+status during replacement, no input/event/device/runner effects before grant, sourceS→producerL A/V,
+late deadline no auto-grant. Real packet functions may remain socket-free injected tests; that is not
+Moonlight handshake proof. Existing plain InputSeat validation or historical Granted cannot substitute
+for current typed authority. Domain construction/serial publication and readiness are distinct gates.
+
+Lock graph remains: Seat→Runtime only in accepted admission; Runtime Current reads immutable lifetime
+view, never Seat/authority/queue/callback. TLS/DER/parser/Work preparation runs outside gates. Queue
+exchange → unlock → effect/owner callback → payload destruction → short accounting ACK; no copied
+arbitrary owner can retire under a lock or escape F12 accounting. Operator pairing/ACL/lifecycle changes
+close under the SAME Seat gate before legacy publication; stale async prepared policy cannot reopen.
+
+All other §3/5/6 requirements remain: Unix defaultdeny without exact delegation, PadOnly every route
+including combo/JoinLeave/arrival/mask/motion/battery/nonpad and PlugDevice, real device attachment and
+singleton/prefix aliases, no ordinary Leave/stop_when_empty on transfer. Protected remote Quit should
+source-close/revoke only, never legacy GameStop absent separate operator authority. Public UI/HUD
+requires Penpot; raw touch is not HUD gamepad commands. No enabling, mocked readiness, arrival ETA,
+local-game readiness or physical/kernel/Wine/isolation proof is implied by this proposal. WoW launch
+requires a NEW explicit command after return AND readiness; current game/prefix remain untouched.
+
+TLS-source qualification: custom-https.cpp:11–16 accepts the certificate during the handshake
+verification callback so endpoints can return protocol errors; actual per-request paired verification
+is state/config.hpp:42–61. Successful TLS handshake alone is NOT per-game approval. The future adapter
+must preserve both layers, uniquely compare full presented/paired DER and retain owner-issued pairing
+revision. The software certificate getter seam cannot prove a real TLS handshake occurred.
+
+Cancellation bridge detail: cancel_for_transfer returns false when there is no active reservation;
+this must not manufacture a CancelledReleased ACK or quarantine a healthy transfer merely for an
+empty cell. The real Seat send fence decides whether an obligation exists. The new internal command
+result should distinguish Refused/Stale/NoOutstanding/Retiring/Unknown, with NoOutstanding historical
+only. Any command-owned TransferHandle remains an INTERNAL capture owner (F16), not the external
+diagnostic exception: its actual destruction must be included in a bounded gate retirement obligation
+before any later grant, with exact retained old/current identities. A queue flag or worker status
+alone cannot add that proof. This requires a concrete narrow Handoff/Seat accounting proposal before
+implementing the bridge; it cannot be hidden in ControlLoop-only code.
