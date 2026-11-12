@@ -110,6 +110,8 @@ bool ProtectedRuntimeOwner::start(RuntimeBootstrap bootstrap, control::SeatThrea
     exited_ = done->get_future().share();
     worker_ = start_thread([this, done] {
       try {
+        if (state_->probe)
+          state_->probe->before_worker_run();
         run();
       } catch (...) {
         state_->execution_failed = state_->unknown = true;
@@ -510,12 +512,13 @@ ProtectedRuntimeOwner::~ProtectedRuntimeOwner() {
   request_stop();
   if (worker_.joinable())
     worker_.join();
-  // Probe captures retire on lifecycle owner after all execution, while state is
-  // still complete for reentrant inspection; never a per-call last release.
-  state_->probe.reset();
   // Payload retirement may inspect the still-live bundle. Never hold queue lock.
   for (auto &cell : state_->cells)
     cell.job.reset();
+  if (state_->probe)
+    state_->probe->before_bundle_teardown();
+  // Probe captures retire while State is complete, never a per-call last release.
+  state_->probe.reset();
   state_->handoff.reset();
   state_->seat.reset();
   state_->authority.reset();

@@ -652,3 +652,285 @@ TEST_CASE("Pairing negative persistence outcomes and throw retain typed slot wit
     CHECK_FALSE(f.runtime->current());
   }
 }
+
+namespace {
+struct F17Source : access_api::VerifiedIdentitySource {
+  x509::x509_ptr cert;
+  uint64_t index;
+  F17Source(x509::x509_ptr value, uint64_t number) : cert(std::move(value)), index(number) {}
+  access_api::VerifiedLeafSnapshot verified_leaf() const override {
+    return {cert, cert, index};
+  }
+};
+struct LifetimeAudit {
+  Gate worker;
+  std::atomic_bool bundle_live{true};
+  std::atomic_uint backend_calls{0}, listener_threads{0}, worker_entries{0};
+  std::atomic_uint provider_destroyed{0}, resource_destroyed{0}, late_destroyed{0}, inspections{0};
+  std::atomic_uint executed{0}, resource_retire{0};
+  std::atomic_bool inspected_unknown{true}, inspected_no_current{true}, inspected_joined{true};
+  bool pause_worker = false;
+  void inspect(ProtectedRuntimeOwner *runtime) {
+    if (!bundle_live.load()) {
+      ++late_destroyed;
+      return; // RED: never read ended State members; ordering assertion is enough
+    }
+    const auto status = runtime->status();
+    inspected_unknown = inspected_unknown.load() && status.unknown && status.occupied == 1;
+    inspected_joined = inspected_joined.load() && status.joined;
+    inspected_no_current = inspected_no_current.load() && !runtime->current();
+    ++inspections;
+  }
+};
+struct LifecycleProbe final : RuntimeInspectionProbe {
+  LifetimeAudit &audit;
+  explicit LifecycleProbe(LifetimeAudit &value) : audit(value) {}
+  void before_worker_run() const noexcept override {
+    ++audit.worker_entries;
+    if (audit.pause_worker)
+      audit.worker.wait();
+  }
+  void before_bundle_teardown() const noexcept override {
+    audit.bundle_live = false;
+  }
+};
+struct RevisionRig {
+  LifetimeAudit &audit;
+  RunScope run = RunScope::fresh("L");
+  SeatCandidate initial{
+      RunScope::fresh("42"), run, ConnectionScope::fresh(42), PeerToken::fresh(0), BindingRevision::fresh(0), 0};
+  pa::OperatorCapability op = pa::OperatorCapability::fresh(0);
+  std::shared_ptr<IO> io = std::make_shared<IO>();
+  state::SessionsAtoms running = std::make_shared<immer::atom<immer::vector<wolf::core::events::StreamSession>>>();
+  std::shared_ptr<ConsumerComposition> composition = std::make_shared<ConsumerComposition>(running);
+  std::shared_ptr<LifecycleProbe> probe;
+  std::shared_ptr<ProtectedRuntimeOwner> runtime;
+  std::unique_ptr<pp::PairingMutationOwner> owner;
+  explicit RevisionRig(LifetimeAudit &value)
+      : audit(value), probe(std::make_shared<LifecycleProbe>(value)),
+        runtime(std::make_shared<ProtectedRuntimeOwner>(composition, probe)) {}
+  RuntimeBootstrap bootstrap(access_api::Principal principal) {
+    return {{},
+            op,
+            initial,
+            std::move(principal),
+            {true, true, true},
+            [this](auto callback) {
+              ++audit.backend_calls;
+              auto xbox =
+                  inputtino::checked::Xbox::adopt({io, 42}, io->operations(), std::move(callback), [this](auto work) {
+                    ++audit.listener_threads;
+                    return std::thread(std::move(work));
+                  });
+              return std::make_shared<CheckedXboxBackend>(std::move(xbox));
+            },
+            {},
+            [] { return Clock::now(); }};
+  }
+  void start() {
+    auto leaf = *access_api::Leaf::from_x509(certificate());
+    std::array<access_api::PinView, 1> pins{{{leaf, std::hash<std::string>{}(x509::get_cert_pem(certificate()))}}};
+    std::array<access_api::RuleView, 1> rules{{{"game", "42", pins}}};
+    owner = std::make_unique<pp::PairingMutationOwner>(runtime, clients(), rules, "game", "42", bootstrap(principal()));
+    REQUIRE(eventually([&] { return bool(runtime->current()); }));
+  }
+  ~RevisionRig() {
+    audit.worker.release();
+    owner.reset();
+    runtime.reset();
+  }
+};
+struct RetainedProvider final : pp::PersistenceOperation {
+  LifetimeAudit &audit;
+  ProtectedRuntimeOwner *runtime; // borrowed lifecycle inspection; no owning back edge
+  unsigned mode;
+  RetainedProvider(LifetimeAudit &a, ProtectedRuntimeOwner *r, unsigned m) : audit(a), runtime(r), mode(m) {}
+  pp::PersistenceOutcome execute(const pp::Transaction &tx) override {
+    ++audit.executed;
+    if (mode == 2)
+      throw std::runtime_error("F18 retained provider fault");
+    return tx.outcome(mode == 0 ? pp::PersistenceResult::Failed : pp::PersistenceResult::Unknown);
+  }
+  ~RetainedProvider() override {
+    ++audit.provider_destroyed;
+    audit.inspect(runtime);
+  }
+};
+struct RetainedResource final : pa::RetirementResource {
+  LifetimeAudit &audit;
+  ProtectedRuntimeOwner *runtime;
+  RetainedResource(LifetimeAudit &a, ProtectedRuntimeOwner *r) : audit(a), runtime(r) {}
+  void retire() override {
+    ++audit.resource_retire;
+  }
+  ~RetainedResource() override {
+    ++audit.resource_destroyed;
+    audit.inspect(runtime);
+  }
+};
+void submit_retained(RevisionRig &rig, LifetimeAudit &audit, unsigned mode) {
+  auto old = rig.owner->capture_publication();
+  auto update = rig.owner->begin_update(rig.op, old);
+  REQUIRE(update.result == pp::Result::Accepted);
+  auto leaf = *access_api::Leaf::from_x509(certificate());
+  std::array<access_api::PinView, 1> pins{{{leaf, std::hash<std::string>{}(x509::get_cert_pem(certificate()))}}};
+  std::array<access_api::RuleView, 1> rules{{{"game", "42", pins}}};
+  auto prepared = rig.owner->prepare(update.update, clients(), rules);
+  REQUIRE(prepared);
+  REQUIRE(eventually([&] { return rig.owner->ready(update.update); }));
+  REQUIRE(rig.owner->submit(update.update,
+                            prepared,
+                            std::make_unique<RetainedProvider>(audit, rig.runtime.get(), mode),
+                            std::make_unique<RetainedResource>(audit, rig.runtime.get())) == pp::Result::Accepted);
+}
+} // namespace
+
+TEST_CASE("F17 bootstrap requires exact current sealed leaf before any backend or thread factory",
+          "[protected-pairing][f17-f18]") {
+  auto key = x509::generate_key();
+  auto a = x509::generate_x509(key);
+  x509::x509_ptr selected = a;
+  bool allow_start = false;
+  bool null_principal = false;
+  bool wrong_index = false;
+  SECTION("historical unrelated B still in ACL but current pairing only A") {
+    selected = x509::generate_x509(x509::generate_key());
+  }
+  SECTION("same public key reissued leaf is not the paired leaf") {
+    selected = x509::x509_ptr(X509_dup(a.get()), X509_free);
+    REQUIRE(selected);
+    REQUIRE(ASN1_INTEGER_set(X509_get_serialNumber(selected.get()), 98765) == 1);
+    REQUIRE(X509_sign(selected.get(), key.get(), EVP_sha256()) > 0);
+    REQUIRE(EVP_PKEY_eq(X509_get0_pubkey(a.get()), X509_get0_pubkey(selected.get())) == 1);
+    REQUIRE_FALSE(access_api::Leaf::from_x509(a)->matches(*access_api::Leaf::from_x509(selected)));
+  }
+  SECTION("null Principal") {
+    null_principal = true;
+  }
+  SECTION("exact DER but inconsistent numeric metadata") {
+    wrong_index = true;
+  }
+  SECTION("exact current paired leaf") {
+    allow_start = true;
+  }
+  auto index = std::hash<std::string>{}(x509::get_cert_pem(selected));
+  if (wrong_index)
+    index ^= 1;
+  access_api::Principal captured;
+  if (!null_principal) {
+    auto p = access_api::Principal::capture(F17Source(selected, index));
+    REQUIRE(p);
+    captured = *p;
+  }
+  auto leaf = *access_api::Leaf::from_x509(selected);
+  std::array<access_api::PinView, 1> pins{{{leaf, index}}};
+  std::array<access_api::RuleView, 1> rules{{{"game", "42", pins}}};
+  LifetimeAudit audit;
+  RevisionRig rig(audit);
+  try {
+    rig.owner = std::make_unique<pp::PairingMutationOwner>(rig.runtime,
+                                                           clients(x509::get_cert_pem(a)),
+                                                           rules,
+                                                           "game",
+                                                           "42",
+                                                           rig.bootstrap(captured));
+  } catch (const std::exception &) {
+  }
+  if (rig.owner)
+    REQUIRE(eventually([&] { return bool(rig.runtime->current()); }));
+  CHECK(bool(rig.owner) == allow_start);
+  if (allow_start) {
+    CHECK(audit.backend_calls == 1);
+    CHECK(audit.listener_threads == 1);
+    CHECK(rig.runtime->current());
+  } else {
+    CHECK(audit.backend_calls == 0);
+    CHECK(audit.listener_threads == 0);
+    CHECK(audit.worker_entries == 0);
+    CHECK_FALSE(rig.runtime->current());
+  }
+}
+
+TEST_CASE("F18 failed typed provider and resource retire before live bundle ends", "[protected-pairing][f17-f18]") {
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    LifetimeAudit audit;
+    {
+      RevisionRig rig(audit);
+      rig.start();
+      submit_retained(rig, audit, mode);
+      REQUIRE(eventually([&] { return rig.runtime->status().stop; }));
+      REQUIRE(eventually([&] { return rig.runtime->join_when_exited() == RuntimeJoin::Joined; }));
+      CHECK(rig.runtime->status().occupied == 1);
+      CHECK(rig.owner->status().phase == pp::Phase::Unknown);
+      CHECK(audit.provider_destroyed == 0);
+      CHECK(audit.resource_destroyed == 0);
+    }
+    CHECK(audit.executed == 1);
+    CHECK(audit.provider_destroyed == 1);
+    CHECK(audit.resource_destroyed == 1);
+    CHECK(audit.late_destroyed == 0);
+    CHECK(audit.inspections == 2);
+    CHECK(audit.inspected_unknown);
+    CHECK(audit.inspected_no_current);
+    CHECK(audit.inspected_joined);
+    CHECK(audit.resource_retire == 0);
+    CHECK_FALSE(audit.bundle_live);
+  }
+}
+
+TEST_CASE("F18 queued typed command stopped before execution retains Unknown until joined cleanup",
+          "[protected-pairing][f17-f18]") {
+  LifetimeAudit audit;
+  audit.pause_worker = true;
+  {
+    RevisionRig rig(audit);
+    rig.start();
+    REQUIRE(eventually([&] { return audit.worker.entered.load(); }));
+    submit_retained(rig, audit, 0);
+    CHECK(rig.runtime->status().occupied == 1);
+    CHECK(audit.executed == 0);
+    rig.runtime->request_stop();
+    audit.worker.release();
+    REQUIRE(eventually([&] { return rig.runtime->join_when_exited() == RuntimeJoin::Joined; }));
+    CHECK(rig.owner->status().phase == pp::Phase::Unknown);
+    CHECK(rig.runtime->status().occupied == 1);
+    CHECK(audit.provider_destroyed == 0);
+  }
+  CHECK(audit.executed == 0);
+  CHECK(audit.provider_destroyed == 1);
+  CHECK(audit.resource_destroyed == 1);
+  CHECK(audit.late_destroyed == 0);
+  CHECK(audit.inspections == 2);
+  CHECK(audit.inspected_unknown);
+  CHECK(audit.inspected_no_current);
+  CHECK(audit.inspected_joined);
+  CHECK(audit.resource_retire == 0);
+}
+
+TEST_CASE("F18 launch rollback has no accepted typed cell and keeps live inspection until teardown",
+          "[protected-pairing][f17-f18]") {
+  for (bool nonjoinable : {false, true}) {
+    LifetimeAudit audit;
+    RevisionRig rig(audit);
+    auto bootstrap = rig.bootstrap(principal());
+    auto leaf = *access_api::Leaf::from_x509(certificate());
+    std::array<access_api::PinView, 1> pins{{{leaf, std::hash<std::string>{}(x509::get_cert_pem(certificate()))}}};
+    std::array<access_api::RuleView, 1> rules{{{"game", "42", pins}}};
+    bootstrap.facts.facts = pa::Facts::prepare(rules, "game", "42", rig.run, pa::PairingRevision::fresh(0));
+    unsigned launched = 0;
+    CHECK_FALSE(rig.runtime->start(std::move(bootstrap), [&](auto) -> std::thread {
+      ++launched;
+      if (nonjoinable)
+        return {};
+      throw std::runtime_error("owned thread launch failed");
+    }));
+    CHECK(launched == 1);
+    CHECK(rig.runtime->status().stop);
+    CHECK(rig.runtime->status().unknown);
+    CHECK(rig.runtime->status().occupied == 0);
+    CHECK_FALSE(rig.runtime->status().started);
+    CHECK(rig.runtime->submit(std::make_unique<RuntimeJob>()).result == RuntimeSubmission::Closed);
+    CHECK(rig.runtime->join_when_exited() == RuntimeJoin::Refused);
+    CHECK(audit.bundle_live);
+  }
+}

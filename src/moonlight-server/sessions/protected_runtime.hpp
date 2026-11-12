@@ -108,6 +108,8 @@ struct RuntimeBootstrap {
 // no per-call ownership/capture release, no strong owner back-reference.
 struct RuntimeInspectionProbe {
   virtual ~RuntimeInspectionProbe() = default;
+  virtual void before_worker_run() const noexcept {}      // optional bounded test scheduling, outside locks
+  virtual void before_bundle_teardown() const noexcept {} // lifecycle marker, not a retirement ACK
   virtual void after_submit_publish() const noexcept {}
   virtual void after_status_inspection() const noexcept {}
 };
