@@ -618,3 +618,150 @@ TEST_CASE("Shared composition preserves exact legacy recognition and unrelated r
   CHECK_FALSE(cancelled.load());
   CHECK(run.matches(f.running->load()->front().run_scope));
 }
+
+namespace {
+struct F16Probe final : RuntimeInspectionProbe {
+  std::shared_ptr<TestGate> inspected = std::make_shared<TestGate>();
+  mutable std::atomic_bool submit{false}, status{false};
+  void after_submit_publish() const noexcept override {
+    if (submit.exchange(false))
+      inspected->wait();
+  }
+  void after_status_inspection() const noexcept override {
+    if (status.exchange(false))
+      inspected->wait();
+  }
+};
+struct F16Retirement {
+  std::shared_ptr<TestGate> gate = std::make_shared<TestGate>();
+  std::mutex mutex;
+  std::thread::id inspector;
+  std::atomic_bool on_inspector{false}, reentered{false};
+};
+struct F16Capture {
+  std::shared_ptr<F16Retirement> retirement;
+  ProtectedRuntimeOwner *owner;
+  ~F16Capture() {
+    {
+      std::lock_guard lock(retirement->mutex);
+      retirement->on_inspector = std::this_thread::get_id() == retirement->inspector;
+    }
+    (void)owner->status(); // actual reentry; no Seat/queue lock may surround retirement
+    retirement->reentered = true;
+    retirement->gate->wait();
+  }
+};
+struct F16Join {
+  std::shared_ptr<F16Probe> probe;
+  std::shared_ptr<F16Retirement> retirement;
+  std::thread thread;
+  ~F16Join() {
+    probe->inspected->release();
+    retirement->gate->release();
+    if (thread.joinable())
+      thread.join();
+  }
+};
+void f16_schedule(bool submit_schedule, bool deadline) {
+  // All gate/counter/probe owners precede fixture; Join releases them before
+  // fixture supervisor joins even if any REQUIRE fails (RED included).
+  auto probe = std::make_shared<F16Probe>();
+  auto retirement = std::make_shared<F16Retirement>();
+  std::atomic_bool inspector_done{false}, inspector_failed{false};
+  Fixture f(false);
+  f.owner = std::make_unique<ProtectedRuntimeOwner>(f.composition, probe);
+  f.gates.push_back(probe->inspected);
+  f.gates.push_back(retirement->gate);
+  REQUIRE(f.owner->start(f.bootstrap()));
+  REQUIRE(eventually([&] { return bool(f.owner->current()); }));
+  auto capture = std::make_shared<F16Capture>();
+  capture->retirement = retirement;
+  capture->owner = f.owner.get();
+  auto first = f.selection([capture](const auto &) { return true; });
+  capture.reset(); // no external strong TransferHandle OR validator owner
+  auto h1_receipt = f.owner->submit(std::move(first));
+  REQUIRE(h1_receipt.receipt);
+  REQUIRE(eventually([&] {
+    auto current = f.owner->current();
+    return h1_receipt.receipt->state == RuntimeJobState::Complete && current &&
+           current->owner.connection.matches(f.next.connection);
+  }));
+  const auto old_connection = f.next.connection;
+  const auto old_peer = f.next.peer;
+  f.next.connection = ConnectionScope::fresh(42);
+  f.next.peer = PeerToken::fresh(0);
+  f.next.binding = BindingRevision::fresh(0);
+  auto second = f.selection();
+  F16Join join{probe, retirement, {}};
+  auto inspect = [&](std::unique_ptr<RuntimeJob> job) {
+    {
+      std::lock_guard lock(retirement->mutex);
+      retirement->inspector = std::this_thread::get_id();
+    }
+    try {
+      if (submit_schedule)
+        (void)f.owner->submit(std::move(job));
+      else
+        (void)f.owner->status();
+    } catch (...) {
+      inspector_failed = true;
+    }
+    inspector_done = true;
+  };
+  if (submit_schedule) {
+    probe->submit = true;
+    join.thread = std::thread(inspect, std::move(second));
+  } else {
+    probe->status = true;
+    join.thread = std::thread(inspect, nullptr);
+  }
+  REQUIRE(eventually([&] { return probe->inspected->entered.load(); }));
+  if (!submit_schedule)
+    REQUIRE(f.owner->submit(std::move(second)).result == RuntimeSubmission::Accepted);
+  auto h2_granted = [&] {
+    auto current = f.owner->current();
+    return current && current->owner.connection.matches(f.next.connection);
+  };
+  REQUIRE(eventually([&] { return retirement->gate->entered.load() || h2_granted(); }));
+  CHECK(retirement->gate->entered.load());
+  CHECK(retirement->reentered.load());
+  CHECK_FALSE(h2_granted()); // actual replacement ACK/grant must not precede sole destructor
+  probe->inspected->release();
+  CHECK(eventually([&] { return inspector_done.load(); })); // RED may run sole destructor here
+  CHECK_FALSE(retirement->on_inspector.load());
+  CHECK_FALSE(inspector_failed.load());
+  if (deadline) {
+    f.clock->store(16001);
+    CHECK(f.owner->status().unknown); // must decide while actual replacement cleanup blocks
+    CHECK_FALSE(h2_granted());
+    CHECK(f.owner->close_exact(f.op, f.original));
+  } else {
+    CHECK_FALSE(f.owner->status().unknown);
+  }
+  retirement->gate->release();
+  if (join.thread.joinable())
+    join.thread.join();
+  if (deadline) {
+    CHECK_FALSE(h2_granted());
+    CHECK(f.owner->status().unknown);
+  } else {
+    REQUIRE(eventually(h2_granted));
+    CHECK_FALSE(f.owner->close_exact(old_connection, old_peer));
+    CHECK(h2_granted());
+    auto h2 = f.owner->transfer();
+    REQUIRE(h2);
+    auto media = f.owner->submit(f.media(h2, RuntimeCell::Audio));
+    REQUIRE(media.receipt);
+    REQUIRE(eventually([&] { return media.receipt->state == RuntimeJobState::Complete; }));
+    CHECK(media.receipt->media == ConsumerAdmission::Accepted);
+  }
+}
+} // namespace
+TEST_CASE("F16 submit diagnostic cannot retain H1 validator beyond H2 publication", "[protected-runtime][f16]") {
+  f16_schedule(true, false);
+  f16_schedule(true, true);
+}
+TEST_CASE("F16 status diagnostic never becomes last H1 validator owner", "[protected-runtime][f16]") {
+  f16_schedule(false, false);
+  f16_schedule(false, true);
+}

@@ -44,6 +44,7 @@ struct ProtectedRuntimeOwner::State {
     bool occupied = false;
   };
   const std::shared_ptr<ConsumerComposition> composition;
+  const std::shared_ptr<const RuntimeInspectionProbe> probe;
   mutable std::mutex mutex;
   std::condition_variable wake;
   std::array<Cell, 4> cells;
@@ -61,12 +62,14 @@ struct ProtectedRuntimeOwner::State {
   std::weak_ptr<const TransferHandle> transfer;
   // Fixed candidate rollback obligation, never inferred from a missing status.
   std::optional<streaming::ConsumerDrainTicket> failed_media;
-  explicit State(std::shared_ptr<ConsumerComposition> c) : composition(std::move(c)) {}
+  State(std::shared_ptr<ConsumerComposition> c, std::shared_ptr<const RuntimeInspectionProbe> p)
+      : composition(std::move(c)), probe(std::move(p)) {}
 };
-ProtectedRuntimeOwner::ProtectedRuntimeOwner(std::shared_ptr<ConsumerComposition> c) {
+ProtectedRuntimeOwner::ProtectedRuntimeOwner(std::shared_ptr<ConsumerComposition> c,
+                                             std::shared_ptr<const RuntimeInspectionProbe> probe) {
   if (!c)
     throw std::invalid_argument("Protected owner requires shared consumer composition");
-  state_ = std::make_unique<State>(std::move(c));
+  state_ = std::make_unique<State>(std::move(c), std::move(probe));
 }
 bool ProtectedRuntimeOwner::start(RuntimeBootstrap bootstrap, control::SeatThreadFactory start_thread) {
   if (attempted_ || state_->stop)
@@ -163,6 +166,8 @@ RuntimeSubmitResult ProtectedRuntimeOwner::submit(std::unique_ptr<RuntimeJob> jo
     s.order[s.queued++] = unsigned(cell.receipt->identity.id()); // fixed FIFO, no growing history
   }
   s.wake.notify_one();
+  if (s.probe)
+    s.probe->after_submit_publish();
   return {RuntimeSubmission::Accepted, std::move(receipt)};
 }
 void ProtectedRuntimeOwner::run() {
@@ -302,6 +307,8 @@ RuntimeOwnerStatus ProtectedRuntimeOwner::status() const {
       occupied += c.occupied;
     result = {s.started, s.stop, s.unknown, joined_, occupied, s.bytes};
   }
+  if (s.probe)
+    s.probe->after_status_inspection();
   result.unknown = result.unknown || authority_unknown ||
                    (observed && observed->status() == TransferStatus::Quarantined);
   return result;

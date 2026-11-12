@@ -457,3 +457,21 @@ Earlier reports/raw artifacts are immutable. No protected runtime construction/e
 no actual media descriptor-to-Gst adapter, no Loop cancellation/TLS/ANNOUNCE/selection integration,
 no bounded DeviceExecutor/readiness/singleton/reconciliation/physical proof is claimed. WoW requires
 new explicit permission; current game/prefix untouched; future local-game tests are a separate gate.
+
+## 11. F16 correction design checkpoint
+
+Internal submit/status must never weak.lock a TransferHandle just to inspect state: this creates
+an untracked validator owner beyond real Handoff replacement retirement. Add a typed diagnostic
+observation on InputHandoff under its existing Seat gate: only TransferToken (payload-free allocation
+identity) and TransferStatus, or absent. No TransferHandle/validator/facts/Work/Runtime/IO/clock capture.
+Read this observation BEFORE queue lock; observation is historical, never grant/admission authority.
+Actual request/admit gates remain unchanged. transfer() deliberately returns an external caller-owned
+handle; media/internal execution strong references remain protected by occupied phase cells.
+
+Deterministic regression seam: optional immutable RuntimeInspectionProbe retained once by owner State
+before start (default absent), never copied per call. Its noexcept test callbacks run after queue
+publication/status inspection and outside all locks. State releases this test owner only on lifecycle
+teardown after worker join, outside locks; no per-call hook capture cleanup. Probe must not back-reference
+owner strongly and tests keep synchronization owners alive through all joined calls. Production never
+installs it. The seam schedules actual H1 sole-validator retirement versus H2 request; it is not itself
+completion evidence. RED preserves the old strong-observation decisions; GREEN changes only observation.

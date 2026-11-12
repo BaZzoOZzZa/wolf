@@ -100,6 +100,13 @@ struct RuntimeBootstrap {
   control::SeatValidation validate;
   std::function<InputHandoff::Clock::time_point()> now = [] { return InputHandoff::Clock::now(); };
 };
+// Internal deterministic scheduling only. Retained once until lifecycle teardown;
+// no per-call ownership/capture release, no strong owner back-reference.
+struct RuntimeInspectionProbe {
+  virtual ~RuntimeInspectionProbe() = default;
+  virtual void after_submit_publish() const noexcept {}
+  virtual void after_status_inspection() const noexcept {}
+};
 class ProtectedRuntimeOwner {
   struct State;
   std::unique_ptr<State> state_;
@@ -110,7 +117,8 @@ class ProtectedRuntimeOwner {
   void run();
 
 public:
-  explicit ProtectedRuntimeOwner(std::shared_ptr<ConsumerComposition>);
+  explicit ProtectedRuntimeOwner(std::shared_ptr<ConsumerComposition>,
+                                 std::shared_ptr<const RuntimeInspectionProbe> = {});
   ~ProtectedRuntimeOwner(); // lifecycle only, never worker/ingress; may wait indefinitely
   ProtectedRuntimeOwner(const ProtectedRuntimeOwner &) = delete;
   // Lifecycle-only start once, no fallback legacy factory. Factory must not escape on throw.
