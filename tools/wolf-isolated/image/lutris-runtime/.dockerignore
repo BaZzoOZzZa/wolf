@@ -1,0 +1,6 @@
+*
+!Dockerfile
+!runtime-software.tar
+!runtime-manifest.json
+!verify.py
+!.dockerignore

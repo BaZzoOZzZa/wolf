@@ -79,3 +79,42 @@ lease и provisioning. Эта ветка основана на native `0e3710b`:
    Дополнительно обязательны native compositor/interpipe/GStreamer ABI,
    private Pulse path/auth, Wine ELF closure, GPU/device ACL и crossover,
    migration/auth и root-helper proofs. Сборка образа ничего из этого не заменяет.
+# Existing Lutris DLL runtime overlay
+
+The prefix's DXVK/VKD3D/compiler DLL links can point at versioned software paths
+under `/home/bazzoozza/.local/share/lutris/runtime`. The Wine runner archive does
+not supply these separate Lutris runtimes. The recipe in
+`tools/wolf-isolated/image/lutris-runtime/` adds only `dxvk/v2.6.2`,
+`vkd3d/v2.14`, and `d3d_extras/v2` at their original absolute guest paths.
+It does not modify a prefix, copy game data, mount HOME, or execute Wine.
+
+`bundle.py --context <fresh-approved-Games-context>` inventories every source
+file before copying, rejects escaping symlinks and external hardlinks, and emits
+a deterministic root-owned archive plus the exact source/content manifest.
+Source files remain untouched. Image directories are normalized to 0555 and
+regular files to 0444 (0555 for source executables). Internal symlink aliases
+remain links; their targets must stay inside the same versioned software tree.
+`verify.py` runs inside the build as inherited UID2001 and checks the complete
+path set, hashes, ownership, modes, traversal, and readability. It has no Wine,
+game, prefix, device, compositor, or service operations.
+
+The parent is the existing **local** image ID
+`sha256:84719e0af05e1ee4720e1d6605aed0bf9c3d55d7ebf24e159aee355580632505`.
+The Dockerfile uses its existing local tag `mwow9-candidate:latest`, not an
+invented registry manifest pin. A build owner must verify that tag's exact ID
+before and after the build, use the default Docker driver with `--pull=false`
+and `--network=none`, and require the derived image's initial layers to equal
+the parent's complete layer list. Keep the old tag/image; tag the derived image
+separately and deploy only its resulting immutable ID. Record source revision,
+parent ID/source/context, software manifest/archive hashes, and derived context
+hash as image labels and in the build packet. No downloads or global installs.
+
+Deployment is a separate Root operation: update the configured guest image,
+profile image, and image-contract image/image_id; recompute the config, profile,
+and image-contract hashes in runtime.json. Rebind prefix-contract's profile hash
+to the actual new profile without inventing a new clean-stop/migration receipt;
+recompute runtime.json's prefix-contract hash. Preserve prefix identities,
+capabilities, Wine/entrypoint hashes, touch/input, and silent audio provenance.
+Archive/retire the exact old guest and epoch only after positive exit evidence;
+do not bypass the one-CID-per-epoch guard or rename arbitrary containers.
+The image's content checks do not prove a successful D3D11/BNet/WoW launch.
