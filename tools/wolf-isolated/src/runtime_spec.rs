@@ -111,6 +111,8 @@ pub trait Source {
     fn private_dir(&mut self, path: &str, uid: u32) -> Result<(u64, u64), String>;
     fn socket(&mut self, path: &str, uid: Option<u32>) -> Result<(), String>;
     fn device(&mut self, path: &str, gid: u32) -> Result<(), String>;
+    /// Shared GPU only: production provider validates root-pinned path/rdev and service access.
+    fn shared_render(&mut self, path: &str, gid: u32) -> Result<(), String> { self.device(path, gid) }
     fn uid(&self) -> u32;
     /// Exact /dev/uinput DAC/ACL check for the shared-existing UID2001 service, without opening it.
     fn uinput_rw_access(&mut self) -> Result<(), String> { Err(fail()) }
@@ -211,13 +213,27 @@ pub fn prepare<S: Source>(
     profile_path: &str,
     spec_path: &str,
 ) -> Result<Prepared, String> {
+    let mut stage = "profile-file";
+    prepare_inner(s, profile_path, spec_path, &mut stage).map_err(|error| {
+        let errno = error.split("errno=").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse::<i32>().ok());
+        match errno {
+            Some(n) => format!("prelaunch stage={stage} errno={n}"),
+            None => format!("prelaunch stage={stage}"),
+        }
+    })
+}
+fn prepare_inner<S: Source>(s: &mut S, profile_path: &str, spec_path: &str, stage: &mut &'static str) -> Result<Prepared, String> {
     let pb = root(s, profile_path, crate::MAX_PROFILE)?;
+    *stage = "profile-parse";
     let p: Profile = crate::parse(&pb)?;
+    *stage = "profile-policy";
     if !validate(&p).is_empty() {
         return Err(fail());
     }
+    *stage = "runtime-spec-file";
     let sb = root(s, spec_path, 32768)?;
     let spec: Spec = serde_json::from_slice(&sb).map_err(|_| fail())?;
+    *stage = "runtime-spec-binding";
     if spec.schema != 1
         || spec.native_revision != E1
         || spec.profile_sha256 != digest(&pb)
@@ -227,6 +243,7 @@ pub fn prepare<S: Source>(
         return Err(fail());
     }
     for a in &p.artifacts {
+        *stage = match a.role.as_str() { "wolf"=>"artifact-wolf", "gamescope"=>"artifact-gamescope", "wine"=>"artifact-wine", "entrypoint"=>"artifact-entrypoint", "compositor"=>"artifact-compositor", "interpipe"=>"artifact-interpipe", _=>"artifact-unknown" };
         pinned(
             s,
             &FilePin {
@@ -236,10 +253,13 @@ pub fn prepare<S: Source>(
             256 * 1024 * 1024,
         )?;
     }
+    *stage = "image-contract-file";
     let image: ImageContract =
         serde_json::from_slice(&pinned(s, &spec.image_contract, 32768)?).map_err(|_| fail())?;
+    *stage = "prefix-contract-file";
     let prefix: PrefixContract =
         serde_json::from_slice(&pinned(s, &spec.prefix_contract, 32768)?).map_err(|_| fail())?;
+    *stage = "image-contract-binding";
     if (p.image_kind == crate::ImageKind::LocalImageId && p.image != image.image_id)
         || image.image != p.image
         || image.native_revision != E1
@@ -260,12 +280,14 @@ pub fn prepare<S: Source>(
     {
         return Err(fail());
     }
+    *stage = "input-rule";
     if image.input_rule.path != "/etc/udev/rules.d/72-wolf-wow.rules"
         || pinned(s, &image.input_rule, 16384)?
             != include_bytes!("../provisioning/72-wolf-wow.rules.in")
     {
         return Err(fail());
     }
+    *stage = "remote-account";
     let users = root(s, "/etc/passwd", 256 * 1024)?;
     let users = std::str::from_utf8(&users).map_err(|_| fail())?;
     let remote = users
@@ -278,6 +300,7 @@ pub fn prepare<S: Source>(
     if remote.len() != 1 {
         return Err(fail());
     }
+    *stage = "remote-groups-uinput";
     let groups = root(s, "/etc/group", 256 * 1024)?;
     let groups = std::str::from_utf8(&groups).map_err(|_| fail())?;
     let mut required = vec![p.render_gid];
@@ -322,6 +345,7 @@ pub fn prepare<S: Source>(
     if required.iter().any(|g| !effective.contains(g)) {
         return Err(fail());
     }
+    *stage = "private-state-directories";
     let state = format!("{}/state", p.remote_home);
     let lease = format!("{}/launcher", p.remote_home);
     for dir in [
@@ -334,13 +358,17 @@ pub fn prepare<S: Source>(
     ] {
         s.private_dir(dir, p.remote_uid)?;
     }
+    *stage = "private-prefix-directory";
     let working = s.private_dir(&p.prefix.working, p.remote_uid)?;
+    *stage = "prefix-source-gpu-vendor";
     if s.directory_identity(&p.prefix.source)? != (p.prefix.source_dev, p.prefix.source_ino)
         || s.gpu_vendor(&p.render_node)? != image.gpu_vendor
     {
         return Err(fail());
     }
+    *stage = "game-source";
     s.directory_identity(&p.game_data)?;
+    *stage = "prefix-boot-processes";
     if prefix.boot_id != s.boot_id()? || prefix.original_processes.len() > 4 {
         return Err(fail());
     }
@@ -349,6 +377,7 @@ pub fn prepare<S: Source>(
             return Err(fail());
         }
     }
+    *stage = "prefix-contract-binding";
     if prefix.profile_sha256 != digest(&pb)
         || prefix.source_dev != p.prefix.source_dev
         || prefix.source_ino != p.prefix.source_ino
@@ -360,6 +389,7 @@ pub fn prepare<S: Source>(
     {
         return Err(fail());
     }
+    *stage = "shared-root-observation";
     let shared_boundary = if p.prefix.mode == crate::PrefixMode::SharedExistingExclusive {
         let pin = prefix.shared_clean_stop.clone().ok_or_else(fail)?;
         let receipt: SharedCleanStopReceipt =
@@ -396,13 +426,20 @@ pub fn prepare<S: Source>(
     } else {
         None
     };
+    *stage = "private-pulse-socket";
     s.socket(&format!("{}/pulse-socket", p.runtime), Some(p.remote_uid))?;
+    *stage = "docker-socket";
     s.socket(&spec.docker_socket, None)?;
-    s.device(&p.render_node, p.render_gid)?;
+    *stage = "render-device";
+    if p.prefix.mode == crate::PrefixMode::SharedExistingExclusive {
+        s.shared_render(&p.render_node, p.render_gid)?;
+    } else { s.device(&p.render_node, p.render_gid)?; }
+    *stage = "fake-udev";
     if spec.fake_udev.path != format!("{state}/fake-udev") {
         return Err(fail());
     }
     pinned(s, &spec.fake_udev, 16 * 1024 * 1024)?;
+    *stage = "server-key";
     let key_record = s.root_file(&spec.private_key, 32768)?;
     if key_record.uid != 0
         || key_record.mode & 0o027 != 0
@@ -411,12 +448,15 @@ pub fn prepare<S: Source>(
     {
         return Err(fail());
     }
+    *stage = "server-certificate";
     root(s, &spec.certificate, 32768)?;
+    *stage = "config-file";
     let config_bytes = pinned(s, &spec.config, 256 * 1024)?;
     let config: toml::Value = std::str::from_utf8(&config_bytes)
         .map_err(|_| fail())?
         .parse()
         .map_err(|_| fail())?;
+    *stage = "config-policy";
     validate_config(&p, &config, &image)?;
     // Host plugins are fixed independent root-provisioned files, not guest path assertions.
     let plugins = p
@@ -432,10 +472,12 @@ pub fn prepare<S: Source>(
         })
         .collect::<Vec<_>>()
         .join(":");
+    *stage = "gpu-topology";
     let gpu = s.gpu_nodes(&p.render_node)?;
     if gpu.len() != 2 || !gpu.contains(&p.render_node) {
         return Err(fail());
     }
+    *stage = "device-majors";
     let proc = root(s, "/proc/devices", 65536)?;
     let proc = std::str::from_utf8(&proc).map_err(|_| fail())?;
     let mut input = None;

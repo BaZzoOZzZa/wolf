@@ -83,6 +83,19 @@ impl Source for NativeSource {
         }
         Ok(())
     }
+    fn shared_render(&mut self, path: &str, gid: u32) -> Result<(), String> {
+        let m = crate::metadata(path)?;
+        if path != "/dev/dri/renderD128" || gid != 989 || unsafe { geteuid() } != 2001
+            || !m.file_type().is_char_device() || m.uid() != 0 || m.gid() != gid
+            || m.rdev() != ((226_u64 << 8) | 128)
+            || !matches!(m.mode() & 0o7777, 0o660 | 0o666) {
+            return Err(err());
+        }
+        if unsafe { faccessat(-100, c"/dev/dri/renderD128".as_ptr(), 6, 0x200) } != 0 {
+            return Err(format!("errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)));
+        }
+        Ok(())
+    }
     fn uinput_rw_access(&mut self) -> Result<(), String> {
         let m = crate::metadata("/dev/uinput")?;
         if unsafe { geteuid() } != 2001 || !m.file_type().is_char_device()

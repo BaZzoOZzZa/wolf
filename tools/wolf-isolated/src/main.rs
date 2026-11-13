@@ -13,8 +13,13 @@ fn main() -> ExitCode {
                     ExitCode::SUCCESS
                 }
             }
-            Err(_) => {
-                eprintln!("runtime not provisioned, busy or ownership unknown; no new grant");
+            Err(error) => {
+                if error.starts_with("prelaunch stage=") && error.len() <= 160
+                    && error.bytes().all(|c| c.is_ascii_alphanumeric() || b" =-_".contains(&c)) {
+                    eprintln!("{error}");
+                } else {
+                    eprintln!("runtime not provisioned, busy or ownership unknown; no new grant");
+                }
                 ExitCode::from(3)
             }
         };
