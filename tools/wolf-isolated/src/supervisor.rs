@@ -474,6 +474,8 @@ impl Io for NativeIo {
             .env("WOLF_USE_ZERO_COPY", "FALSE")
             .env("WOLF_LOG_LEVEL", "INFO")
             .env("PULSE_SERVER", format!("{}/pulse-socket", p.runtime))
+            .env("PULSE_CLIENTCONFIG", format!("{}/mwow-audio/configs/pulse-client.conf", p.runtime))
+            .env("PULSE_COOKIE", format!("{}/mwow-audio/private-cookie", p.runtime))
             .env("GST_PLUGIN_PATH", &p.plugins)
             .spawn()
             .map_err(|_| SpawnError::NoChild)?;
