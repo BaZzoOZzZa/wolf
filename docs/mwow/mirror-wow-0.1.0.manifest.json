@@ -43,6 +43,6 @@
     "Battle.net updater observed CascLocked while WoW open; SSL libraries and CA are present; no established SSL root cause.",
     "Silent mode only; no real audio capture PASS.",
     "No other-machine qualification or production-grade claim.",
-    "After MVP acceptance, user reported Steam Deck LT/RT not working and no DualShock input; connection topology and cause unverified, separate investigation pending. No full controller PASS."
+    "After MVP acceptance, user reported Steam Deck LT/RT not working and no DualShock input; both connect by Bluetooth to iPad and are tested separately; cause unverified, separate investigation pending. No full controller PASS."
   ]
 }

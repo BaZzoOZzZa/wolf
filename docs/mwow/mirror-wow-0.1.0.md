@@ -64,7 +64,8 @@ are not release source or public artifacts. Do not commit them.
 ## Qualification and limitations
 
 - After MVP acceptance, the user reported that Steam Deck LT/RT do not work and
-  DualShock provides no input. Connection topology and cause remain unverified;
+  DualShock provides no input. Both controllers were reported connected to the iPad by Bluetooth and
+  tested one at a time with the other disconnected. The cause remains unverified;
   investigation is separate from this preserved release baseline. Full
   controller compatibility has not passed.
 - Battle.net updater reported `CascLocked` while WoW was open. SSL libraries and
