@@ -33,7 +33,8 @@
     "physical_acceptance": "user accepted image and touch on iPad on current host",
     "real_audio_capture_pass": false,
     "other_machine_qualification": false,
-    "production_security_performance_gates": "not fully qualified"
+    "production_security_performance_gates": "not fully qualified",
+    "full_controller_compatibility_pass": false
   },
   "limitations": [
     "Reconnect after closing/resuming Moonlight can collide with retained Docker name; controller single-CID epoch becomes Unknown; guarded operator archive and fresh epoch required.",
@@ -41,6 +42,7 @@
     "Direct launch does not transfer the Battle.net authentication ticket; manual game authentication or normal Battle.net route required.",
     "Battle.net updater observed CascLocked while WoW open; SSL libraries and CA are present; no established SSL root cause.",
     "Silent mode only; no real audio capture PASS.",
-    "No other-machine qualification or production-grade claim."
+    "No other-machine qualification or production-grade claim.",
+    "After MVP acceptance, user reported Steam Deck LT/RT not working and no DualShock input; connection topology and cause unverified, separate investigation pending. No full controller PASS."
   ]
 }

@@ -63,6 +63,10 @@ are not release source or public artifacts. Do not commit them.
 
 ## Qualification and limitations
 
+- After MVP acceptance, the user reported that Steam Deck LT/RT do not work and
+  DualShock provides no input. Connection topology and cause remain unverified;
+  investigation is separate from this preserved release baseline. Full
+  controller compatibility has not passed.
 - Battle.net updater reported `CascLocked` while WoW was open. SSL libraries and
   CA data were present; an SSL root cause has not been established.
 - Silent mode is the only supported MVP audio mode. There is no real audio
