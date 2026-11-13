@@ -131,6 +131,7 @@ pub struct Prepared {
     pub(crate) uid: u32,
     pub(crate) image_id: String,
     pub(crate) image_ref: String,
+    pub(crate) image_kind: crate::ImageKind,
     pub(crate) inspection: crate::inspection::Policy,
 }
 impl Prepared {
@@ -471,6 +472,7 @@ pub fn prepare<S: Source>(
         uid: p.remote_uid,
         image_id: image.image_id,
         image_ref: p.image,
+        image_kind: p.image_kind,
         spec,
         config,
         inspection,
@@ -540,8 +542,15 @@ pub fn validate_config(p: &Profile, c: &toml::Value, i: &ImageContract) -> Resul
             "legacy_pad_only_trial",
             "legacy_direct_touch_trial",
             "legacy_keyboard_mouse_trial",
+            "video",
         ],
     )?;
+    if let Some(video) = app.get("video") {
+        only(video, &["video_params"])?;
+        if text(video, "video_params")? != "videoconvert ! videoscale ! video/x-raw,format=I420,width={width},height={height},framerate={fps}/1" {
+            return Err(fail());
+        }
+    }
     if text(app, "title")? != "WoW"
         || app
             .get("start_virtual_compositor")

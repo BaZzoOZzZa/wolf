@@ -663,9 +663,10 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
     )
     .map_err(|_| err())?;
     if image["Id"] != p.image_id
-        || !image["RepoDigests"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|d| d.as_str() == Some(p.image_ref.as_str())))
+        || (p.image_kind == crate::ImageKind::RegistryDigest
+            && !image["RepoDigests"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|d| d.as_str() == Some(p.image_ref.as_str()))))
         || image["Config"]["Entrypoint"] != json!(["/opt/wolf/approved-entrypoint"])
     {
         return Err(err());
