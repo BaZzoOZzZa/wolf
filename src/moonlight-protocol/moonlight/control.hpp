@@ -1,15 +1,23 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <boost/endian/conversion.hpp>
-#include <core/input.hpp>
+#include <cmath>
 #include <crypto/crypto.hpp>
 #include <cstdint>
-#include <helpers/utils.hpp>
+#include <cstring>
+#include <inputtino/input.hpp>
 #include <memory>
+#include <moonlight/control_crypto.hpp>
+#include <stdexcept>
+#include <string_view>
+#include <type_traits>
 
 namespace moonlight::control {
 
 namespace pkts {
+
+using netfloat = uint8_t[4]; // little-endian IEEE-754 bytes on the wire
 
 enum PACKET_TYPE : std::uint16_t {
   START_A = boost::endian::little_to_native(0x0305),
@@ -212,11 +220,11 @@ struct TOUCH_PACKET : INPUT_PKT {
   uint8_t zero[1]; // Alignment/reserved
   uint16_t rotation;
   uint32_t pointer_id;
-  utils::netfloat x;
-  utils::netfloat y;
-  utils::netfloat pressure_or_distance;
-  utils::netfloat contact_area_major;
-  utils::netfloat contact_area_minor;
+  netfloat x;
+  netfloat y;
+  netfloat pressure_or_distance;
+  netfloat contact_area_major;
+  netfloat contact_area_minor;
 };
 
 enum TOOL_TYPE : uint8_t {
@@ -239,14 +247,14 @@ struct PEN_PACKET : INPUT_PKT {
   TOOL_TYPE tool_type;
   uint8_t pen_buttons;
   uint8_t zero[1]; // Alignment/reserved
-  utils::netfloat x;
-  utils::netfloat y;
-  utils::netfloat pressure_or_distance;
+  netfloat x;
+  netfloat y;
+  netfloat pressure_or_distance;
   uint16_t rotation;
   uint8_t tilt;
   uint8_t zero2[1];
-  utils::netfloat contact_area_major;
-  utils::netfloat contact_area_minor;
+  netfloat contact_area_major;
+  netfloat contact_area_minor;
 };
 
 struct CONTROLLER_ARRIVAL_PACKET : INPUT_PKT {
@@ -261,9 +269,9 @@ struct CONTROLLER_TOUCH_PACKET : INPUT_PKT {
   TOUCH_EVENT_TYPE event_type;
   uint8_t zero[2]; // Alignment/reserved
   uint32_t pointer_id;
-  utils::netfloat x;
-  utils::netfloat y;
-  utils::netfloat pressure;
+  netfloat x;
+  netfloat y;
+  netfloat pressure;
 };
 
 enum MOTION_TYPE : uint8_t {
@@ -288,9 +296,9 @@ struct CONTROLLER_MOTION_PACKET : INPUT_PKT {
   uint8_t controller_number;
   MOTION_TYPE motion_type;
   uint8_t zero[2]; // Alignment/reserved
-  utils::netfloat x;
-  utils::netfloat y;
-  utils::netfloat z;
+  netfloat x;
+  netfloat y;
+  netfloat z;
 };
 
 struct CONTROLLER_BATTERY_PACKET : INPUT_PKT {
@@ -308,6 +316,8 @@ static constexpr int GCM_TAG_SIZE = 16;
 static constexpr int MAX_PAYLOAD_SIZE = 128;
 static constexpr std::uint32_t TERMINATE_REASON_GRACEFULL = boost::endian::native_to_big(0x80030023);
 
+// Control replies are wire objects too: never transmit native tail padding.
+#pragma pack(push, 1)
 struct ControlPacket {
   pkts::PACKET_TYPE type;
   std::uint16_t length; // The length of the REST of the packet, EXCLUDING size of type and length
@@ -381,6 +391,8 @@ struct ControlEncryptedPacket {
    */
   [[nodiscard]] std::string_view encrypted_msg() const {
     auto len = boost::endian::little_to_native(this->header.length);
+    if (len < GCM_TAG_SIZE + sizeof(seq) || len > GCM_TAG_SIZE + sizeof(seq) + sizeof(payload))
+      throw std::runtime_error("Invalid encrypted payload length");
     return {payload, static_cast<size_t>(len - GCM_TAG_SIZE - sizeof(seq))};
   }
 
@@ -389,33 +401,173 @@ struct ControlEncryptedPacket {
   }
 };
 
-/**
- * Given a received packet will decrypt the payload inside it.
- * This includes checking that the AES GCM TAG is valid and not tampered
- */
-static std::string decrypt_packet(const ControlEncryptedPacket &packet_data, std::string_view gcm_key) {
-  std::array<std::uint8_t, GCM_TAG_SIZE> iv_data = {0};
-  iv_data[0] = boost::endian::little_to_native(packet_data.seq);
+#pragma pack(pop)
 
-  return crypto::aes_decrypt_gcm(packet_data.encrypted_msg(),
-                                 crypto::hex_to_str(gcm_key.data(), true),
-                                 packet_data.gcm_tag,
-                                 {(char *)iv_data.data(), iv_data.size()},
-                                 GCM_TAG_SIZE);
+// Read wire objects by value. Network buffers need not be aligned and do not
+// contain live instances of the C++ derived input structs.
+template <typename T> T read_packet(std::string_view bytes) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  if (bytes.size() < sizeof(T))
+    throw std::runtime_error("Truncated control packet");
+  T packet{};
+  std::memcpy(&packet, bytes.data(), sizeof(T));
+  return packet;
+}
+
+inline bool valid_control_packet(std::string_view bytes) {
+  return bytes.size() >= sizeof(ControlPacket) &&
+         boost::endian::little_to_native(read_packet<ControlPacket>(bytes).length) ==
+             bytes.size() - sizeof(ControlPacket);
+}
+
+// The protocol mask has 16 bits. Bound every input path (also Unix API)
+// before indexing or shifting; a product-specific one-pad policy belongs above this layer.
+inline constexpr unsigned int CONTROL_SLOT_COUNT = 16;
+
+// Typed entry points use the same field checks as the wire validator. Decode
+// before arithmetic; clamp finite normalized values at the device boundary.
+inline float input_float(const pkts::netfloat &value) {
+  return boost::endian::endian_load<float, sizeof(float), boost::endian::order::little>(value);
+}
+
+inline bool valid_input_fields(const pkts::TOUCH_PACKET &pkt) {
+  return pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL && std::isfinite(input_float(pkt.x)) &&
+         std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.pressure_or_distance)) &&
+         std::isfinite(input_float(pkt.contact_area_major)) && std::isfinite(input_float(pkt.contact_area_minor));
+}
+
+inline bool valid_input_fields(const pkts::PEN_PACKET &pkt) {
+  return pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL && pkt.tool_type <= pkts::TOOL_TYPE_ERASER &&
+         std::isfinite(input_float(pkt.x)) && std::isfinite(input_float(pkt.y)) &&
+         std::isfinite(input_float(pkt.pressure_or_distance)) && std::isfinite(input_float(pkt.contact_area_major)) &&
+         std::isfinite(input_float(pkt.contact_area_minor));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_TOUCH_PACKET &pkt) {
+  // This implementation maps wire IDs directly to the two PS5 touchpad slots.
+  // Check the uint32 value BEFORE converting to inputtino's signed finger index.
+  // Screen-touch IDs have a different mapping and are not restricted here.
+  return pkt.controller_number < CONTROL_SLOT_COUNT && pkt.event_type <= pkts::TOUCH_EVENT_CANCEL_ALL &&
+         boost::endian::little_to_native(pkt.pointer_id) < 2 && std::isfinite(input_float(pkt.x)) &&
+         std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.pressure));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_MOTION_PACKET &pkt) {
+  return pkt.controller_number < CONTROL_SLOT_COUNT &&
+         (pkt.motion_type == pkts::ACCELERATION || pkt.motion_type == pkts::GYROSCOPE) &&
+         std::isfinite(input_float(pkt.x)) && std::isfinite(input_float(pkt.y)) && std::isfinite(input_float(pkt.z));
+}
+
+inline bool valid_input_fields(const pkts::CONTROLLER_BATTERY_PACKET &pkt) {
+  return pkt.controller_number < CONTROL_SLOT_COUNT && pkt.battery_state <= pkts::BATTERY_FULL &&
+         (pkt.battery_percentage <= 100 || pkt.battery_percentage == pkts::BATTERY_PERCENTAGE_UNKNOWN);
+}
+
+inline bool valid_input_packet(std::string_view bytes) {
+  using namespace pkts;
+  if (!valid_control_packet(bytes) || bytes.size() < sizeof(INPUT_PKT))
+    return false;
+  auto header = read_packet<INPUT_PKT>(bytes);
+  if (header.packet_type != INPUT_DATA || boost::endian::big_to_native(header.data_size) != bytes.size() - 8)
+    return false;
+
+  switch (header.type) {
+  case MOUSE_MOVE_REL:
+    return bytes.size() == sizeof(MOUSE_MOVE_REL_PACKET);
+  case MOUSE_MOVE_ABS:
+    return bytes.size() == sizeof(MOUSE_MOVE_ABS_PACKET) &&
+           boost::endian::big_to_native(read_packet<MOUSE_MOVE_ABS_PACKET>(bytes).width) > 0 &&
+           boost::endian::big_to_native(read_packet<MOUSE_MOVE_ABS_PACKET>(bytes).height) > 0;
+  case MOUSE_BUTTON_PRESS:
+  case MOUSE_BUTTON_RELEASE:
+    return bytes.size() == sizeof(MOUSE_BUTTON_PACKET);
+  case MOUSE_SCROLL:
+    return bytes.size() == sizeof(MOUSE_SCROLL_PACKET);
+  case MOUSE_HSCROLL:
+    return bytes.size() == sizeof(MOUSE_HSCROLL_PACKET);
+  case KEY_PRESS:
+  case KEY_RELEASE:
+    return bytes.size() == sizeof(KEYBOARD_PACKET);
+  case UTF8_TEXT:
+    return bytes.size() > sizeof(INPUT_PKT) && bytes.size() <= sizeof(UTF8_TEXT_PACKET);
+  case TOUCH:
+    return bytes.size() == sizeof(TOUCH_PACKET) && valid_input_fields(read_packet<TOUCH_PACKET>(bytes));
+  case PEN:
+    return bytes.size() == sizeof(PEN_PACKET) && valid_input_fields(read_packet<PEN_PACKET>(bytes));
+  case CONTROLLER_MULTI:
+    if (bytes.size() != sizeof(CONTROLLER_MULTI_PACKET))
+      return false;
+    return boost::endian::little_to_native(read_packet<CONTROLLER_MULTI_PACKET>(bytes).controller_number) >= 0 &&
+           boost::endian::little_to_native(read_packet<CONTROLLER_MULTI_PACKET>(bytes).controller_number) <
+               CONTROL_SLOT_COUNT;
+  case CONTROLLER_ARRIVAL:
+    return bytes.size() == sizeof(CONTROLLER_ARRIVAL_PACKET) &&
+           read_packet<CONTROLLER_ARRIVAL_PACKET>(bytes).controller_number < CONTROL_SLOT_COUNT;
+  case CONTROLLER_TOUCH:
+    return bytes.size() == sizeof(CONTROLLER_TOUCH_PACKET) &&
+           valid_input_fields(read_packet<CONTROLLER_TOUCH_PACKET>(bytes));
+  case CONTROLLER_MOTION:
+    return bytes.size() == sizeof(CONTROLLER_MOTION_PACKET) &&
+           valid_input_fields(read_packet<CONTROLLER_MOTION_PACKET>(bytes));
+  case CONTROLLER_BATTERY:
+    return bytes.size() == sizeof(CONTROLLER_BATTERY_PACKET) &&
+           valid_input_fields(read_packet<CONTROLLER_BATTERY_PACKET>(bytes));
+  case HAPTICS:
+    return bytes.size() == sizeof(HAPTICS_PACKET);
+  default:
+    return false;
+  }
+}
+
+/** A bounded legacy Moonlight envelope. The tag is binary, never a C string. */
+inline std::string decrypt_packet(std::string_view bytes,
+                                  std::string_view gcm_key,
+                                  EncryptionMode mode = EncryptionMode::legacy,
+                                  Direction direction = Direction::client) {
+  constexpr size_t prefix_size = sizeof(ControlPacket) + sizeof(std::uint32_t) + GCM_TAG_SIZE;
+  if (!valid_control_packet(bytes) || bytes.size() < prefix_size ||
+      read_packet<ControlPacket>(bytes).type != pkts::ENCRYPTED)
+    throw std::runtime_error("Invalid encrypted control envelope");
+
+  auto seq = read_packet<std::uint32_t>(bytes.substr(sizeof(ControlPacket)));
+  auto iv = control_iv(boost::endian::little_to_native(seq), mode, direction);
+  if (iv.empty())
+    throw std::runtime_error("Control encryption not negotiated");
+  auto key = crypto::hex_to_str(gcm_key, true);
+  if (key.size() != 16)
+    throw std::runtime_error("Invalid control key length");
+  return crypto::aes_decrypt_gcm(bytes.substr(prefix_size),
+                                 key,
+                                 bytes.substr(sizeof(ControlPacket) + sizeof(seq), GCM_TAG_SIZE),
+                                 iv,
+                                 static_cast<int>(iv.size()));
+}
+
+// Only for an owned, complete object (e.g. locally produced test vectors).
+inline std::string decrypt_packet(const ControlEncryptedPacket &packet, std::string_view key) {
+  if (packet.full_size() > sizeof(packet))
+    throw std::runtime_error("Oversized encrypted control packet");
+  return decrypt_packet({reinterpret_cast<const char *>(&packet), packet.full_size()}, key);
 }
 
 /**
  * Turns a payload into a properly formatted control encrypted packet
  */
-static std::unique_ptr<ControlEncryptedPacket>
-encrypt_packet(std::string_view gcm_key, std::uint32_t seq, std::string_view payload) {
-  std::array<std::uint8_t, GCM_TAG_SIZE> iv_data = {0};
-  iv_data[0] = boost::endian::native_to_little(seq);
+static std::unique_ptr<ControlEncryptedPacket> encrypt_packet(std::string_view gcm_key,
+                                                              std::uint32_t seq,
+                                                              std::string_view payload,
+                                                              EncryptionMode mode = EncryptionMode::legacy,
+                                                              Direction direction = Direction::client) {
+  if (payload.size() > MAX_PAYLOAD_SIZE)
+    throw std::runtime_error("Control payload exceeds packet capacity");
+  auto key = crypto::hex_to_str(gcm_key, true);
+  if (key.size() != 16)
+    throw std::runtime_error("Invalid control key length");
+  auto iv = control_iv(seq, mode, direction);
+  if (iv.empty())
+    throw std::runtime_error("Control encryption not negotiated");
 
-  auto [encrypted_str, gcm_tag] = crypto::aes_encrypt_gcm(payload,
-                                                          crypto::hex_to_str(gcm_key.data(), true),
-                                                          {(char *)iv_data.data(), iv_data.size()},
-                                                          GCM_TAG_SIZE);
+  auto [encrypted_str, gcm_tag] = crypto::aes_encrypt_gcm(payload, key, iv, static_cast<int>(iv.size()));
 
   std::uint16_t size = sizeof(seq) + GCM_TAG_SIZE + encrypted_str.length();
   ControlEncryptedPacket encrypted_pkt = {

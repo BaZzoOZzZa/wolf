@@ -6,9 +6,9 @@
 
 namespace wolf::core::sessions {
 
-void start_runner(std::shared_ptr<events::Runner> runner,
-                  std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
-                  immer::box<RunnerArgs> args) {
+RunnerOutcome start_runner(std::shared_ptr<events::Runner> runner,
+                           std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
+                           immer::box<RunnerArgs> args) {
   /* Setup devices paths */
   auto all_devices = immer::array_transient<std::string>();
 
@@ -72,19 +72,25 @@ void start_runner(std::shared_ptr<events::Runner> runner,
   mounted_paths.push_back({std::filesystem::path(args->app_host_state_folder) / "udev", "/run/udev/"});
 
   /* Finally run the app, this will stop here until over */
-  runner->run(args->session_id,
-              args->app_local_state_folder,
-              args->host->host_xdg_runtime_dir,
-              plugged_devices_queue,
-              all_devices.persistent(),
-              mounted_paths.persistent(),
-              full_env.persistent(),
-              render_node);
+  try {
+    runner->run(args->run_scope,
+                args->app_local_state_folder,
+                args->host->host_xdg_runtime_dir,
+                plugged_devices_queue,
+                all_devices.persistent(),
+                mounted_paths.persistent(),
+                full_env.persistent(),
+                render_node);
+  } catch (const docker::DockerOutcomeUnknown &e) {
+    logs::log(logs::error, "[RUNNER] {}; admission and media retained for reconciliation", e.what());
+    return {RunnerOutcome::State::unknown, e.identity};
+  }
 
-  if (args->audio_server && args->audio_sink) {
+  if (args->cleanup_audio_sink && args->audio_server && args->audio_sink) {
     logs::log(logs::debug, "[STREAM_SESSION] Remove virtual audio sink");
     audio::delete_virtual_sink(args->audio_server->server, args->audio_sink);
   }
+  return {};
 }
 
 } // namespace wolf::core::sessions

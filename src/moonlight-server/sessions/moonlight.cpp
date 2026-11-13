@@ -3,52 +3,39 @@
 #include <immer/map_transient.hpp>
 #include <immer/vector_transient.hpp>
 #include <sessions/common.hpp>
+#include <sessions/diagnostic_startup.hpp>
 #include <sessions/handlers.hpp>
 #include <state/sessions.hpp>
+#include <streaming/consumer_events.hpp>
 #include <streaming/streaming.hpp>
 
 namespace wolf::core::sessions {
 
-using session_devices = immer::map<std::string /* session_id */, std::shared_ptr<events::devices_atom_queue>>;
-
-/**
- * Will stop the execution until an event of type RTPPingType is triggered
- * and the signature is matching the input `sess`.
- * Returns the RTPPingType event
- */
-template <typename RTPPingType>
-immer::box<RTPPingType> wait_for_ping(std::shared_ptr<events::EventBusType> ev_bus, const auto &sess) {
-  auto ping_promise = std::make_shared<std::promise<RTPPingType>>();
-  auto ping_future = ping_promise->get_future();
-  auto resolved = std::make_shared<std::atomic_bool>(false);
-
-  auto handler = ev_bus->register_handler<immer::box<RTPPingType>>(
-      [sess, ping_promise, resolved](const immer::box<RTPPingType> &ping_ev) {
-        // Check if this ping is for our session
-        if (sess->rtp_secret_payload == ping_ev->payload || // Secret payload matching
-            (!ping_ev->payload.has_value() && ping_ev->client_ip == sess->client_ip &&
-             ping_ev->client_port == sess->port)) { // Legacy IP+port matching when no payload has been passed
-          bool expected = false;
-          if (resolved->compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            // Resolve the promise with the ping event data
-            ping_promise->set_value(*ping_ev);
-          }
-        }
-      });
-
-  // Wait for the promise to be fulfilled
-  auto ping_ev = ping_future.get();
-
-  // Unregister the handler since we only need it once
-  handler.unregister();
-
-  return ping_ev;
+bool consumer_legacy_current(const state::SessionsAtoms &running, const ConnectionScope &scope) {
+  return state::get_session_by_scope(running->load(), scope).has_value();
 }
+
+struct OwnedDeviceQueue {
+  RunScope scope;
+  std::shared_ptr<events::devices_atom_queue> queue;
+};
+using session_devices = immer::map<std::string, OwnedDeviceQueue>;
 
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server) {
+  auto composition = make_consumer_composition(app_state->running_sessions);
+  return setup_moonlight_handlers(app_state, runtime_dir, audio_server, consumer_runtime(composition));
+}
+
+immer::vector<immer::box<events::EventBusHandlers>>
+setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
+                         const std::string &runtime_dir,
+                         const std::optional<AudioServer> &audio_server,
+                         std::shared_ptr<streaming::ConsumerRuntime> consumers) {
+  if (!consumers)
+    throw std::invalid_argument("Moonlight handlers require the shared consumer runtime");
   immer::vector_transient<immer::box<events::EventBusHandlers>> handlers;
 
   /*
@@ -57,153 +44,190 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
    */
   auto plugged_devices_queue = std::make_shared<immer::atom<session_devices>>();
 
-  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-      [&app_state, plugged_devices_queue](const immer::box<events::StopStreamEvent> &ev) {
-        // Remove session from app state so that HTTP/S applist gets updated
-        // This should effectively destroy the virtual Wayland session since it holds the last reference
-        app_state->running_sessions->update([&ev](const immer::vector<events::StreamSession> &ses_v) {
-          return state::remove_session(ses_v, {.session_id = ev->session_id});
+  // A connection stop never destroys a persistent game/runner or its devices.
+  auto stop_connections = [app_state](const RunScope &run) {
+    auto snapshot = app_state->running_sessions->load();
+    for (const auto &session : *snapshot) {
+      if (session.run_scope.matches(run)) {
+        app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>{
+            events::StopStreamEvent{.session_id = session.session_id, .connection_scope = session.connection_scope}});
+      }
+    }
+  };
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::GameStopRequest>>(
+      [stop_connections](const immer::box<events::GameStopRequest> &ev) {
+        if (ev->run_scope.get() && ev->run_scope.get().id() == ev->session_id)
+          stop_connections(ev->run_scope.get());
+      }));
+  handlers.push_back(app_state->event_bus->register_handler<immer::box<events::RunEnded>>(
+      [app_state, plugged_devices_queue, stop_connections](const immer::box<events::RunEnded> &ev) {
+        const auto run = ev->run_scope.get();
+        if (!run || run.id() != ev->session_id)
+          return;
+        stop_connections(run);
+        app_state->running_sessions->update([run](const auto &all) {
+          return all | ranges::views::filter([&](const auto &s) { return !s.run_scope.matches(run); }) |
+                 ranges::to<immer::vector<events::StreamSession>>();
         });
-
-        plugged_devices_queue->update([=](const auto map) { return map.erase(std::to_string(ev->session_id)); });
+        plugged_devices_queue->update([run](const auto &map) {
+          auto entry = map.find(run.id());
+          return entry && entry->scope.matches(run) ? map.erase(run.id()) : map;
+        });
       }));
 
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::PlugDeviceEvent>>(
-      [plugged_devices_queue, lobbies = app_state->lobbies](const immer::box<events::PlugDeviceEvent> &hotplug_ev) {
-        logs::log(logs::debug, "{} received hot-plug device event", hotplug_ev->session_id);
-
-        // If we are currently in a lobby we don't want to plug the device to the original wolf-ui session
-        if (!state::get_lobby_by_connected_session(lobbies->load(), hotplug_ev->session_id)) {
-          if (auto session_devices_queue = plugged_devices_queue->load()->find(hotplug_ev->session_id)) {
-            session_devices_queue->get()->push(hotplug_ev);
-          } else {
-            logs::log(logs::warning, "Unable to find plugged_devices_queue for session {}", hotplug_ev->session_id);
-          }
-        } else {
-          // This event will be picked up by the lobbies handler
-          logs::log(logs::debug, "Session {} is in a lobby, ignoring hot-plug device event", hotplug_ev->session_id);
+      [plugged_devices_queue, app_state, lobbies = app_state->lobbies](
+          const immer::box<events::PlugDeviceEvent> &hotplug_ev) {
+        auto queues = plugged_devices_queue->load();
+        if (auto entry = queues->find(hotplug_ev->session_id)) {
+          diagnostic::queue_device(hotplug_ev,
+                                   app_state->running_sessions->load(),
+                                   lobbies->load(),
+                                   entry->scope,
+                                   entry->queue);
         }
       }));
 
   // Run process and our custom wayland as soon as a new StreamSession is created
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StreamSession>>(
       [=](const immer::box<events::StreamSession> &session) {
+        if (!session->run_scope ||
+            !state::get_session_by_scope(app_state->running_sessions->load(), session->connection_scope))
+          return;
         /* Initialise plugged device queue */
         auto devices_q = std::make_shared<events::devices_atom_queue>();
-        plugged_devices_queue->update(
-            [=](const session_devices map) { return map.set(std::to_string(session->session_id), devices_q); });
-
-        std::shared_ptr<boost::promise<streaming::WaylandDisplayReady>> on_ready =
-            std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
-
-        if (session->app->start_virtual_compositor) {
-          logs::log(logs::debug, "[STREAM_SESSION] Create wayland compositor");
-
-          // Start Gstreamer producer pipeline
-          std::thread([session, on_ready, gst_context = app_state->gst_context]() {
-            streaming::start_video_producer(std::to_string(session->session_id),
-                                            session->app->video_producer_buffer_caps,
-                                            session->app->render_node,
-                                            {.width = session->display_mode.width,
-                                             .height = session->display_mode.height,
-                                             .refreshRate = session->display_mode.refreshRate},
-                                            gst_context,
-                                            on_ready,
-                                            session->event_bus);
-          }).detach();
-        } else {
-          // Create virtual devices
-          auto mouse = input::Mouse::create();
-          if (!mouse) {
-            logs::log(logs::error, "Failed to create mouse: {}", mouse.getErrorMessage());
-          } else {
-            auto mouse_ptr = input::Mouse(std::move(*mouse));
-            devices_q->push(immer::box<events::PlugDeviceEvent>(
-                events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = mouse_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries()}));
-            session->mouse->emplace(std::move(mouse_ptr));
-          }
-
-          auto keyboard = input::Keyboard::create();
-          if (!keyboard) {
-            logs::log(logs::error, "Failed to create keyboard: {}", keyboard.getErrorMessage());
-          } else {
-            auto keyboard_ptr = input::Keyboard(std::move(*keyboard));
-            devices_q->push(immer::box<events::PlugDeviceEvent>(
-                events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
-                                        .udev_events = keyboard_ptr.get_udev_events(),
-                                        .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries()}));
-            session->keyboard->emplace(std::move(keyboard_ptr));
-          }
-          on_ready->set_value({});
-        }
-
-        /* Create audio virtual sink */
-        logs::log(logs::debug, "[STREAM_SESSION] Create virtual audio sink");
-        auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, session->session_id);
-        std::shared_ptr<audio::VSink> v_device;
-        if (session->app->start_audio_server && audio_server && audio_server->server) {
-          v_device = audio::create_virtual_sink(
-              audio_server->server,
-              audio::AudioDevice{.sink_name = pulse_sink_name,
-                                 .mode = state::get_audio_mode(session->audio_channel_count, true)});
-          session->audio_sink->store(v_device);
-
-          std::thread([session, audio_server = audio_server->server]() {
-            auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
-            streaming::start_audio_producer(std::to_string(session->session_id),
-                                            session->event_bus,
-                                            session->audio_channel_count,
-                                            sink_name,
-                                            audio::get_server_name(audio_server));
-          }).detach();
-        }
-
-        // TODO: timeout? What if the wayland display is never ready?
-        auto w_display_ready = on_ready->get_future().then([session, runtime_dir](auto fut) {
-          streaming::WaylandDisplayReady ready = fut.get();
-
-          auto wl_state = virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
-          // Set the wayland display
-          session->wayland_display->store(wl_state);
-
-          // Set virtual devices
-          session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
-          session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
-          session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
-
-          if (!wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name)) {
-            logs::log(logs::error,
-                      "[STREAM_SESSION] Wayland socket {} was not ready, aborting runner startup",
-                      ready.wayland_socket_name);
-            session->event_bus->fire_event(
-                immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session->session_id}));
-            return;
-          }
-
-          logs::log(logs::debug, "[STREAM_SESSION] Start runner");
-          session->event_bus->fire_event(immer::box<events::StartRunner>(
-              events::StartRunner{.stop_stream_when_over = true,
-                                  .runner = session->app->runner,
-                                  .stream_session = std::make_shared<events::StreamSession>(*session)}));
+        plugged_devices_queue->update([=](const session_devices map) {
+          return map.set(std::to_string(session->session_id), OwnedDeviceQueue{session->run_scope, devices_q});
         });
+
+        // The same production decision/continuation is exercised with injected IO in safe tests.
+        auto startup = diagnostic::start(
+            *session->app,
+            diagnostic::StartupOps{
+                .compositor =
+                    [session, gst_context = app_state->gst_context]() {
+                      auto on_ready = std::make_shared<boost::promise<streaming::WaylandDisplayReady>>();
+                      auto future = on_ready->get_future();
+                      // Start Gstreamer producer pipeline
+                      std::thread([session, on_ready, gst_context]() {
+                        streaming::start_video_producer(session->run_scope,
+                                                        session->app->video_producer_buffer_caps,
+                                                        session->app->render_node,
+                                                        {.width = session->display_mode.width,
+                                                         .height = session->display_mode.height,
+                                                         .refreshRate = session->display_mode.refreshRate},
+                                                        gst_context,
+                                                        on_ready,
+                                                        session->event_bus);
+                      }).detach();
+
+                      return future;
+                    },
+                .mouse =
+                    [session, devices_q] {
+                      auto mouse = input::Mouse::create();
+                      if (!mouse) {
+                        logs::log(logs::error, "Failed to create mouse: {}", mouse.getErrorMessage());
+                      } else {
+                        auto mouse_ptr = input::Mouse(std::move(*mouse));
+                        devices_q->push(immer::box<events::PlugDeviceEvent>(
+                            events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
+                                                    .udev_events = mouse_ptr.get_udev_events(),
+                                                    .udev_hw_db_entries = mouse_ptr.get_udev_hw_db_entries(),
+                                                    .run_scope = session->run_scope,
+                                                    .connection_scope = session->connection_scope}));
+                        session->mouse->emplace(std::move(mouse_ptr));
+                      }
+                    },
+                .keyboard =
+                    [session, devices_q] {
+                      auto keyboard = input::Keyboard::create();
+                      if (!keyboard) {
+                        logs::log(logs::error, "Failed to create keyboard: {}", keyboard.getErrorMessage());
+                      } else {
+                        auto keyboard_ptr = input::Keyboard(std::move(*keyboard));
+                        devices_q->push(immer::box<events::PlugDeviceEvent>(
+                            events::PlugDeviceEvent{.session_id = std::to_string(session->session_id),
+                                                    .udev_events = keyboard_ptr.get_udev_events(),
+                                                    .udev_hw_db_entries = keyboard_ptr.get_udev_hw_db_entries(),
+                                                    .run_scope = session->run_scope,
+                                                    .connection_scope = session->connection_scope}));
+                        session->keyboard->emplace(std::move(keyboard_ptr));
+                      }
+                    },
+                .audio =
+                    [session, audio_server] {
+                      /* Create audio virtual sink */
+                      logs::log(logs::debug, "[STREAM_SESSION] Create virtual audio sink");
+                      auto pulse_sink_name = fmt::format("{}{}", VIRTUAL_SINK_PREFIX, session->session_id);
+                      std::shared_ptr<audio::VSink> v_device;
+                      if (session->app->start_audio_server && audio_server && audio_server->server) {
+                        v_device = audio::create_virtual_sink(
+                            audio_server->server,
+                            audio::AudioDevice{.sink_name = pulse_sink_name,
+                                               .mode = state::get_audio_mode(session->audio_channel_count, true)});
+                        session->audio_sink->store(v_device);
+
+                        std::thread([session, audio_server = audio_server->server]() {
+                          auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, session->session_id);
+                          streaming::start_audio_producer(session->run_scope,
+                                                          session->event_bus,
+                                                          session->audio_channel_count,
+                                                          sink_name,
+                                                          audio::get_server_name(audio_server));
+                        }).detach();
+                      }
+                    },
+                .bind_wayland =
+                    [session](const streaming::WaylandDisplayReady &ready) {
+                      auto wl_state =
+                          virtual_display::create_wayland_display(ready.wayland_plugin, ready.wayland_socket_name);
+                      // Set the wayland display
+                      session->wayland_display->store(wl_state);
+
+                      // Set virtual devices
+                      session->mouse->emplace(virtual_display::WaylandMouse(wl_state));
+                      session->keyboard->emplace(virtual_display::WaylandKeyboard(wl_state));
+                      session->touch_screen->emplace(virtual_display::WaylandTouchScreen(wl_state));
+                    },
+                .wait_wayland =
+                    [runtime_dir](const streaming::WaylandDisplayReady &ready) {
+                      return wait_for_wayland_socket(runtime_dir, ready.wayland_socket_name);
+                    },
+                .runner =
+                    [session] {
+                      logs::log(logs::debug, "[STREAM_SESSION] Start runner");
+                      session->event_bus->fire_event(immer::box<events::StartRunner>(
+                          events::StartRunner{.stop_stream_when_over = true,
+                                              .runner = session->app->runner,
+                                              .stream_session = std::make_shared<events::StreamSession>(*session)}));
+                    },
+                .failed =
+                    [session] {
+                      session->event_bus->fire_event(immer::box<events::RunEnded>(
+                          events::RunEnded{.session_id = std::to_string(session->session_id),
+                                           .run_scope = session->run_scope}));
+                    }});
       }));
 
   /* Start runner */
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::StartRunner>>(
       [=](const immer::box<events::StartRunner> &run_session) {
+        if (!run_session->stream_session || !run_session->stream_session->run_scope)
+          return;
         auto session_id = std::to_string(run_session->stream_session->session_id);
-        auto devices_q = plugged_devices_queue->load()->find(session_id);
-        if (!devices_q) {
+        auto queues = plugged_devices_queue->load();
+        auto entry = queues->find(session_id);
+        if (!entry || !entry->scope.matches(run_session->stream_session->run_scope)) {
           logs::log(logs::warning, "No devices queue found for session {}", session_id);
           return;
         }
 
+        auto devices_q = entry->queue; // Own it across worker launch and map replacement.
         std::thread([=]() {
-          start_runner(
+          auto outcome = start_runner(
               run_session->runner,
-              *devices_q,
+              devices_q,
               immer::box<RunnerArgs>{RunnerArgs{
                   .session_id = session_id,
                   .video_settings =
@@ -222,55 +246,79 @@ setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                   .app_local_state_folder = run_session->stream_session->app_local_state_folder,
                   .app_host_state_folder = run_session->stream_session->app_host_state_folder,
                   .xdg_runtime_dir = runtime_dir,
-                  .client_settings = run_session->stream_session->client_settings}});
+                  .client_settings = run_session->stream_session->client_settings,
+                  .run_scope = run_session->stream_session->run_scope}});
 
+          if (outcome.state == RunnerOutcome::State::unknown) {
+            logs::log(logs::error, "[STREAM_SESSION] Runner {} is unknown; session retained", outcome.identity);
+            return;
+          }
           // Runner process ended
           if (run_session->stop_stream_when_over) {
             run_session->stream_session->wayland_display->store(nullptr);
 
-            app_state->event_bus->fire_event(immer::box<events::StopStreamEvent>(
-                events::StopStreamEvent{.session_id = run_session->stream_session->session_id}));
+            app_state->event_bus->fire_event(immer::box<events::RunEnded>(
+                events::RunEnded{.session_id = session_id, .run_scope = run_session->stream_session->run_scope}));
           }
         }).detach();
       }));
 
+  // The registry outlives all owned workers. Captures deliberately exclude
+  // AppState/EventBus from work functions to avoid a bus -> runtime -> bus cycle.
+  auto running = app_state->running_sessions;
+  auto lobbies = app_state->lobbies;
+  for (const auto &handler : streaming::consumer_event_handlers(app_state->event_bus, consumers))
+    handlers.push_back(handler);
+
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::VideoSession>>(
-      [ev_bus = app_state->event_bus,
-       gst_context = app_state->gst_context](const immer::box<events::VideoSession> &sess) {
-        // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, gst_context]() {
-          auto ping_ev = wait_for_ping<events::RTPVideoPingEvent>(ev_bus, sess);
-
-          // Start streaming
-          streaming::start_streaming_video(sess,
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           gst_context,
-                                           ping_ev->video_socket.get());
-        }).detach();
+      [consumers, running, lobbies, gst_context = app_state->gst_context](
+          const immer::box<events::VideoSession> &sess) {
+        if (!state::prepare_stream_consumer(*sess, running->load(), lobbies->load()))
+          return;
+        auto admission = streaming::admit_consumer(
+            *consumers,
+            *sess,
+            streaming::ConsumerKind::Video,
+            [running, lobbies, sess, gst_context](streaming::ConsumerJob &job, const streaming::ConsumerPing &ping) {
+              auto prepared = state::prepare_stream_consumer(*sess, running->load(), lobbies->load());
+              if (!prepared || job.cancelled())
+                return true;
+              return streaming::start_streaming_video(
+                  immer::box<events::VideoSession>{*prepared},
+                  job,
+                  ping.ip,
+                  ping.port,
+                  gst_context,
+                  std::static_pointer_cast<boost::asio::ip::udp::socket>(ping.socket));
+            });
+        if (admission != streaming::ConsumerAdmission::Accepted && admission != streaming::ConsumerAdmission::Duplicate)
+          logs::log(logs::warning, "[CONSUMER] Video admission denied: {}", static_cast<int>(admission));
       }));
-
   handlers.push_back(app_state->event_bus->register_handler<immer::box<events::AudioSession>>(
-      [ev_bus = app_state->event_bus, audio_server](const immer::box<events::AudioSession> &sess) {
-        // Start a thread that will wait for the RTP ping event
-        std::thread([sess, ev_bus, audio_server]() {
-          auto ping_ev = wait_for_ping<events::RTPAudioPingEvent>(ev_bus, sess);
-
-          // Start streaming
-          auto audio_server_name = audio_server ? audio::get_server_name(audio_server->server)
-                                                : std::optional<std::string>();
-          auto sink_name = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
-          auto server_name = audio_server_name ? audio_server_name.value() : "";
-
-          streaming::start_streaming_audio(sess,
-                                           ev_bus,
-                                           ping_ev->client_ip,
-                                           ping_ev->client_port,
-                                           ping_ev->audio_socket.get(),
-                                           sink_name,
-                                           server_name);
-        }).detach();
+      [consumers, running, lobbies, audio_server](const immer::box<events::AudioSession> &sess) {
+        if (!state::prepare_stream_consumer(*sess, running->load(), lobbies->load()))
+          return;
+        auto admission = streaming::admit_consumer(
+            *consumers,
+            *sess,
+            streaming::ConsumerKind::Audio,
+            [running, lobbies, sess, audio_server](streaming::ConsumerJob &job, const streaming::ConsumerPing &ping) {
+              auto prepared = state::prepare_stream_consumer(*sess, running->load(), lobbies->load());
+              if (!prepared || job.cancelled())
+                return true;
+              auto server = audio_server ? audio::get_server_name(audio_server->server) : std::optional<std::string>();
+              auto sink = fmt::format("{}{}.monitor", VIRTUAL_SINK_PREFIX, sess->session_id);
+              return streaming::start_streaming_audio(
+                  immer::box<events::AudioSession>{*prepared},
+                  job,
+                  ping.ip,
+                  ping.port,
+                  std::static_pointer_cast<boost::asio::ip::udp::socket>(ping.socket),
+                  sink,
+                  server.value_or(""));
+            });
+        if (admission != streaming::ConsumerAdmission::Accepted && admission != streaming::ConsumerAdmission::Duplicate)
+          logs::log(logs::warning, "[CONSUMER] Audio admission denied: {}", static_cast<int>(admission));
       }));
 
   return handlers.persistent();

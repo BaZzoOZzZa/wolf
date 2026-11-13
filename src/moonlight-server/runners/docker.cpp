@@ -1,3 +1,4 @@
+#include <atomic>
 #include <runners/docker.hpp>
 
 namespace wolf::core::docker {
@@ -31,7 +32,7 @@ static std::optional<std::string> get_device_major(std::string_view type) {
   return std::nullopt;
 }
 
-void RunDocker::run(std::string_view session_id,
+void RunDocker::run(const wolf::core::sessions::RunScope &run_scope,
                     std::string_view app_state_folder,
                     std::string_view host_xdg_runtime_dir,
                     std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
@@ -39,6 +40,9 @@ void RunDocker::run(std::string_view session_id,
                     const immer::array<std::pair<std::string, std::string>> &paths,
                     const immer::map<std::string, std::string> &env_variables,
                     std::string_view render_node) {
+  if (!run_scope)
+    return;
+  const auto session_id = run_scope.id();
 
   std::vector<std::string> full_env;
   full_env.insert(full_env.end(), this->container.env.begin(), this->container.env.end());
@@ -189,42 +193,50 @@ void RunDocker::run(std::string_view session_id,
                              .devices = devices,
                              .env = full_env};
 
-  if (auto docker_container = docker_api.create(new_container, final_json_opts)) {
+  auto stop_requested = std::make_shared<ContainerStopRequests>();
+  const std::string owned_session_id(session_id);
+  auto terminate_handler = this->ev_bus->register_handler<immer::box<events::GameStopRequest>>(
+      [owned_session_id, stop_requested, run_scope](const immer::box<events::GameStopRequest> &ev) {
+        if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
+          stop_requested->request();
+        }
+      });
+  auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<events::StopLobbyEvent>>(
+      [owned_session_id, stop_requested, run_scope](const immer::box<events::StopLobbyEvent> &ev) {
+        if (sessions::targets(run_scope, ev->run_scope.get(), ev->lobby_id)) {
+          stop_requested->request();
+        }
+      });
+
+  if (stop_requested->pending()) {
+    return;
+  }
+  auto creation = docker_api.create_with_outcome(new_container, final_json_opts, {}, false);
+  if (auto docker_container = creation.container) {
     auto container_id = docker_container->id;
-    docker_api.start_by_id(container_id);
+    const bool start_confirmed = docker_api.start_by_id(container_id);
+    if (!start_confirmed) {
+      // The daemon may have accepted start before the response was lost. Keep
+      // supervising this exact ID instead of releasing the lobby for a retry.
+      logs::log(logs::warning, "[DOCKER] Start outcome uncertain for {}, reconciling", container_id);
+    }
 
     logs::log(logs::info, "[DOCKER] Starting container: {}", docker_container->name);
     logs::log(logs::debug, "[DOCKER] Starting container: {}", *docker_container);
 
-    std::string inspected_hostname;
-    if (auto inspected = docker_api.get_by_id(container_id)) {
-      inspected_hostname = inspected->hostname;
-      this->ev_bus->fire_event(immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{
-          .container_id = container_id,
-          .hostname = inspected->hostname,
-          .session_id = std::string(session_id),
-      }});
-    } else {
-      logs::log(logs::warning, "[DOCKER] Unable to inspect container {} for hostname", container_id);
-    }
-
-    auto terminate_handler = this->ev_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, container_id, this](const immer::box<events::StopStreamEvent> &terminate_ev) {
-          if (std::to_string(terminate_ev->session_id) == session_id) {
-            docker_api.stop_by_id(container_id);
-          }
-        });
-
-    auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-        [session_id, container_id, this](const immer::box<events::StopLobbyEvent> &terminate_ev) {
-          if (terminate_ev->lobby_id == session_id) {
-            docker_api.stop_by_id(container_id);
-          }
-        });
+    const auto inspected_hostname = docker_container->hostname;
+    // Also emitted after a failed post-create inspect: ID ownership is known.
+    // Lobby cancellation can now reassert a stop that preceded runner setup.
+    this->ev_bus->fire_event(immer::box<events::DockerContainerCreated>{events::DockerContainerCreated{
+        .container_id = container_id,
+        .hostname = inspected_hostname,
+        .session_id = owned_session_id,
+        .run_scope = run_scope,
+    }});
 
     auto unplug_device_handler = this->ev_bus->register_handler<immer::box<events::UnplugDeviceEvent>>(
-        [session_id, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
-          if (ev->session_id == session_id) {
+        [session_id, run_scope, container_id, hw_db_path, this](const immer::box<events::UnplugDeviceEvent> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
             logs::log(logs::debug, "[DOCKER] Received UnplugDeviceEvent for session: {}", ev->session_id);
             for (const auto &[filename, content] : ev->udev_hw_db_entries) {
               try {
@@ -249,9 +261,32 @@ void RunDocker::run(std::string_view session_id,
           }
         });
 
-    do {
-      // Plug all devices that are waiting in the queue
-      while (auto device_ev = plugged_devices_queue->pop(50ms)) {
+    InspectResult last_inspect;
+    ContainerSupervision supervision(start_confirmed);
+    for (;;) {
+      auto observation = supervision.poll(docker_api, container_id, *stop_requested, ContainerMonitor::Clock::now());
+      if (observation.stop_result && !*observation.stop_result) {
+        logs::log(logs::warning,
+                  "[DOCKER] Stop for {} failed or is uncertain; lobby remains addressable for explicit retry",
+                  container_id);
+      }
+      last_inspect = std::move(observation.inspect);
+      auto decision = observation.decision;
+      if (decision == ContainerMonitor::Decision::terminal) {
+        break;
+      }
+      if (decision == ContainerMonitor::Decision::quarantine) {
+        throw DockerOutcomeUnknown(container_id);
+      }
+      if (decision == ContainerMonitor::Decision::reconcile || !last_inspect.container ||
+          last_inspect.container->status != RUNNING) {
+        std::this_thread::sleep_for(500ms);
+        continue;
+      }
+      // Bound each device batch so hotplug traffic cannot starve inspection/stop.
+      if (auto device_ev = plugged_devices_queue->pop(50ms)) {
+        if (!sessions::targets(run_scope, (*device_ev)->run_scope.get(), (*device_ev)->session_id))
+          continue;
         if (device_ev->get().session_id == session_id) {
           logs::log(logs::debug, "[DOCKER] Plugging device from queue in session: {}", session_id);
           if (use_fake_udev) {
@@ -278,22 +313,23 @@ void RunDocker::run(std::string_view session_id,
       }
 
       std::this_thread::sleep_for(500ms);
+    }
 
-      // value_or() avoids dereferencing nullopt when the container was removed mid-session.
-    } while (docker_api.get_by_id(container_id).value_or(Container{.status = EXITED}).status == RUNNING);
-
-    logs::log(logs::debug, "[DOCKER] Container logs: \n{}", docker_api.get_logs(container_id));
+    if (last_inspect.state == InspectState::present) {
+      logs::log(logs::debug, "[DOCKER] Container logs: \n{}", docker_api.get_logs(container_id));
+    }
     logs::log(logs::debug, "[DOCKER] Stopping container: {}", docker_container->name);
 
     this->ev_bus->fire_event(immer::box<events::DockerContainerStopped>{events::DockerContainerStopped{
         .container_id = container_id,
         .hostname = inspected_hostname,
         .session_id = std::string(session_id),
+        .run_scope = run_scope,
     }});
 
     if (const auto env = utils::get_env("WOLF_STOP_CONTAINER_ON_EXIT")) {
       if (std::string(env) == "TRUE") {
-        docker_api.stop_by_id(container_id);
+        // Supervision has already confirmed exit/absence; never force-stop here.
         docker_api.remove_by_id(container_id);
       }
     }
@@ -304,6 +340,12 @@ void RunDocker::run(std::string_view session_id,
     } catch (const std::filesystem::filesystem_error &e) {
       logs::log(logs::warning, "Failed to remove udev base path: {}", e.what());
     }
+  } else if (creation.state == CreateState::unknown || creation.state == CreateState::conflict) {
+    // Do not adopt, stop, remove or automatically retry an uncertain/pre-existing
+    // instance. start_runner propagates this explicit outcome without teardown.
+    throw DockerOutcomeUnknown(new_container.name);
+  } else {
+    logs::log(logs::error, "[DOCKER] Container create rejected for {}", new_container.name);
   }
 }
 

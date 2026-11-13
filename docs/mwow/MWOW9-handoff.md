@@ -1,0 +1,414 @@
+# MWOW-9: scope foundation checkpoint
+
+Status: **review**, foundation only. Base `d57e6b0145fb8733b4ec0634604a453ebc7c2478`.
+This is the first atomic step of R1/R6/R9 (and the device-routing part of R5),
+not a completed handoff, release candidate, or deployment permission.
+
+## Stable internal interfaces
+
+`wolf::core::sessions` in `sessions/connection_scope.hpp`:
+
+- `RunScope::fresh(std::string)` identifies one admitted run lifetime. Launch
+  allocates it; resume retains it. LobbyLifecycle allocates it once per Entry.
+- `ConnectionScope::fresh(std::size_t)` identifies one launch/resume connection.
+  A copy retains identity. Recreating a scope with the same ID creates a different
+  identity, regardless of reused RTP/ENet secrets, crypto object or random output.
+- `scope.matches(other)` requires two non-null handles with the same retained
+  epoch allocation and ID. Even null/null is false. No implicit wildcard exists.
+- `targets(owned, requested, id)` additionally verifies the event's public ID.
+- `resource_key()` is an opaque process-local name. The retained allocation cannot
+  be reused while an event/worker still holds it. It is not a durable identifier,
+  authentication secret or public API field.
+- `resolve_producer(consumer, requested, session_id, producer, producer_id)` returns
+  only the captured run's resource key, or nullopt. Both real audio/video switch
+  callbacks use it. `ProducerBinding::select` serializes the property change and
+  retains the selected RunScope after the event disappears (otherwise a listening
+  sink name could suffer allocator ABA). This is not full pipeline serialization.
+  Interpipe sink names and initial default-source bindings use
+  this key, so old switch events cannot discover a replacement by numeric ID.
+
+Connection events carry `rfl::Skip<ConnectionScope> connection_scope`:
+IDR, Pause, Resume, Stop, UICombo, VideoSession, AudioSession, JoinLobby, LeaveLobby,
+SwitchStreamProducerEvents, and device-routing source events.
+VideoSession/AudioSession also carry `rfl::Skip<RunScope> run_scope`.
+Join/Leave carry `lobby_scope`; Switch carries `producer_scope`.
+
+`GameStopRequest{session_id, run_scope}` is an explicit run stop request.
+`RunEnded{session_id, run_scope}` is a terminal runner/startup fact, not a stop request.
+StopLobby retains its public name and PIN but gains a hidden RunScope.
+Runner::run now takes `const RunScope&` instead of a session string; all owned
+runners and `RunnerArgs` adapters propagate it. No ID-only overload remains.
+StartRunner retains the captured StreamSession, including both scopes.
+
+Device plug/unplug events carry destination RunScope and originating ConnectionScope.
+The queue map retains `{RunScope, shared_ptr<queue>}`; worker launch copies the
+queue ownership while the immutable map snapshot is alive. Docker callbacks and
+queue dequeue validate the destination run. Docker lifecycle notifications carry
+that same run. This is **not yet** a device-generation/worker completion contract.
+
+## Inventory: runtime emitters and consumers
+
+Paths in this table are under `src/moonlight-server/`.
+
+| Event / ingress | Emitters and capture | Consumers and adaptation |
+|---|---|---|
+| StreamSession | `state/sessions.hpp` allocates both scopes; REST launch and Unix add publish state before firing | `sessions/moonlight.cpp` rejects missing/noncurrent connection; retains scope in startup callbacks, queue and producers |
+| REST resume | `rest/endpoints.hpp` allocates a fresh connection, retains run/display/devices/audio/held modifiers | Compare-and-replace uses old scope; failed replacement returns error. Old StopStream captures the old scope. Completion/drain admission remains next stage |
+| VideoSession / AudioSession | `rtsp/commands.hpp` copies both scopes; Unix StreamSessionStart resolves once and overwrites any deserialized scope | `sessions/moonlight.cpp` verifies captured connection before waiter and after ping; `streaming.cpp` rejects null scopes. Waiters are still unbounded/detached |
+| PauseStream | Authenticated TERMINATION in `control/control.cpp`; explicit Unix pause resolves once | Video/audio consumer checks exact scope; **no lobby leave, runner stop, or session removal** |
+| ResumeStream | First authenticated control packet copies the associated connection scope | No runtime consumer currently exists; notification only |
+| IDRRequest | Authenticated control packet captures the peer's StreamSession scope | Video consumer checks exact scope |
+| StopStream | REST resume targets prior connection; run adapter targets connections belonging to the captured run | Video/audio consumers check exact scope. No direct runner/producer/session-map/lobby teardown |
+| GameStopRequest | HTTPS cancel of the paired session, Unix stop, shutdown snapshots | Run-scoped CMD/Docker and producers; moonlight emits exact connection stops but retains session until RunEnded; lobby cleanup uses matching member run only. Network disconnect/TERMINATION cannot emit it |
+| RunEnded | Captured Moonlight runner completion or confirmed pre-runner Wayland-socket failure; Unknown is retained | Producer EOS, scoped consumer stop, removal only of matching run, queue erase only of matching run, matching lobby member cleanup |
+| StopLobby | Unix PIN-checked ingress captures the lobby; shutdown captures snapshots; lifecycle completion and deferred stop retain Entry.run_scope | Lobby cleanup validates ticket scope; CMD/Docker/video/audio compare exact scope. DockerContainerCreated retry verifies same run; existing MWOW-7 retry/Unknown/exception semantics retained |
+| JoinLobby | Unix ingress captures current connection and target lobby scope once | Exact scope lookup, matching lobby, existing lifecycle admission and PIN checks; captured member snapshot retained |
+| LeaveLobby | Unix ingress, UICombo, explicit game end/stop cleanup, lobby cleanup, deferred lifecycle queue | Exact connection + lobby scope; member must belong to same run. Removed sessions can be cleaned from retained member snapshot, without promoting an ID to a new run. Deferred leaves store ConnectionScope, not numeric ID |
+| UICombo | Both keyboard and controller combo paths in `control/input_handler.cpp` | Scoped explicit leave; network pause/stop no longer shares this path |
+| SwitchStreamProducer | Join/leave captures consumer connection and target producer run | Both streaming consumers use `resolve_producer`; actual destination uses retained run resource key |
+| PlugDevice | Initial mouse/keyboard in moonlight; joypad/pen/touch creation in input_handler; lobby join/leave migration and relay | Source relay resolves only exact connection/run; queues preserve destination run; Docker dequeue validates it |
+| UnplugDevice | Input inactive-mask path; lobby migration and source relay | Source relay rejects stale connection/run; Docker compares destination run before filesystem/exec |
+| DockerContainerCreated/Stopped | `runners/docker.cpp` retains scope alongside immutable container ID | Created stop reassertion validates Entry scope; Stopped currently SSE only |
+| StartRunner | Moonlight on-ready continuation and Unix RunnerStart capture full session | Queue lookup must match run before copying ownership to worker; terminal callback keeps captured run. All-route singleton admission remains outside this checkpoint |
+| Unix input | Existing endpoint resolves a StreamSession once | `handle_input` now rejects missing/mismatched scope; existing complete packet/field guards remain. Serial InputSeat admission is not implemented |
+| ENet association / feedback | Existing MWOW-6 peer state retains session; match rejects missing scopes | `same_control_generation` adds exact ConnectionScope/RunScope to existing crypto/token/key checks; V2/replay/outbox behavior unchanged |
+| RTP ping | UDP ingress has only wire correlator / legacy address and port | Cannot mint internal authority. Waiter captures Video/Audio scope, rechecks before streaming; cancellation and duplicate-start reservation remain next stage |
+
+`get_session_by_scope` never creates authority from a stable ID. Run-scoped
+administrative cleanup may enumerate the current connection of that **same captured
+run** (`get_session_by_run`); it cannot target a new run with the same stable ID.
+All delayed lifecycle completion callbacks retain their Entry/run; they do not
+resolve a new run by ID. There are no legacy ID-only runner stop adapters.
+
+## Public compatibility
+
+No Moonlight packet, RTP token size, SDP extension or ENet message format changes.
+The existing printable RTP-secret / ENet random generation is unchanged; its
+mt19937 weakness is not claimed fixed. Wire correlators are not internal epochs.
+
+Existing JSON request fields and reflector projections remain. `rfl::Skip` hides
+runtime handles; StreamSession/Lobby explicit reflectors omit the new fields.
+SSE remains notification, never a capability that can be replayed to gain authority.
+New GameStopRequest/RunEnded notifications are additive. Existing StopStream
+notifications still describe consumer stop. Local `/sessions/stop` and paired
+HTTPS cancel retain explicit game-stop intent; Pause means connection-only pause.
+The intentional behavioral change is that network pause/stop no longer unplugs
+or leaves a lobby. API success means accepted, not completed teardown.
+
+An externally delayed administrative ID-only HTTP request still resolves whatever
+instance exists **at ingress**. An expected-epoch public API would require a separate
+compatibility decision. Internally delayed events retain their original scopes.
+
+Default named interpipesrc elements bind to scoped sink names at pipeline setup.
+Custom externally supplied pipelines which hard-code raw `<id>_video/audio` sink
+names must migrate to the server-managed named interpipesrc binding; no general
+arbitrary-pipeline rewrite or backward alias to a reused sink is provided.
+
+## Verification and limits of this checkpoint
+
+- Existing AST index absent; used targeted ranges/diffs, no rebuild. No agent-tools
+  manifest. Canonical source is the assigned ext4 Worktrees checkout, base exact above.
+- Cheap standalone production Scope/LobbyLifecycle smoke: C++20, ASan/UBSan, including
+  10,000 retained-allocation ABA iterations and deferred/null scope checks.
+- Adapted `tests/testLifecycle.cpp`: **13 scenarios passed**, ASan/UBSan. Only scope
+  arguments and retained deferred-scope assertions changed; no checks removed.
+- New native `wolf-connection-scope-tests` uses Catch2's safe main and actual
+  `setup_moonlight_handlers` / `setup_lobbies_handlers`, an owned EventBus and fake
+  state. It never emits startup/ping events or initializes GStreamer/devices.
+  Covers stale/null RunEnded/GameStop, connection-stop vs game completion, stale
+  join/leave, preserved lobby membership on connection loss, scope serialization,
+  deferred scope retention, ABA, exact session removal, stale producer switch,
+  and retained listener binding after the switch event is destroyed.
+  **Authored/syntax-checked; native link/execution awaits Manager's slot.**
+- Mechanical legacy adapters: `tests/testLifecycle.cpp` and `tests/testWolfAPI.cpp`
+  (real source scope in device relay and control-association fixtures; fake joined
+  session receives explicit scopes). `tests/testStream.cpp` does not exist here;
+  `tests/testControl.cpp` needs no adapter. Serialization-only IDR SSE fixture is
+  intentionally unscoped and does not execute a runtime sink. RTSP fixture sessions
+  use the production session factory. No security/field assertions removed.
+- Qualified `clang++ -fsyntax-only` uses native MWOW-8 compile commands, changing only
+  source root, output/dependency-writing flags, and adding the **same fetched Boost
+  1.87 split uuid include**. Baseline native commands omit that dependency; Manager
+  reproduced the failure and assigned its CMake correction to MWOW-10. Manager
+  subsequently reported UUID correction `7e3c430` in its separate candidate, then
+  a static-ENet/PIC link blocker. Neither build fix is imported into this checkpoint.
+  No CMakeBoost,
+  SimpleWeb, Motion helper or borrowed dependency tree modified here.
+- Exact command/log evidence: `/home/bazzoozza/.bb/thread-storage/thr_z5wceyp8m4/checks/`.
+  Cheap compiled artifacts: `/run/media/bazzoozza/Games/bb-targets/wolf/MWOW9/`;
+  `cheap-results.json` records all four successful compile/run commands and logs.
+  These are qualified syntax + isolated tests, **not** a native full link/build pass.
+  No GStreamer pipeline, ENet listener, device, Docker daemon, game or Wolf main run.
+- Full link, native scope execution, sanitizer integration and independent review
+  remain gates. Manager requested this source checkpoint before the heavy slot.
+  Exact token usage is unavailable; no fabricated usage report submitted. Manager
+  owns the MWOW-9 lease. No merge, push, deployment or additional agents.
+
+## Boundaries for subsequent owners (not implemented here)
+
+1. **Consumer runtime:** keep these scope types/fields; add owned per-kind admission,
+   cancellation, bounded ping wait, GLib-context commands and callback/resource drain.
+   A scope check is not a serialization fence. Audio participates even when muted.
+   Repeated ANNOUNCE, in-flight callbacks and stop-before-registration remain gates.
+2. **InputSeat:** retain one MVP Xbox device; map one configured wire controller without
+   rejecting protocol slots 0..15 globally. Use the same serial owner ticket for ENet,
+   API and lobby routing; revoke admission, finish in-flight writes, neutral, then grant.
+   Bind feedback to the current peer. Existing inputtino void setters do not prove
+   kernel delivery; require a checked dependency seam or honest fail-closed policy.
+3. **Device executor:** destination RunScope is already in every job. Add immutable
+   container/device generation, bounded count/bytes queue, reserved control lane,
+   FIFO completion and Unknown/quarantine outcomes. Current unplug can still perform
+   synchronous filesystem/Docker work; run identity alone does not solve R5.
+4. **Integration:** serialize resume/member replacement and side effects. Current
+   snapshot checks + compare-and-replace prevent ID remapping but do not prove an
+   atomic handoff of shared input/display resources. A queued device operation within
+   the same persistent run still requires the new owner/device-generation gate.
+   Lobby membership retains a snapshot across resume; run-authorized cleanup resolves
+   that same run's current connection, but old-vs-new run retention/reconciliation and
+   bounded membership storage still need the next stage.
+5. Preserve MWOW-6 key registry, V2/legacy policies and all field guards; MWOW-7
+   Docker Unknown, retryable stop and worker-handoff exception accounting. No generic
+   singleton/all-routes prefix ownership, restart recovery, 16-pad neutral guarantee,
+   measured 5s deadline, or bounded physical GStreamer/kernel completion is implied.
+
+Manager may split the next consumer/input/device stages only after reviewing this
+frozen interface checkpoint and assigning disjoint file ownership. This document
+is the handoff contract for the foundation, not acceptance of R1/R6/R9.
+
+## F6/F7 regression checkpoint (RED seam)
+
+Independent review of `8e930ba` identified two sequential routing defects:
+consumer startup after a retained-lobby resume selected the source run instead of
+the lobby (F6); numeric membership alone allowed a replacement run's devices into
+that lobby and suppressed its own queue (F7). Manager's native combined `5e465404`
+passed full compilation and six isolated suites; those suites did not cover these
+triggers. The old link-pending section above is historical evidence for 8e930ba,
+not the current status of Manager's combined baseline.
+
+This regression checkpoint deliberately preserves the old routing decisions:
+`state::get_lobby_for_session` delegates to numeric membership and
+`state::prepare_stream_consumer` selects the source run. New `[scope][routing]`
+cases are therefore expected RED. No passing runtime result is asserted here.
+The next commit changes these decisions without weakening the assertions.
+
+Production seams (all in `state/sessions.hpp`, not test copies):
+
+- `get_lobby_for_session(lobbies, StreamSession)` is shared by both lobby device
+  relays, own-queue suppression and explicit UI-combo leave.
+- `prepare_stream_consumer<VideoSession/AudioSession>(request, sessions, lobbies)`
+  runs after RTP ping and before streaming. It validates the captured current
+  connection/run, replaces any incoming `producer_scope`, and returns an optional
+  prepared consumer. Both audio/video startup paths call this same function.
+- `queue_own_session_device(event, sessions, lobbies, queue_scope, queue)` is the
+  actual own-queue adapter used by the Moonlight event callback. The tests execute
+  it directly without starting a session to create that queue.
+- VideoSession and AudioSession now have hidden `producer_scope`, separate from
+  the connection's original `run_scope`. Initial named interpipesrc binding and
+  ProducerBinding retain this selection; no raw-ID alias was restored.
+
+The three new cases cover admitted lifecycle membership plus real pause handlers,
+new audio/video preparation after resume, stale/replacement requests, and five
+routing variants (resumed same run, replacement run, missing retained member,
+missing committed projection, null lobby scope). Device tests execute actual
+lobby event handlers and inspect both the real TSQueue and the emitted unplug.
+The legacy API relay fixture now includes its retained member snapshot; its old
+assertion remains. Input-object identities and absence of implicit leave are
+checked; these synthetic joined-state fixtures do not create a Wayland display,
+exercise physical input, or prove the pending InputSeat/neutral/drain contract.
+No CMake/build dependencies or other future-stage implementation is changed.
+
+## F6/F7 correction checkpoint (GREEN source)
+
+RED predecessor: `8241631b08efe5846f34fc072c27e4facff8d70f`.
+The correction is confined to the two production decisions in `state/sessions.hpp`:
+
+- `get_lobby_for_session` now requires a valid source connection/run, a valid lobby
+  run, the retained `members[source.session_id]` snapshot with the **same RunScope**,
+  and its committed connected-session projection. A new connection of the same run
+  is allowed; a different run reusing the ID, absent member, absent projection,
+  or null lobby scope is not. The ID-only lookup helper is removed entirely.
+- `prepare_stream_consumer` selects that confirmed lobby's RunScope, otherwise the
+  source's own RunScope. Both audio/video use this decision after ping; the prepared
+  value and the actual streaming ProducerBinding retain the selection. The original
+  connection/run identities are unchanged. A supplied producer_scope is overwritten.
+- Plug relay, unplug relay, own-queue suppression, and UI-combo routing all use the
+  same guard. A mismatched replacement run gets no lobby scope; the own-queue adapter
+  instead enqueues the unchanged event into that run's queue. No silent leave or
+  raw-ID sink alias was introduced. The regression assertions are unchanged from RED.
+
+Ownership/interfaces: only `events/events.hpp` (hidden selected-producer field),
+`state/sessions.hpp` (three seams), `sessions/moonlight.cpp` (after-ping/queue adapters),
+`sessions/lobbies.cpp` (shared membership decision), `streaming/streaming.cpp`
+(initial selected binding), `tests/testConnectionScopes.cpp`, `tests/testWolfAPI.cpp`
+and this document. No CMake, Boost, ENet, Beast, security guards or Docker Unknown
+logic changed. Scope type interfaces from 8e930ba remain unchanged.
+
+Qualified syntax checks use Manager's current native compile database with source
+paths remapped here; UUID already exists in those native flags, no extra include
+qualification is added this time. These are not a native build/link pass. Root owns
+RED/GREEN native builds and suite execution. Until that evidence and independent
+review arrive, this is a **review candidate**, not a measured GREEN test result.
+Artifacts: thread-storage `thr_z5wceyp8m4/checks/f6-f7-red/` and `f6-f7-green/`.
+
+This fixes the sequential membership/producer decisions in F6/F7. It does not make
+separate snapshot reads atomic with concurrent join/leave/resume or GStreamer side
+effects. Consumer cancellation/drain, serial InputSeat and neutral delivery, feedback
+rebinding, bounded device executor and retained-member reconciliation stay deferred.
+The tests use committed membership records and input-object identity markers; actual
+Wayland input redirection and audio/video transport are not exercised here.
+
+## Consumer ownership interface checkpoint (2026-11-11, before implementation)
+
+Ownership: `streaming/consumer_runtime.{hpp,cpp}` owns a bounded registry of
+connection records and audio/video jobs; one supervisor reaps joinable workers.
+`admit(scope, run, kind, correlation, work)` reserves before launching a worker.
+A trusted current-scope predicate is checked inside admission and again before
+activation. `revoke(scope)` is a nonblocking cancellation request, including a
+retained tombstone for stop-before-admission. Ping is only a correlator delivered
+to an already admitted job, never an authority to resolve a session by ID.
+Duplicate admission for a connection/kind cannot start another worker.
+
+`ConsumerJob` retains connection/run scopes, ping/socket, cancellation state and
+coalesced typed commands (IDR / selected producer scope). It has no raw pipeline
+pointer. Event-bus callbacks only update this state. The consumer pipeline worker
+owns a private GMainContext and applies commands there. Producer pipelines keep
+the existing runner and lifecycle behavior. Consumers publish no GameStop or
+RunEnded. Setup/drain/callback state belongs to the worker until NULL state,
+callback removal/drain, pipeline destruction and thread join are confirmed.
+
+Policy proposal: RTP wait 5 s, drain decision 5 s, supervisor/context polling
+10 ms; at most 16 unreaped jobs, 64 retained connection records and 4 Unknown
+jobs before global admission denial. These are resource/deadline policies, not
+measured latency guarantees. Same numeric ID cannot acquire replacement consumer
+resources while an earlier scope is unreaped. Unknown retains resources and
+worker ownership; late actual completion may release quarantine. Shutdown joins
+owned workers and can wait indefinitely for a stuck external driver: bounded
+classification is explicitly not bounded physical termination. No detach, forced
+kill or EOS-as-completion. Retired noncurrent, fully joined records may be pruned;
+current revoked records remain so delayed ANNOUNCE cannot reopen them.
+
+Next input/device stages consume the scoped cancellation/completion status; this
+stage does not implement neutral input, delivery proof or device executor fencing.
+
+Implementation checkpoint: `ConsumerRuntime::{admit,revoke,ping,command,status}`,
+`ConsumerJob::{cancelled,take_commands,begin_drain}` and
+`run_consumer_pipeline(description, job, hooks)` now form the production seams.
+`consumer_event_handlers` installs lifetime registrations once (no per-waiter
+registration race). The two Moonlight ANNOUNCE receivers reserve through
+`admit_consumer`, and re-run F6/F7 preparation after ping. Streaming consumer entry
+points now return a cleanup result and require an owned `ConsumerJob&`; their only
+production callers are the two Moonlight receivers. Wire/events schemas and
+RunScope/ConnectionScope interfaces are unchanged. Producer `run_pipeline` and
+both producer callers are unchanged. No common core helper changes.
+
+The new isolated fixture covers cancellation, timeout, concurrent duplicate
+admission, reused IDs, stop tombstones/capacity, Unknown/replacement denial,
+private-context command execution, EOS-before-drain, and an in-flight real Gst
+fakesink callback. Native configure/build/test qualification is pending at this
+code checkpoint. Existing assertions/targets remain intact.
+
+Frozen build commits applied in the authorized order, stable patch IDs identical:
+869e1a0 -> 21683d9 (UUID), d2c6212 -> a480299 (ENet PIC),
+a10e7e8 -> ffa5388 (test-only Beast). Their production CMake is not rewritten;
+only the new isolated consumer test target is appended to tests/CMakeLists.txt.
+
+Consumer native follow-up: first native configure passed; first build exposed
+pinned eventbus `function_traits` rejecting generic registration lambdas in the
+new adapter. Registrations now name their concrete event types (including fixture
+observers); no dependency workaround. Historical build-1.log remains evidence.
+
+Completion contract for subsequent stages: `revoke(scope)` returns
+`optional<ConsumerDrainTicket>`. It closes admission immediately; the ticket
+retains that exact ConnectionScope and a shared completion future. `complete()`
+is a zero-time readiness query, true only after every reserved worker has joined;
+missing/broken tickets are false. A retained ticket survives registry pruning and
+numeric-ID reuse. Unknown does not fulfil it. A revoked connection with no
+reserved workers can complete immediately, while later ANNOUNCE stays denied.
+`status(scope, kind)` supplies diagnostic state/reason; absence of a status is not
+release proof. Share the owner runtime with the future coordinator and retain the
+returned ticket before publishing any replacement input/device owner; no polling
+by raw numeric ID. This patch supplies the consumer fence, not that future grant
+protocol or input neutral/device completion.
+
+The consumer streaming entry points additionally require job/request exact
+ConnectionScope+RunScope, matching public ID and kind. Regression checks now also
+observe actual pipeline destruction via GObject weak notify and cancel in the
+after-ping/before-Gst-setup gap. No EOS send or ticket issuance counts as release.
+
+Runtime fixture isolation: the consumer executable disables plugin search and
+registry updates before `gst_init_check`, explicitly loads only the installed
+`coreelements` shared library discovered through pkg-config, and checks that no
+other dynamic plugin is loaded. The CTest registry path is inside its binary
+folder. It does not call `streaming::init`, start Wolf or scan GPU/device plugins.
+System GStreamer used here is 1.28.7; older-version/runtime matrix is unverified.
+The callback holder strategy uses Gst destroy-notify lifetime and explicit drain;
+see [GstBus callback contract](https://gstreamer.freedesktop.org/documentation/gstreamer/gstbus.html#gst_bus_set_sync_handler)
+and [installed-version appsink implementation](https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gst-plugins-base/gst-libs/gst/app/gstappsink.c).
+
+## F8/F9 review correction — RED production seams
+
+Review part9 rejects ce0e03a's release proof. Gst1.28.7 bus posting and appsink
+sample delivery retain their callback records across invocation; unregister drops
+only the registration reference, not every in-flight reference. Counting entered
+Lease objects misses a retained callback paused before entry or after Lease exit.
+Transfer-full sink/bus/source refs also crossed throwing holder/string allocations.
+
+The RED checkpoint extracts the existing real media setup/select/drain adapter to
+`streaming/consumer_media.{hpp,cpp}`. Both production consumers call it with their
+owned UDP/context functions. Narrow optional probes observe exact allocation
+sites and callback/notify boundaries; they do not substitute Gst objects or change
+production scheduling when absent. Holder retirement is instrumented AFTER deleting
+its captured resources, but the RED drain intentionally retains the old active-only
+predicate. Sink/bus/src lookups intentionally retain the old raw-ref throw holes.
+
+New tests use real Gst bus posting on an owned thread, before-entry/after-entry/
+notify gates, actual appsink from installed software app plugin, and injected
+bad_alloc immediately after the production adapter acquired a real Gst ref. Weak
+resource/object destruction is checked before successful ticket publication.
+RED fault tests rescue the known lost ref only after assertion and worker join,
+so a failing test never leaves dangling weak-notify user data or process leaks.
+RAII teardown opens every gate, joins the posting thread and shuts down the owned
+runtime even if a REQUIRE fails. Existing11cases/assertions are preserved; software
+allowlist extends only to app, with search/registry updates OFF and actual1.28.7
+version asserted. Tests are intended to stay byte-identical in RED and GREEN.
+
+Inherited eventbus noexcept/EAGAIN and general supervisor allocation failure remain
+separate residuals; this correction does not claim exception-safe ingress or fix
+InputSeat/device executor/all-route/live handoff.
+
+First RED execution on ed12475 built successfully and reached the intended
+2 cases / 9 failed assertions (six premature-release/Unknown checks, three weak
+Gst object release checks). It also exposed an independent fixture cleanup bug:
+the synthetic late application message used its own bus as source, creating a
+bus→queued-message→bus cycle after NULL. Its source is now nullable nullptr;
+the actual Gst posting/holder-retention schedule and every assertion are unchanged.
+The original RED log/LSan failure remains archived. The corrected RED fixture is
+the version frozen for the subsequent unchanged RED/GREEN comparison.
+
+## F8/F9 GREEN contract
+
+Corrected RED0e0ba14: native build exit0; actual regression run exit42,
+2 cases / 68 assertions with exactly9 semantic failures; no sanitizer diagnostic.
+GREEN keeps that test source unchanged.
+
+`ConsumerCallbackBarrier::close_and_wait` now requires BOTH active entries ==0
+and published holder obligations ==0. Each real appsink/bus registration increments
+an obligation before transferring data to Gst. Gst's final destroy-notify deletes
+the entire owned holder (including callback captures) before acknowledging retirement.
+The tiny shared barrier is synchronization/fence state, not a retained UDP/context
+payload. Late callback/notify/payload destruction therefore retains the worker and
+stays Unknown; unregister or entry into notify cannot publish a successful ticket.
+No wait is added to event-bus/control callbacks.
+
+Every transfer-full media sink, bus and source reference is immediately held by
+`GstOwned` (unique_ptr + gst_object_unref), including the drain lookup. Holder data
+is constructed under unique_ptr before registration; failed construction/copy/
+retain unwinds the unpublished holder and all acquired Gst refs. After registration,
+Gst destroy-notify owns deletion/ack. Partial setup failure still goes through
+confirmed NULL, unregister and holder/entry drain before Failed+joined can release.
+No core helper, producer lifecycle, scope/registry protocol or public wire change.
+
+This fixes the reviewed media adapter release boundary, not all-process exception
+safety: GLib fatal allocation, inherited eventbus noexcept/EAGAIN and supervisor
+allocation recovery remain outside this correction. Physical GPU/driver shutdown
+is still not bounded; an unretired holder remains owned/quarantined.

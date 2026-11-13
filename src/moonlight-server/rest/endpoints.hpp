@@ -1,5 +1,6 @@
 #pragma once
 
+#include <charconv>
 #include <control/control.hpp>
 #include <crypto/crypto.hpp>
 #include <curl/curl.h>
@@ -126,7 +127,14 @@ std::shared_ptr<boost::promise<XMLResult>> pair_phase1(const immer::box<state::A
   future_pin->get_future().then(
       [state, salt, client_cert_str, cache_key, future_result](boost::future<std::string> fut_pin) {
         auto server_pem = x509::get_cert_pem(state->host->server_cert);
-        auto result = moonlight::pair::get_server_cert(fut_pin.get(), salt, server_pem);
+        std::pair<XML, std::string> result;
+        try {
+          result = moonlight::pair::get_server_cert(fut_pin.get(), salt, server_pem);
+        } catch (const std::runtime_error &e) {
+          logs::log(logs::warning, "Pairing failed (phase 1): {}", e.what());
+          future_result->set_value({SimpleWeb::StatusCode::client_error_bad_request, fail_pair("Pairing failed")});
+          return;
+        }
 
         auto client_cert_parsed = crypto::hex_to_str(client_cert_str, true);
 
@@ -153,8 +161,14 @@ XMLResult pair_phase2(const immer::box<state::AppState> &state,
   client_cache.last_phase = state::PAIR_PHASE::CLIENTCHALLENGE;
 
   auto server_cert_signature = x509::get_cert_signature(state->host->server_cert);
-  auto [xml, server_secret_pair] =
-      moonlight::pair::send_server_challenge(client_cache.aes_key, client_challenge, server_cert_signature);
+  std::pair<XML, std::pair<std::string, std::string>> challenge;
+  try {
+    challenge = moonlight::pair::send_server_challenge(client_cache.aes_key, client_challenge, server_cert_signature);
+  } catch (const std::runtime_error &e) {
+    logs::log(logs::warning, "Pairing failed (phase 2): {}", e.what());
+    return {SimpleWeb::StatusCode::client_error_bad_request, fail_pair("Invalid client challenge")};
+  }
+  auto [xml, server_secret_pair] = challenge;
 
   auto [server_secret, server_challenge] = server_secret_pair;
   client_cache.server_secret = server_secret;
@@ -175,10 +189,17 @@ XMLResult pair_phase3(const immer::box<state::AppState> &state,
   }
   client_cache.last_phase = state::PAIR_PHASE::SERVERCHALLENGERESP;
 
-  auto [xml, client_hash] = moonlight::pair::get_client_hash(client_cache.aes_key,
-                                                             client_cache.server_secret.value(),
-                                                             server_challenge,
-                                                             x509::get_pkey_content(state->host->server_pkey));
+  std::pair<XML, std::string> hash_result;
+  try {
+    hash_result = moonlight::pair::get_client_hash(client_cache.aes_key,
+                                                   client_cache.server_secret.value(),
+                                                   server_challenge,
+                                                   x509::get_pkey_content(state->host->server_pkey));
+  } catch (const std::runtime_error &e) {
+    logs::log(logs::warning, "Pairing failed (phase 3): {}", e.what());
+    return {SimpleWeb::StatusCode::client_error_bad_request, fail_pair("Invalid server challenge response")};
+  }
+  auto [xml, client_hash] = hash_result;
   client_cache.client_hash = client_hash;
   state->pairing_cache->update([&](const immer::map<std::string, state::PairCache> &pairing_cache) {
     return pairing_cache.set(cache_key, client_cache);
@@ -368,17 +389,40 @@ void appasset(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>
   }
 }
 
-auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
-                        const std::string &client_ip,
-                        const state::PairedClient &current_client,
-                        immer::box<state::AppState> state,
-                        const events::App &run_app) {
-  auto display_mode_str = utils::split(get_header(headers, "mode").value_or("1920x1080x60"), 'x');
-  moonlight::DisplayMode display_mode = {std::stoi(display_mode_str[0].data()),
-                                         std::stoi(display_mode_str[1].data()),
-                                         std::stoi(display_mode_str[2].data()),
-                                         state->config->support_hevc,
-                                         state->config->support_av1};
+// Own the header value across splitting; no returned views or null-terminated
+// reads of individual fields. The cap admits three positive int fields exactly.
+std::optional<moonlight::DisplayMode>
+parse_run_display_mode(const SimpleWeb::CaseInsensitiveMultimap &headers, bool hevc, bool av1) {
+  const auto it = headers.find("mode");
+  if (it != headers.end() && it->second.size() > 32)
+    return {};
+  const std::string mode = get_header(headers, "mode").value_or("1920x1080x60");
+  if (mode.empty() || mode.front() == 'x' || mode.back() == 'x' || mode.find("xx") != std::string::npos ||
+      std::count(mode.begin(), mode.end(), 'x') != 2)
+    return {};
+  const auto fields = utils::split(mode, 'x');
+  if (fields.size() != 3)
+    return {};
+  std::array<int, 3> values{};
+  for (std::size_t i = 0; i < fields.size(); ++i) {
+    const auto field = fields[i];
+    if (field.empty() || field.size() > 10 || field.front() < '0' || field.front() > '9')
+      return {};
+    const auto [end, error] = std::from_chars(field.data(), field.data() + field.size(), values[i]);
+    if (error != std::errc{} || end != field.data() + field.size() || values[i] <= 0)
+      return {};
+  }
+  return moonlight::DisplayMode{values[0], values[1], values[2], hevc, av1};
+}
+
+std::shared_ptr<events::StreamSession> create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
+                                                          const std::string &client_ip,
+                                                          const state::PairedClient &current_client,
+                                                          immer::box<state::AppState> state,
+                                                          const events::App &run_app) {
+  const auto display_mode = parse_run_display_mode(headers, state->config->support_hevc, state->config->support_av1);
+  if (!display_mode)
+    return {};
 
   auto surround_info = std::stoi(get_header(headers, "surroundAudioInfo").value_or("196610"));
   int channelCount = surround_info & (0xffff /* last 16 bits */);
@@ -386,7 +430,7 @@ auto create_run_session(const SimpleWeb::CaseInsensitiveMultimap &headers,
   auto base_session = create_stream_session(state,
                                             run_app,
                                             current_client,
-                                            display_mode,
+                                            *display_mode,
                                             channelCount,
                                             get_header(headers, "rikey").value(),
                                             get_header(headers, "rikeyid").value());
@@ -430,9 +474,13 @@ void launch(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
   auto new_session = create_run_session(request->parse_query_string(), client_ip, current_client, state, app.value());
-  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
+  if (!new_session) {
+    server_error<SimpleWeb::HTTPS>(response);
+    return;
+  }
   state->running_sessions->update(
       [new_session](const immer::vector<events::StreamSession> &ses_v) { return ses_v.push_back(*new_session); });
+  state->event_bus->fire_event(immer::box<events::StreamSession>(*new_session));
 
   auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
   auto xml = moonlight::launch_success(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
@@ -450,6 +498,13 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
   if (old_session) {
     auto new_session =
         create_run_session(request->parse_query_string(), client_ip, current_client, state, *old_session->app);
+    if (!new_session) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
+    new_session->run_scope = old_session->run_scope;
+    new_session->audio_sink = old_session->audio_sink;
+    new_session->held_modifiers = old_session->held_modifiers;
     // Carry over the old session display handle
     new_session->wayland_display = std::move(old_session->wayland_display);
     // Carry over the old session devices, they'll be already plugged into the container
@@ -460,9 +515,18 @@ void resume(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
     new_session->touch_screen = std::move(old_session->touch_screen);
 
     state->running_sessions->update([&old_session, new_session](const immer::vector<events::StreamSession> ses_v) {
+      if (!state::get_session_by_scope(ses_v, old_session->connection_scope))
+        return ses_v;
       return state::remove_session(ses_v, old_session.value()).push_back(*new_session);
     });
 
+    if (!state::get_session_by_scope(state->running_sessions->load(), new_session->connection_scope)) {
+      server_error<SimpleWeb::HTTPS>(response);
+      return;
+    }
+    state->event_bus->fire_event(immer::box<events::StopStreamEvent>{
+        events::StopStreamEvent{.session_id = old_session->session_id,
+                                .connection_scope = old_session->connection_scope}});
     auto rtsp_ip = get_rtsp_ip_string(get_host_ip<SimpleWeb::HTTPS>(request, state), *new_session);
     auto xml = moonlight::launch_resume(rtsp_ip, std::to_string(get_port(state::RTSP_SETUP_PORT)));
     send_xml<SimpleWeb::HTTPS>(response, SimpleWeb::StatusCode::success_ok, xml);
@@ -480,12 +544,10 @@ void cancel(const std::shared_ptr<typename SimpleWeb::Server<SimpleWeb::HTTPS>::
 
   auto client_session = state::get_session_by_client(state->running_sessions->load(), current_client);
   if (client_session) {
-    state->event_bus->fire_event(
-        immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = client_session->session_id}));
+    state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+        events::GameStopRequest{.session_id = std::to_string(client_session->session_id),
+                                .run_scope = client_session->run_scope}));
 
-    state->running_sessions->update([&client_session](const immer::vector<events::StreamSession> &ses_v) {
-      return state::remove_session(ses_v, client_session.value());
-    });
   } else {
     auto client_ip = get_client_ip<SimpleWeb::HTTPS>(request);
     logs::log(logs::warning, "[HTTPS] Received resume event from an unregistered session, ip: {}", client_ip);

@@ -10,7 +10,7 @@ namespace process {
 
 using namespace wolf::core::events;
 
-void RunProcess::run(std::string_view session_id,
+void RunProcess::run(const wolf::core::sessions::RunScope &run_scope,
                      std::string_view app_state_folder,
                      std::string_view host_xdg_runtime_dir,
                      std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
@@ -18,6 +18,10 @@ void RunProcess::run(std::string_view session_id,
                      const immer::array<std::pair<std::string, std::string>> &paths,
                      const immer::map<std::string, std::string> &env_variables,
                      std::string_view render_node) {
+  if (!run_scope)
+    return;
+  const auto session_id = run_scope.id();
+
   logs::log(logs::debug, "[PROCESS] Starting process: {}", this->run_cmd);
 
   std::future<std::string> std_out = {}, err_out = {};
@@ -46,16 +50,16 @@ void RunProcess::run(std::string_view session_id,
     return;
   }
 
-  auto terminate_handler = this->ev_bus->register_handler<immer::box<StopStreamEvent>>(
-      [&group_proc, session_id](const immer::box<StopStreamEvent> &terminate_ev) {
-        if (std::to_string(terminate_ev->session_id) == session_id) {
+  auto terminate_handler = this->ev_bus->register_handler<immer::box<GameStopRequest>>(
+      [&group_proc, session_id, run_scope](const immer::box<GameStopRequest> &terminate_ev) {
+        if (sessions::targets(run_scope, terminate_ev->run_scope.get(), terminate_ev->session_id)) {
           group_proc.terminate(); // Manually terminate the process
         }
       });
 
   auto terminate_lobby_handler = this->ev_bus->register_handler<immer::box<StopLobbyEvent>>(
-      [&group_proc, session_id](const immer::box<StopLobbyEvent> &terminate_ev) {
-        if (terminate_ev->lobby_id == session_id) {
+      [&group_proc, session_id, run_scope](const immer::box<StopLobbyEvent> &terminate_ev) {
+        if (sessions::targets(run_scope, terminate_ev->run_scope.get(), terminate_ev->lobby_id)) {
           group_proc.terminate(); // Manually terminate the process
         }
       });

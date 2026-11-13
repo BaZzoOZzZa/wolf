@@ -1,0 +1,68 @@
+--- a/src/uhid/joypad_ps5.cpp
++++ b/src/uhid/joypad_ps5.cpp
+@@ -1,3 +1,4 @@
++#include "motion_encoding.hpp"
+ #include <algorithm>
+ #include <climits>
+ #include <cmath>
+@@ -497,25 +498,20 @@
+ /**
+  * For a rationale behind this, see: https://github.com/LizardByte/Sunshine/issues/3247#issuecomment-2428065349
+  */
+-static __le16 to_le_signed(float original, float value) {
+-  value = std::clamp(value, static_cast<float>(SHRT_MIN), static_cast<float>(SHRT_MAX));
+-  return htole16(value);
+-}
+-
+ void PS5Joypad::set_motion(PS5Joypad::MOTION_TYPE type, float x, float y, float z) {
+   switch (type) {
+   case ACCELERATION: {
+-    this->_state->current_state.accel[0] = to_le_signed(x, (x * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
+-    this->_state->current_state.accel[1] = to_le_signed(y, (y * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
+-    this->_state->current_state.accel[2] = to_le_signed(z, (z * uhid::SDL_STANDARD_GRAVITY_CONST * 100));
++    this->_state->current_state.accel[0] = detail::motion_to_le(x, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
++    this->_state->current_state.accel[1] = detail::motion_to_le(y, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
++    this->_state->current_state.accel[2] = detail::motion_to_le(z, static_cast<double>(uhid::SDL_STANDARD_GRAVITY_CONST) * 100);
+-
++
+     send_report(*this->_state);
+     break;
+   }
+   case GYROSCOPE: {
+-    this->_state->current_state.gyro[0] = to_le_signed(x, x * uhid::gyro_resolution);
+-    this->_state->current_state.gyro[1] = to_le_signed(y, y * uhid::gyro_resolution);
+-    this->_state->current_state.gyro[2] = to_le_signed(z, z * uhid::gyro_resolution);
++    this->_state->current_state.gyro[0] = detail::motion_to_le(x, uhid::gyro_resolution);
++    this->_state->current_state.gyro[1] = detail::motion_to_le(y, uhid::gyro_resolution);
++    this->_state->current_state.gyro[2] = detail::motion_to_le(z, uhid::gyro_resolution);
+-
++
+     send_report(*this->_state);
+     break;
+--- /dev/null
++++ b/src/uhid/motion_encoding.hpp
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++#include <endian.h>
++#include <limits>
++
++namespace inputtino::detail {
++
++// Private report encoding, also exercised without constructing a device.
++// Invalid samples become neutral; finite samples saturate to the signed wire
++// range. Scale in double to avoid overflow for even FLT_MAX sensor input.
++inline uint16_t motion_to_le(float sample, double scale) {
++  if (!std::isfinite(sample))
++    return htole16(uint16_t{0});
++  const auto scaled = std::clamp(static_cast<double>(sample) * scale,
++                               static_cast<double>(std::numeric_limits<int16_t>::min()),
++                               static_cast<double>(std::numeric_limits<int16_t>::max()));
++  const auto signed_value = static_cast<int16_t>(scaled);
++  return htole16(static_cast<uint16_t>(signed_value));
++}
++
++} // namespace inputtino::detail

@@ -1,3 +1,4 @@
+#include "consumer_media.hpp"
 #include "platforms/hw.hpp"
 
 #include <chrono>
@@ -92,19 +93,22 @@ std::pair<std::string, std::string> get_color_params(immer::box<events::VideoSes
   return std::make_pair(color_range, color_space);
 }
 
-void start_video_producer(const std::string &session_id,
+void start_video_producer(const sessions::RunScope &run_scope,
                           const std::string &buffer_format,
                           const std::string &render_node,
                           const wolf::core::virtual_display::DisplayMode &display_mode,
                           std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                           std::shared_ptr<boost::promise<WaylandDisplayReady>> on_ready,
                           std::shared_ptr<events::EventBusType> event_bus) {
+  if (!run_scope)
+    return;
+  const auto session_id = run_scope.id();
   auto pipeline = fmt::format("waylanddisplaysrc name=wolf_wayland_source render_node={render_node} ! "
                               "{buffer_format}, width={width}, height={height}, framerate={fps}/1 ! \n"    //
                               "interpipesink sync=true async=false name={session_id}_video max-buffers=1", //
                               fmt::arg("buffer_format", buffer_format),
                               fmt::arg("render_node", render_node),
-                              fmt::arg("session_id", session_id),
+                              fmt::arg("session_id", run_scope.resource_key()),
                               fmt::arg("width", display_mode.width),
                               fmt::arg("height", display_mode.height),
                               fmt::arg("fps", display_mode.refreshRate));
@@ -125,27 +129,34 @@ void start_video_producer(const std::string &session_id,
     gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
     gst_object_unref(bus);
 
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (std::to_string(ev->session_id) == session_id) {
+    auto stop_handler = event_bus->register_handler<immer::box<events::GameStopRequest>>(
+        [session_id, run_scope, pipeline](const immer::box<events::GameStopRequest> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
             logs::log(logs::debug, "[GSTREAMER] Stopping video producer: {}", session_id);
             gst_element_send_event(pipeline.get(), gst_event_new_eos());
           }
         });
 
     auto stop_lobby_handler = event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-        [session_id, pipeline](const immer::box<events::StopLobbyEvent> &ev) {
-          if (ev->lobby_id == session_id) {
+        [session_id, run_scope, pipeline](const immer::box<events::StopLobbyEvent> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->lobby_id)) {
             logs::log(logs::debug, "[GSTREAMER] Stopping video producer: {}", session_id);
             gst_element_send_event(pipeline.get(), gst_event_new_eos());
           }
         });
 
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler), std::move(stop_lobby_handler)};
+    auto ended_handler = event_bus->register_handler<immer::box<events::RunEnded>>(
+        [run_scope, pipeline](const immer::box<events::RunEnded> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id))
+            gst_element_send_event(pipeline.get(), gst_event_new_eos());
+        });
+    return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler),
+                                                              std::move(stop_lobby_handler),
+                                                              std::move(ended_handler)};
   });
 }
 
-void start_audio_producer(const std::string &session_id,
+void start_audio_producer(const sessions::RunScope &run_scope,
                           const std::shared_ptr<events::EventBusType> &event_bus,
                           int channel_count,
                           const std::string &sink_name,
@@ -165,35 +176,46 @@ void start_audio_producer(const std::string &session_id,
     channel_mask = "";
   }
 
-  auto pipeline = fmt::format("pulsesrc device=\"{sink_name}\" server=\"{server_name}\" ! "                           //
+  if (!run_scope)
+    return;
+  const auto session_id = run_scope.id();
+  // MVP: send clocked silence per user request while real audio capture is disabled.
+  (void)sink_name;
+  (void)server_name;
+  auto pipeline = fmt::format("audiotestsrc is-live=true wave=silence ! "                                             //
                               "audio/x-raw, channels={channels}, channel-mask=(bitmask){channel_mask}, rate=48000 ! " //
                               "queue leaky=downstream max-size-buffers=3 ! "                                          //
                               "interpipesink name=\"{session_id}_audio\" sync=true async=false max-buffers=3",
-                              fmt::arg("session_id", session_id),
+                              fmt::arg("session_id", run_scope.resource_key()),
                               fmt::arg("channels", channel_count),
-                              fmt::arg("channel_mask", channel_mask),
-                              fmt::arg("sink_name", sink_name),
-                              fmt::arg("server_name", server_name));
+                              fmt::arg("channel_mask", channel_mask));
   logs::log(logs::debug, "[GSTREAMER] Starting audio producer: {}", pipeline);
 
   run_pipeline(pipeline, [=](auto pipeline) {
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (std::to_string(ev->session_id) == session_id) {
+    auto stop_handler = event_bus->register_handler<immer::box<events::GameStopRequest>>(
+        [session_id, run_scope, pipeline](const immer::box<events::GameStopRequest> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id)) {
             logs::log(logs::debug, "[GSTREAMER] Stopping audio producer: {}", session_id);
             gst_element_send_event(pipeline.get(), gst_event_new_eos());
           }
         });
 
     auto stop_lobby_handler = event_bus->register_handler<immer::box<events::StopLobbyEvent>>(
-        [session_id, pipeline](const immer::box<events::StopLobbyEvent> &ev) {
-          if (ev->lobby_id == session_id) {
+        [session_id, run_scope, pipeline](const immer::box<events::StopLobbyEvent> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->lobby_id)) {
             logs::log(logs::debug, "[GSTREAMER] Stopping video producer: {}", session_id);
             gst_element_send_event(pipeline.get(), gst_event_new_eos());
           }
         });
 
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler), std::move(stop_lobby_handler)};
+    auto ended_handler = event_bus->register_handler<immer::box<events::RunEnded>>(
+        [run_scope, pipeline](const immer::box<events::RunEnded> &ev) {
+          if (sessions::targets(run_scope, ev->run_scope.get(), ev->session_id))
+            gst_element_send_event(pipeline.get(), gst_event_new_eos());
+        });
+    return immer::array<immer::box<events::EventBusHandlers>>{std::move(stop_handler),
+                                                              std::move(stop_lobby_handler),
+                                                              std::move(ended_handler)};
   });
 }
 
@@ -342,14 +364,12 @@ static GstFlowReturn send_buffer_single(GstBuffer *buffer, UDPSink *udp_sink) {
   }
 }
 
-static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
+static GstFlowReturn on_new_sample(GstAppSink *appsink, UDPSink *udp_sink) {
   std::shared_ptr<GstSample> sample(gst_app_sink_pull_sample(appsink), gst_sample_unref);
   if (!sample) {
     logs::log(logs::warning, "Custom sink: failed to create sample");
     return GST_FLOW_ERROR;
   }
-
-  UDPSink *udp_sink = static_cast<UDPSink *>(user_data);
 
   if (GstBufferList *buffer_list = gst_sample_get_buffer_list(sample.get())) {
     return send_buffer_batched(buffer_list, udp_sink);
@@ -361,25 +381,37 @@ static GstFlowReturn on_new_sample(GstAppSink *appsink, gpointer user_data) {
   }
 }
 
-static void configure_appsink(GstElement *appsink, UDPSink *udp_sink) {
-  g_object_set(appsink, "emit-signals", FALSE, NULL);
-  g_object_set(appsink, "buffer-list", TRUE, NULL);
-
-  GstAppSinkCallbacks callbacks = {nullptr};
-  callbacks.new_sample = on_new_sample;
-  gst_app_sink_set_callbacks(GST_APP_SINK(appsink), &callbacks, udp_sink, nullptr);
-}
 } // namespace custom_sink
+
+static bool run_media_consumer(const std::string &description,
+                               ConsumerJob &job,
+                               std::size_t session_id,
+                               const sessions::RunScope &producer,
+                               const std::shared_ptr<custom_sink::UDPSink> &udp_sink,
+                               const std::shared_ptr<NeedContextData> &context = {}) {
+  detail::ConsumerMediaCallbacks callbacks;
+  callbacks.sample = [udp_sink](GstAppSink *sink) { return custom_sink::on_new_sample(sink, udp_sink.get()); };
+  if (context)
+    callbacks.context = [context](GstBus *bus, GstMessage *message) {
+      return bus_sync_handler(bus, message, context.get());
+    };
+  return detail::run_media_consumer(description, job, session_id, producer, callbacks);
+}
 
 /**
  * Start VIDEO pipeline
  */
-void start_streaming_video(immer::box<events::VideoSession> video_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
+bool start_streaming_video(immer::box<events::VideoSession> video_session,
+                           ConsumerJob &job,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<immer::atom<gst_video_context::gst_context_ptr>> video_context,
                            std::shared_ptr<udp::socket> video_socket) {
+  if (!job.connection.matches(video_session->connection_scope.get()) ||
+      !job.run.matches(video_session->run_scope.get()) || job.kind != ConsumerKind::Video ||
+      job.connection.id() != video_session->session_id || !video_session->producer_scope.get())
+    return false;
+
   auto [color_range, color_space] = get_color_params(video_session);
 
   auto pipeline = fmt::format(
@@ -413,102 +445,29 @@ void start_streaming_video(immer::box<events::VideoSession> video_session,
       }});
   std::shared_ptr<NeedContextData> ctx_data_ptr = std::make_shared<NeedContextData>(
       NeedContextData{.device_path = video_session->render_node, .gst_context = video_context});
-  run_pipeline(pipeline, [video_session, event_bus, udp_sink, ctx_data_ptr](auto pipeline) {
-    if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
-      logs::log(logs::debug, "Setting up wolf_udp_sink");
-      g_assert(GST_IS_APP_SINK(app_sink_el));
-      configure_appsink(app_sink_el, udp_sink.get());
-      gst_object_unref(app_sink_el);
-    }
-
-    auto bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline.get()));
-    gst_bus_set_sync_handler(bus, bus_sync_handler, ctx_data_ptr.get(), nullptr);
-    gst_object_unref(bus);
-
-    /*
-     * The force IDR event will be triggered by the control stream.
-     * We have to pass this back into the gstreamer pipeline
-     * in order to force the encoder to produce a new IDR packet
-     */
-    auto idr_handler = event_bus->register_handler<immer::box<events::IDRRequestEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::IDRRequestEvent> &ctrl_ev) {
-          if (ctrl_ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Forcing IDR");
-            // Force IDR event, see: https://github.com/centricular/gstwebrtc-demos/issues/186
-            // https://gstreamer.freedesktop.org/documentation/additional/design/keyframe-force.html?gi-language=c
-            wolf::core::gstreamer::send_message(
-                pipeline.get(),
-                gst_structure_new("GstForceKeyUnit", "all-headers", G_TYPE_BOOLEAN, TRUE, NULL));
-          }
-        });
-
-    auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
-          if (ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", sess_id);
-
-            /**
-             * Unfortunately here we can't just pause the pipeline,
-             * when a pipeline will be resumed there are a lot of breaking changes
-             * like:
-             *  - Client IP:PORT
-             *  - AES key and IV for encrypted payloads
-             *  - Client resolution, framerate, and encoding
-             *
-             *  The only solution is to kill the pipeline and re-create it again
-             * when a resume happens
-             */
-
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [sess_id = video_session->session_id,
-         pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == sess_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching video producer pipeline for {} to {}",
-                      sess_id,
-                      switch_ev->interpipe_src_id);
-            /* Grab a reference to the interpipesrc */
-            auto pipe_name = fmt::format("interpipesrc_{}_video", sess_id);
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
-              /* Perform the switch */
-              auto video_interpipe = fmt::format("{}_video", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", video_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get video interpipesrc for {}", sess_id);
-            }
-          }
-        });
-
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [sess_id = video_session->session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (ev->session_id == sess_id) {
-            logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", sess_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(idr_handler),
-                                                              std::move(pause_handler),
-                                                              std::move(switch_producer_handler),
-                                                              std::move(stop_handler)};
-  });
+  return run_media_consumer(pipeline,
+                            job,
+                            video_session->session_id,
+                            video_session->producer_scope.get(),
+                            udp_sink,
+                            ctx_data_ptr);
 }
 
 /**
  * Start AUDIO pipeline
  */
-void start_streaming_audio(immer::box<events::AudioSession> audio_session,
-                           const std::shared_ptr<events::EventBusType> &event_bus,
+bool start_streaming_audio(immer::box<events::AudioSession> audio_session,
+                           ConsumerJob &job,
                            std::string client_ip,
                            unsigned short client_port,
                            std::shared_ptr<udp::socket> audio_socket,
                            const std::string &sink_name,
                            const std::string &server_name) {
+  if (!job.connection.matches(audio_session->connection_scope.get()) ||
+      !job.run.matches(audio_session->run_scope.get()) || job.kind != ConsumerKind::Audio ||
+      job.connection.id() != audio_session->session_id || !audio_session->producer_scope.get())
+    return false;
+
   auto pipeline = fmt::format(
       fmt::runtime(audio_session->gst_pipeline),
       fmt::arg("session_id", audio_session->session_id),
@@ -533,67 +492,7 @@ void start_streaming_audio(immer::box<events::AudioSession> audio_session,
       .socket = audio_socket,
       .client_endpoint = std::make_shared<udp::endpoint>(boost::asio::ip::make_address(client_ip), client_port)});
 
-  run_pipeline(pipeline, [session_id = audio_session->session_id, udp_sink, event_bus](auto pipeline) {
-    if (auto app_sink_el = gst_bin_get_by_name(GST_BIN(pipeline.get()), "wolf_udp_sink")) {
-      logs::log(logs::debug, "Setting up wolf_udp_sink");
-      g_assert(GST_IS_APP_SINK(app_sink_el));
-      custom_sink::configure_appsink(app_sink_el, udp_sink.get());
-      gst_object_unref(app_sink_el);
-    }
-
-    auto pause_handler = event_bus->register_handler<immer::box<events::PauseStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::PauseStreamEvent> &ev) {
-          if (ev->session_id == session_id) {
-            logs::log(logs::debug, "[GSTREAMER] Pausing pipeline: {}", session_id);
-
-            /**
-             * Unfortunately here we can't just pause the pipeline,
-             * when a pipeline will be resumed there are a lot of breaking changes
-             * like:
-             *  - Client IP:PORT
-             *  - AES key and IV for encrypted payloads
-             *  - Client resolution, framerate, and encoding
-             *
-             *  The only solution is to kill the pipeline and re-create it again
-             * when a resume happens
-             */
-
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    auto switch_producer_handler = event_bus->register_handler<immer::box<events::SwitchStreamProducerEvents>>(
-        [session_id, pipeline](const immer::box<events::SwitchStreamProducerEvents> &switch_ev) {
-          if (switch_ev->session_id == session_id) {
-            logs::log(logs::debug,
-                      "[GSTREAMER] Switching audio producer for {} to {}",
-                      session_id,
-                      switch_ev->interpipe_src_id);
-
-            auto pipe_name = fmt::format("interpipesrc_{}_audio", session_id);
-            if (auto src = gst_bin_get_by_name(GST_BIN(pipeline.get()), pipe_name.c_str())) {
-              /* Perform the switch */
-              auto audio_interpipe = fmt::format("{}_audio", switch_ev->interpipe_src_id);
-              g_object_set(src, "listen-to", audio_interpipe.c_str(), nullptr);
-              gst_object_unref(src);
-            } else {
-              logs::log(logs::error, "[GSTREAMER] Failed to get audio interpipesrc for {}", session_id);
-            }
-          }
-        });
-
-    auto stop_handler = event_bus->register_handler<immer::box<events::StopStreamEvent>>(
-        [session_id, pipeline](const immer::box<events::StopStreamEvent> &ev) {
-          if (ev->session_id == session_id) {
-            logs::log(logs::debug, "[GSTREAMER] Stopping pipeline: {}", session_id);
-            gst_element_send_event(pipeline.get(), gst_event_new_eos());
-          }
-        });
-
-    return immer::array<immer::box<events::EventBusHandlers>>{std::move(pause_handler),
-                                                              std::move(switch_producer_handler),
-                                                              std::move(stop_handler)};
-  });
+  return run_media_consumer(pipeline, job, audio_session->session_id, audio_session->producer_scope.get(), udp_sink);
 }
 
 } // namespace streaming

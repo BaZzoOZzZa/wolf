@@ -1,0 +1,624 @@
+diff --git a/include/inputtino/checked_xbox.hpp b/include/inputtino/checked_xbox.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/inputtino/checked_xbox.hpp
+@@ -0,0 +1,131 @@
++#pragma once
++
++#include <inputtino/input.hpp>
++#include <linux/input.h>
++#include <array>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <optional>
++#include <thread>
++
++struct libevdev;
++
++namespace inputtino::checked {
++
++// Fresh allocation retained by commands; numeric fd/device names are not authority.
++class DeviceGeneration {
++    struct Epoch { };
++    std::shared_ptr<const Epoch> epoch_;
++    explicit DeviceGeneration(std::shared_ptr<const Epoch> epoch)
++        : epoch_(std::move(epoch))
++    { }
++    friend class Xbox;
++
++public:
++    DeviceGeneration() = default;
++    bool matches(const DeviceGeneration& other) const
++    {
++        return epoch_ && other.epoch_ && epoch_ == other.epoch_;
++    }
++};
++
++struct Frame {
++    uint32_t buttons = 0;
++    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
++    uint8_t lt = 0, rt = 0;
++};
++using EncodedFrame = std::array<input_event, 20>;
++EncodedFrame encode(const Frame& frame);
++
++enum class WriteOutcome { KernelFrameAccepted, Rejected, Failed, Unknown };
++enum class WriteError {
++    None,
++    Generation,
++    MissingDevice,
++    Stopped,
++    Poisoned,
++    Io,
++    ShortWrite,
++    Exception,
++    Buttons
++};
++struct WriteReceipt {
++    WriteOutcome outcome = WriteOutcome::Rejected;
++    WriteError reason = WriteError::None;
++    DeviceGeneration generation;
++    size_t accepted_events = 0;
++    size_t attempted_events = 0;
++    int error = 0;
++    uint64_t sequence = 0;
++};
++struct IoResult {
++    std::ptrdiff_t count;
++    int error = 0; // captured immediately at syscall boundary
++};
++
++namespace detail {
++// Actual pre-publication descriptor; allocation only, no device open.
++std::shared_ptr<libevdev> xbox_descriptor(const DeviceDefinition& definition);
++// Narrow production syscall boundary, also used by device-free tests. No default
++// fallbacks in adopt(): every function must be supplied. Factory has std::thread's
++// all-or-nothing contract: throwing means no thread was started.
++struct Io {
++    std::function<IoResult(int, const input_event&, size_t)> write;
++    std::function<IoResult(int, int)> poll;
++    std::function<IoResult(int, input_event&, size_t)> read;
++    std::function<int(int, unsigned long, void*)> ioctl;
++    std::function<std::chrono::steady_clock::time_point()> now;
++};
++struct Device {
++    std::shared_ptr<void> owner; // retains the actual uinput handle, not a borrowed fd
++    int fd = -1;
++};
++using ThreadFactory = std::function<std::thread(std::function<void()>)>;
++} // namespace detail
++
++enum class Retirement { Retired, Unknown, WrongThread };
++struct ListenerStatus {
++    bool failed;
++    bool stop_requested;
++};
++
++// Additive API. Legacy Joypad and BaseJoypadState are intentionally untouched.
++// Only create() opens a device; no factory is called at library load. Methods
++// serialize writes; destruction/retire belong to the creating owner thread, never
++// the feedback callback. Unknown requires retaining this object (no replacement).
++class Xbox {
++public:
++    using Feedback = std::function<void(int low, int high)>;
++    static std::unique_ptr<Xbox> create(
++        const DeviceDefinition& definition, Feedback feedback);
++    static std::unique_ptr<Xbox> adopt(
++        detail::Device device,
++        detail::Io io,
++        Feedback feedback,
++        detail::ThreadFactory start);
++    ~Xbox(); // cancellation + actual join; may block, never detach or force-close
++    Xbox(const Xbox&) = delete;
++    Xbox& operator=(const Xbox&) = delete;
++    DeviceGeneration generation() const;
++    WriteReceipt apply(const DeviceGeneration& expected, const Frame& frame);
++    // Explicit repair attempt; success does NOT clear sticky failure/admit an owner.
++    WriteReceipt neutral(const DeviceGeneration& expected);
++    std::optional<Frame> last_confirmed() const;
++    ListenerStatus listener_status() const;
++    void request_stop() noexcept;
++    Retirement retire_until(std::chrono::steady_clock::time_point deadline);
++
++private:
++    struct State;
++    std::shared_ptr<State> state_;
++    std::thread thread_;
++    const std::thread::id owner_ = std::this_thread::get_id();
++    explicit Xbox(std::shared_ptr<State> state);
++    static void listen(const std::shared_ptr<State>& state) noexcept;
++    WriteReceipt write(
++        const DeviceGeneration& expected, const Frame& frame, bool repair);
++};
++} // namespace inputtino::checked
+diff --git a/src/uinput/checked_xbox.cpp b/src/uinput/checked_xbox.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/uinput/checked_xbox.cpp
+@@ -0,0 +1,483 @@
++#include <inputtino/checked_xbox.hpp>
++
++#include <fcntl.h>
++#include <inputtino/protected_types.hpp>
++#include <linux/uinput.h>
++#include <poll.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <condition_variable>
++#include <limits>
++#include <map>
++#include <mutex>
++#include <stdexcept>
++
++namespace inputtino::checked {
++namespace {
++constexpr uint32_t supported_buttons = 0xf7ff;
++constexpr int poll_ms = 10;
++using Clock = std::chrono::steady_clock;
++IoResult result(std::ptrdiff_t n)
++{
++    return {n, n < 0 ? errno : 0};
++}
++} // namespace
++
++std::shared_ptr<libevdev> detail::xbox_descriptor(const DeviceDefinition& device)
++{
++    std::shared_ptr<libevdev> dev(libevdev_new(), libevdev_free);
++    if (!dev)
++        throw std::bad_alloc();
++    libevdev_set_name(dev.get(), device.name.c_str());
++    libevdev_set_id_vendor(dev.get(), device.vendor_id);
++    libevdev_set_id_product(dev.get(), device.product_id);
++    libevdev_set_id_version(dev.get(), device.version);
++    libevdev_set_id_bustype(dev.get(), BUS_USB);
++
++    auto require_capability = [](int status) {
++        if (status < 0)
++            throw std::runtime_error(
++                "Checked Xbox descriptor capability failed");
++    };
++    require_capability(libevdev_enable_event_type(dev.get(), EV_KEY));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_WEST, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_EAST, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_NORTH, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SOUTH, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBL, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_THUMBR, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TR, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_TL, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_SELECT, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_MODE, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_KEY, BTN_START, nullptr));
++
++    require_capability(libevdev_enable_event_type(dev.get(), EV_ABS));
++
++    input_absinfo dpad{0, -1, 1, 0, 0, 0};
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0Y, &dpad));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_HAT0X, &dpad));
++
++    input_absinfo stick{0, -32768, 32767, 16, 128, 0};
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_X, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RX, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Y, &stick));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RY, &stick));
++
++    input_absinfo trigger{0, 0, 255, 0, 0, 0};
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_Z, &trigger));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_ABS, ABS_RZ, &trigger));
++
++    require_capability(libevdev_enable_event_type(dev.get(), EV_FF));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_FF, FF_RUMBLE, nullptr));
++    require_capability(
++        libevdev_enable_event_code(dev.get(), EV_FF, FF_GAIN, nullptr));
++
++    return dev;
++}
++
++EncodedFrame encode(const Frame& f)
++{
++    EncodedFrame out{};
++    size_t i = 0;
++    auto event = [&](uint16_t type, uint16_t code, int value) {
++        out[i].type = type;
++        out[i].code = code;
++        out[i++].value = value;
++    };
++    const std::array<std::pair<uint32_t, uint16_t>, 11> buttons{
++        {{Joypad::START, BTN_START},
++         {Joypad::BACK, BTN_SELECT},
++         {Joypad::LEFT_STICK, BTN_THUMBL},
++         {Joypad::RIGHT_STICK, BTN_THUMBR},
++         {Joypad::LEFT_BUTTON, BTN_TL},
++         {Joypad::RIGHT_BUTTON, BTN_TR},
++         {Joypad::HOME, BTN_MODE},
++         {Joypad::A, BTN_SOUTH},
++         {Joypad::B, BTN_EAST},
++         {Joypad::X, BTN_NORTH},
++         {Joypad::Y, BTN_WEST}}};
++    for (auto [flag, code]: buttons)
++        event(EV_KEY, code, (f.buttons & flag) != 0);
++    event(
++        EV_ABS,
++        ABS_HAT0X,
++        f.buttons & Joypad::DPAD_LEFT
++            ? -1
++            : (f.buttons & Joypad::DPAD_RIGHT ? 1 : 0));
++    event(
++        EV_ABS,
++        ABS_HAT0Y,
++        f.buttons & Joypad::DPAD_UP ? -1
++                                    : (f.buttons & Joypad::DPAD_DOWN ? 1 : 0));
++    event(EV_ABS, ABS_X, f.lx);
++    event(EV_ABS, ABS_Y, std::clamp(-static_cast<int>(f.ly), -32768, 32767));
++    event(EV_ABS, ABS_RX, f.rx);
++    event(EV_ABS, ABS_RY, std::clamp(-static_cast<int>(f.ry), -32768, 32767));
++    event(EV_ABS, ABS_Z, f.lt);
++    event(EV_ABS, ABS_RZ, f.rt);
++    event(EV_SYN, SYN_REPORT, 0);
++    return out;
++}
++
++struct Xbox::State {
++    detail::Device device;
++    detail::Io io;
++    Feedback feedback; // immutable from BEFORE thread launch until worker cleanup
++    DeviceGeneration generation{
++        std::make_shared<const DeviceGeneration::Epoch>()};
++    mutable std::mutex writes;
++    std::optional<Frame> confirmed;
++    uint64_t sequence = 0;
++    bool poisoned = false;
++    std::atomic_bool stop{false};
++    std::atomic_bool failed{false};
++    std::mutex completion_mutex;
++    std::condition_variable completion;
++    bool done = false;
++    State(detail::Device d, detail::Io ops, Feedback callback)
++        : device(std::move(d))
++        , io(std::move(ops))
++        , feedback(std::move(callback))
++    { }
++};
++Xbox::Xbox(std::shared_ptr<State> state) : state_(std::move(state)) { }
++
++std::unique_ptr<Xbox> Xbox::adopt(
++    detail::Device device,
++    detail::Io io,
++    Feedback feedback,
++    detail::ThreadFactory start)
++{
++    if (!device.owner || device.fd < 0 || !io.write || !io.poll || !io.read ||
++        !io.ioctl || !io.now || !feedback || !start)
++        throw std::invalid_argument(
++            "Checked Xbox requires an owned device and complete IO/callback/factory");
++    auto state = std::make_shared<State>(
++        std::move(device), std::move(io), std::move(feedback));
++    auto xbox = std::unique_ptr<Xbox>(new Xbox(state));
++    xbox->thread_ = start([state] { listen(state); });
++    if (!xbox->thread_.joinable())
++        throw std::runtime_error(
++            "Checked Xbox factory returned no owned thread");
++    return xbox;
++}
++std::unique_ptr<Xbox> Xbox::create(
++    const DeviceDefinition& definition, Feedback feedback)
++{
++    auto descriptor = detail::xbox_descriptor(definition);
++    libevdev_uinput* raw = nullptr;
++    if (libevdev_uinput_create_from_device(
++            descriptor.get(), LIBEVDEV_UINPUT_OPEN_MANAGED, &raw) != 0)
++        throw std::runtime_error("Checked Xbox device creation failed");
++    libevdev_uinput_ptr handle(raw, libevdev_uinput_destroy);
++    const int fd = libevdev_uinput_get_fd(handle.get());
++    const int flags = fcntl(fd, F_GETFL);
++    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
++        throw std::runtime_error("Checked Xbox cannot set nonblocking IO");
++    detail::Io io{
++        [](int fd, const input_event& ev, size_t bytes) {
++            return checked::result(::write(fd, &ev, bytes));
++        },
++        [](int fd, int timeout) {
++            pollfd p{fd, POLLIN, 0};
++            auto r = checked::result(::poll(&p, 1, timeout));
++            if (r.count > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL)))
++                return IoResult{-1, EIO};
++            return r;
++        },
++        [](int fd, input_event& ev, size_t bytes) {
++            return checked::result(::read(fd, &ev, bytes));
++        },
++        [](int fd, unsigned long op, void* arg) {
++            return ::ioctl(fd, op, arg);
++        },
++        [] { return Clock::now(); }};
++    return adopt(
++        {std::move(handle), fd},
++        std::move(io),
++        std::move(feedback),
++        [](std::function<void()> work) { return std::thread(std::move(work)); });
++}
++Xbox::~Xbox()
++{
++    request_stop();
++    if (thread_.joinable())
++        thread_.join(); // owner contract; destructor is not a bounded drain operation
++}
++DeviceGeneration Xbox::generation() const
++{
++    return state_->generation;
++}
++void Xbox::request_stop() noexcept
++{
++    state_->stop.store(true);
++}
++ListenerStatus Xbox::listener_status() const
++{
++    return {state_->failed.load(), state_->stop.load()};
++}
++std::optional<Frame> Xbox::last_confirmed() const
++{
++    std::lock_guard lock(state_->writes);
++    return state_->confirmed;
++}
++WriteReceipt Xbox::apply(const DeviceGeneration& expected, const Frame& frame)
++{
++    return write(expected, frame, false);
++}
++WriteReceipt Xbox::neutral(const DeviceGeneration& expected)
++{
++    return write(expected, {}, true);
++}
++WriteReceipt Xbox::write(
++    const DeviceGeneration& expected, const Frame& frame, bool repair)
++{
++    auto& s = *state_;
++    std::lock_guard lock(s.writes);
++    WriteReceipt r;
++    r.generation = s.generation;
++    r.sequence = s.sequence;
++    if (!s.generation.matches(expected)) {
++        r.reason = WriteError::Generation;
++        return r;
++    }
++    if (s.stop.load()) {
++        r.reason = WriteError::Stopped;
++        return r;
++    }
++    if (!s.device.owner || s.device.fd < 0) {
++        r.reason = WriteError::MissingDevice;
++        return r;
++    }
++    if (frame.buttons & ~supported_buttons) {
++        r.reason = WriteError::Buttons;
++        return r;
++    }
++    if ((!repair && s.poisoned) ||
++        s.sequence == std::numeric_limits<uint64_t>::max()) {
++        r.reason = WriteError::Poisoned;
++        return r;
++    }
++    const auto encoded = encode(frame);
++    for (const auto& event: encoded) {
++        ++r.attempted_events;
++        try {
++            const auto written = s.io.write(s.device.fd, event, sizeof(event));
++            if (written.count != sizeof(event)) {
++                s.poisoned = true;
++                r.outcome = written.count < 0 ? WriteOutcome::Failed
++                                              : WriteOutcome::Unknown;
++                r.reason = written.count < 0 ? WriteError::Io
++                                             : WriteError::ShortWrite;
++                r.error = written.error;
++                return r;
++            }
++        } catch (...) {
++            s.poisoned = true;
++            r.outcome = WriteOutcome::Unknown;
++            r.reason = WriteError::Exception;
++            return r;
++        }
++        ++r.accepted_events;
++    }
++    s.confirmed = frame;
++    r.sequence = ++s.sequence;
++    r.outcome = WriteOutcome::KernelFrameAccepted;
++    return r;
++}
++
++void Xbox::listen(const std::shared_ptr<State>& s) noexcept
++{
++    try {
++        struct Effect {
++            ff_effect data{};
++            int64_t anchor_ms = 0;
++            uint32_t remaining = 0;
++            // Millisecond relative scheduling avoids time_point + deadline overflow.
++            // Skip elapsed repetitions in O(1), never replay missed physical pulses.
++            bool sample(int64_t now_ms)
++            {
++                if (!remaining || now_ms < anchor_ms)
++                    return false;
++                uint64_t elapsed = uint64_t(now_ms) - uint64_t(anchor_ms);
++                const uint64_t delay = data.replay.delay,
++                               length = data.replay.length;
++                if (!length)
++                    return elapsed >= delay; // continuous until explicit stop
++                const uint64_t period = delay + length;
++                const uint64_t cycles = elapsed / period;
++                if (cycles >= remaining) {
++                    remaining = 0;
++                    return false;
++                }
++                // cycles < INT_MAX and period <= 131070: multiplication fits int64.
++                anchor_ms += static_cast<int64_t>(cycles * period);
++                remaining -= static_cast<uint32_t>(cycles);
++                elapsed %= period;
++                return elapsed >= delay;
++            }
++        };
++        const auto time_ms = [&] {
++            return std::chrono::duration_cast<std::chrono::milliseconds>(
++                       s->io.now().time_since_epoch())
++                .count();
++        };
++        std::map<int, Effect> effects;
++        int gain = 0xffff;
++        std::pair<int, int> previous{0, 0};
++        while (!s->stop.load()) {
++            const auto ready = s->io.poll(s->device.fd, poll_ms);
++            if (s->stop.load())
++                break;
++            if (ready.count < 0) {
++                if (ready.error == EINTR)
++                    continue;
++                throw std::runtime_error("Checked Xbox feedback poll failed");
++            }
++            if (ready.count > 0) {
++                input_event ev{};
++                const auto read = s->io.read(s->device.fd, ev, sizeof(ev));
++                if (read.count < 0 &&
++                    (read.error == EAGAIN || read.error == EINTR))
++                    continue;
++                if (read.count != sizeof(ev))
++                    throw std::runtime_error(
++                        "Checked Xbox feedback read failed");
++                if (ev.type == EV_UINPUT && ev.code == UI_FF_UPLOAD) {
++                    uinput_ff_upload upload{};
++                    upload.request_id = ev.value;
++                    if (s->io.ioctl(s->device.fd, UI_BEGIN_FF_UPLOAD, &upload) <
++                        0)
++                        throw std::runtime_error(
++                            "Checked Xbox feedback upload failed");
++                    // This new backend deliberately supports FF_RUMBLE only. Unsupported
++                    // effects are explicitly refused; legacy effect emulation is untouched.
++                    upload.retval = -EINVAL;
++                    if (upload.effect.type == FF_RUMBLE &&
++                        (effects.count(upload.effect.id) ||
++                         effects.size() < 16)) {
++                        upload.retval = 0;
++                        try {
++                            auto [it, inserted] =
++                                effects.try_emplace(upload.effect.id);
++                            auto& effect = it->second;
++                            const auto now_ms = time_ms();
++                            effect.sample(
++                                now_ms); // account for elapsed repetitions before update
++                            effect.data = upload.effect;
++                            // Linux v6.12 ml_ff_upload: restart timing of a started effect,
++                            // retaining its remaining count; an expired effect stays stopped.
++                            if (effect.remaining)
++                                effect.anchor_ms = now_ms;
++                        } catch (...) {
++                            upload.retval = -ENOMEM;
++                            s->io.ioctl(s->device.fd, UI_END_FF_UPLOAD, &upload);
++                            throw;
++                        }
++                    }
++                    if (s->io.ioctl(s->device.fd, UI_END_FF_UPLOAD, &upload) < 0)
++                        throw std::runtime_error(
++                            "Checked Xbox feedback upload completion failed");
++                } else if (ev.type == EV_UINPUT && ev.code == UI_FF_ERASE) {
++                    uinput_ff_erase erase{};
++                    erase.request_id = ev.value;
++                    if (s->io.ioctl(s->device.fd, UI_BEGIN_FF_ERASE, &erase) < 0)
++                        throw std::runtime_error(
++                            "Checked Xbox feedback erase failed");
++                    effects.erase(erase.effect_id);
++                    erase.retval = 0;
++                    if (s->io.ioctl(s->device.fd, UI_END_FF_ERASE, &erase) < 0)
++                        throw std::runtime_error(
++                            "Checked Xbox feedback erase completion failed");
++                } else if (ev.type == EV_FF && ev.code == FF_GAIN) {
++                    gain = std::clamp(ev.value, 0, 0xffff);
++                } else if (ev.type == EV_FF) {
++                    auto it = effects.find(ev.code);
++                    if (it != effects.end()) {
++                        auto& e = it->second;
++                        e.remaining =
++                            ev.value > 0 ? static_cast<uint32_t>(ev.value) : 0;
++                        e.anchor_ms = time_ms();
++                    }
++                }
++            }
++            const auto now_ms = time_ms();
++            uint64_t low = 0, high = 0;
++            for (auto& [id, effect]: effects) {
++                if (effect.sample(now_ms)) {
++                    // Gain precedes saturation, as in Linux's rumble mixer.
++                    low += uint64_t(effect.data.u.rumble.strong_magnitude) *
++                           gain / 0xffff;
++                    high += uint64_t(effect.data.u.rumble.weak_magnitude) *
++                            gain / 0xffff;
++                }
++            }
++            std::pair<int, int> current{
++                static_cast<int>(std::min<uint64_t>(low, 0xffff)),
++                static_cast<int>(std::min<uint64_t>(high, 0xffff))};
++            if (current != previous && !s->stop.load()) {
++                previous = current;
++                auto callback =
++                    s->feedback; // immutable, captured before invocation
++                callback(current.first, current.second);
++            }
++        }
++    } catch (...) {
++        s->failed.store(true);
++    }
++    s->stop.store(true);
++    // Cleanup is owned work too: a stuck write, callback or device destructor keeps
++    // done=false, so the owner can decide Unknown without detaching/reusing it.
++    {
++        std::lock_guard lock(s->writes);
++        s->feedback = {};
++        s->io = {};
++        s->device = {};
++    }
++    {
++        std::lock_guard lock(s->completion_mutex);
++        s->done = true;
++    }
++    s->completion.notify_all();
++}
++Retirement Xbox::retire_until(Clock::time_point deadline)
++{
++    if (std::this_thread::get_id() != owner_)
++        return Retirement::WrongThread;
++    request_stop();
++    {
++        std::unique_lock lock(state_->completion_mutex);
++        if (!state_->completion.wait_until(lock, deadline, [&] {
++                return state_->done;
++            }))
++            return Retirement::Unknown;
++    }
++    if (thread_.joinable())
++        thread_.join();
++    return Retirement::Retired;
++}
++} // namespace inputtino::checked

@@ -143,8 +143,8 @@ bool write_to_disk(pkey_ptr pkey, std::string_view pkey_filename, x509_ptr x509,
 }
 
 bool cert_exists(std::string_view pkey_filename, std::string_view cert_filename) {
-  std::fstream pkey_fs(pkey_filename.data());
-  std::fstream cert_fs(cert_filename.data());
+  std::ifstream pkey_fs(pkey_filename.data());
+  std::ifstream cert_fs(cert_filename.data());
   return pkey_fs.good() && cert_fs.good();
 }
 
@@ -199,57 +199,33 @@ std::string get_cert_public_key(x509_ptr cert) {
 }
 
 /**
- * @brief: adapted from Sunshine
- */
-static int openssl_verify_cb(int ok, X509_STORE_CTX *ctx) {
-  int err_code = X509_STORE_CTX_get_error(ctx);
-
-  switch (err_code) {
-  // TODO: Checking for X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY is a temporary workaround to get
-  // moonlight-embedded to work on the raspberry pi
-  case X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY:
-    return 1;
-
-  // Expired or not-yet-valid certificates are fine. Sometimes Moonlight is running on embedded devices
-  // that don't have accurate clocks (or haven't yet synchronized by the time Moonlight first runs).
-  // This behavior also matches what GeForce Experience does.
-  case X509_V_ERR_CERT_NOT_YET_VALID:
-  case X509_V_ERR_CERT_HAS_EXPIRED:
-    return 1;
-
-  default:
-    return ok;
-  }
-}
-
-/**
- * @brief: adapted from Sunshine
+ * Pairing pins a leaf certificate, not a CA. TLS proves possession of its key;
+ * application authorization must match the exact certificate that was paired.
+ * Do not use chain validation here: another leaf signed by a paired CA is not
+ * that paired identity. Certificate dates are intentionally irrelevant, as in
+ * Moonlight/GFE (clients may have an inaccurate clock).
  */
 std::optional<std::string> verification_error(x509_ptr paired_cert, x509_ptr untrusted_cert) {
-  auto x509_store{X509_STORE_new()};
-  X509_STORE_add_cert(x509_store, paired_cert.get());
-
-  auto _cert_ctx{X509_STORE_CTX_new()};
-
-  X509_STORE_CTX_init(_cert_ctx, x509_store, untrusted_cert.get(), nullptr);
-  X509_STORE_CTX_set_verify_cb(_cert_ctx, openssl_verify_cb);
-
-  // We don't care to validate the entire chain for the purposes of client auth.
-  // Some versions of clients forked from Moonlight Embedded produce client certs
-  // that OpenSSL doesn't detect as self-signed due to some X509v3 extensions.
-  X509_STORE_CTX_set_flags(_cert_ctx, X509_V_FLAG_PARTIAL_CHAIN);
-
-  auto err = X509_verify_cert(_cert_ctx);
-  X509_STORE_free(x509_store);
-
-  if (err == 1) {
-    X509_STORE_CTX_free(_cert_ctx);
-    return std::nullopt;
+  if (!paired_cert || !untrusted_cert) {
+    return "Missing paired or presented certificate";
   }
-
-  int err_code = X509_STORE_CTX_get_error(_cert_ctx);
-  X509_STORE_CTX_free(_cert_ctx);
-  return X509_verify_cert_error_string(err_code);
+  // Compare complete DER, not a cached fingerprint or the signing key alone.
+  auto der = [](X509 *cert) -> std::optional<std::string> {
+    auto size = i2d_X509(cert, nullptr);
+    if (size <= 0)
+      return std::nullopt;
+    std::string bytes(size, '\0');
+    auto data = reinterpret_cast<unsigned char *>(bytes.data());
+    if (i2d_X509(cert, &data) != size)
+      return std::nullopt;
+    return bytes;
+  };
+  auto paired_der = der(paired_cert.get());
+  auto presented_der = der(untrusted_cert.get());
+  if (!paired_der || !presented_der || *paired_der != *presented_der) {
+    return "Presented certificate does not match the paired identity";
+  }
+  return std::nullopt;
 }
 
 } // namespace x509

@@ -21,6 +21,8 @@
 #include <gst-plugin/gstrtpmoonlightpay_audio.hpp>
 #include <gst/base/gstbasetransform.h>
 #include <gst/gst.h>
+#include <memory>
+#include <utility>
 
 GST_DEBUG_CATEGORY_STATIC(gst_rtp_moonlight_pay_audio_debug_category);
 #define GST_CAT_DEFAULT gst_rtp_moonlight_pay_audio_debug_category
@@ -137,19 +139,35 @@ static void gst_rtp_moonlight_pay_audio_class_init(gst_rtp_moonlight_pay_audioCl
 }
 
 static void gst_rtp_moonlight_pay_audio_init(gst_rtp_moonlight_pay_audio *rtpmoonlightpay_audio) {
+  // GObject allocates C storage; it does not run C++ member constructors.
+  std::construct_at(&rtpmoonlightpay_audio->aes_key);
+  std::construct_at(&rtpmoonlightpay_audio->aes_iv);
+  std::construct_at(&rtpmoonlightpay_audio->rs);
   rtpmoonlightpay_audio->cur_seq_number = 0;
 
   rtpmoonlightpay_audio->encrypt = true;
+  rtpmoonlightpay_audio->encrypt_failed = false;
 
   rtpmoonlightpay_audio->packet_duration = 5;
-  rtpmoonlightpay_audio->packets_buffer = new unsigned char *[AUDIO_TOTAL_SHARDS];
-  for (int i = 0; i < AUDIO_TOTAL_SHARDS; i++) {
-    rtpmoonlightpay_audio->packets_buffer[i] = new unsigned char[AUDIO_MAX_BLOCK_SIZE];
+  // Keep partial allocation local until every shard and the RS owner exist.
+  try {
+    std::array<std::unique_ptr<unsigned char[]>, AUDIO_TOTAL_SHARDS> shards;
+    for (auto &shard : shards)
+      shard = std::make_unique<unsigned char[]>(AUDIO_MAX_BLOCK_SIZE);
+    auto matrix = std::make_unique<unsigned char *[]>(AUDIO_TOTAL_SHARDS);
+    auto rs = moonlight::fec::create(AUDIO_DATA_SHARDS, AUDIO_FEC_SHARDS);
+    if (!rs)
+      throw std::bad_alloc{};
+    memcpy(rs->p, AUDIO_FEC_PARITY, sizeof(AUDIO_FEC_PARITY));
+    for (int i = 0; i < AUDIO_TOTAL_SHARDS; ++i)
+      matrix[i] = shards[i].release();
+    rtpmoonlightpay_audio->packets_buffer = matrix.release();
+    rtpmoonlightpay_audio->rs = std::move(rs);
+  } catch (const std::exception &) {
+    // init has no failure return; keep a destructible, non-streaming instance.
+    rtpmoonlightpay_audio->packets_buffer = nullptr;
+    GST_ERROR_OBJECT(rtpmoonlightpay_audio, "Unable to allocate audio FEC state");
   }
-
-  auto rs = moonlight::fec::create(AUDIO_DATA_SHARDS, AUDIO_FEC_SHARDS);
-  memcpy(rs->p, AUDIO_FEC_PARITY, sizeof(AUDIO_FEC_PARITY));
-  rtpmoonlightpay_audio->rs = std::move(rs);
 }
 
 void gst_rtp_moonlight_pay_audio_set_property(GObject *object,
@@ -209,10 +227,11 @@ void gst_rtp_moonlight_pay_audio_dispose(GObject *object) {
   GST_DEBUG_OBJECT(rtpmoonlightpay_audio, "dispose");
 
   // free rtpmoonlightpay_audio->packets_buffer matrix
-  for (int i = 0; i < AUDIO_TOTAL_SHARDS; i++) {
-    delete[] rtpmoonlightpay_audio->packets_buffer[i];
+  if (auto matrix = std::exchange(rtpmoonlightpay_audio->packets_buffer, nullptr)) {
+    for (int i = 0; i < AUDIO_TOTAL_SHARDS; i++)
+      delete[] matrix[i];
+    delete[] matrix;
   }
-  delete[] rtpmoonlightpay_audio->packets_buffer;
 
   G_OBJECT_CLASS(gst_rtp_moonlight_pay_audio_parent_class)->dispose(object);
 }
@@ -222,6 +241,10 @@ void gst_rtp_moonlight_pay_audio_finalize(GObject *object) {
 
   GST_DEBUG_OBJECT(rtpmoonlightpay_audio, "finalize");
 
+  // finalize runs once; dispose may have run repeatedly while properties remain alive.
+  std::destroy_at(&rtpmoonlightpay_audio->rs);
+  std::destroy_at(&rtpmoonlightpay_audio->aes_iv);
+  std::destroy_at(&rtpmoonlightpay_audio->aes_key);
   G_OBJECT_CLASS(gst_rtp_moonlight_pay_audio_parent_class)->finalize(object);
 }
 
@@ -232,6 +255,7 @@ void gst_rtp_moonlight_pay_audio_finalize(GObject *object) {
 static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransform *trans, GstBuffer **outbuf) {
   gst_rtp_moonlight_pay_audio *rtpmoonlightpay_audio = gst_rtp_moonlight_pay_audio(trans);
   GstBuffer *inbuf;
+  *outbuf = nullptr;
 
   /* Retrieve stashed input buffer, if the default submit_input_buffer was run. Takes ownership back from there */
   inbuf = trans->queued_buf;
@@ -241,6 +265,18 @@ static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransfor
   if (inbuf == nullptr)
     return GST_FLOW_OK;
 
+  if (rtpmoonlightpay_audio->encrypt_failed ||
+      (rtpmoonlightpay_audio->encrypt && rtpmoonlightpay_audio->aes_key.size() != 16)) {
+    if (!rtpmoonlightpay_audio->encrypt_failed)
+      GST_ERROR_OBJECT(rtpmoonlightpay_audio, "Invalid AES-128 audio key length; refusing output");
+    rtpmoonlightpay_audio->encrypt_failed = true;
+    gst_buffer_unref(inbuf);
+    return GST_FLOW_ERROR;
+  }
+  if (!rtpmoonlightpay_audio->packets_buffer || !rtpmoonlightpay_audio->rs) {
+    gst_buffer_unref(inbuf);
+    return GST_FLOW_ERROR;
+  }
   auto rtp_packets = audio::split_into_rtp(rtpmoonlightpay_audio, inbuf);
 
   /* Send the generated packets to any downstream listener */
@@ -249,7 +285,6 @@ static GstFlowReturn gst_rtp_moonlight_pay_audio_generate_output(GstBaseTransfor
   gst_buffer_unref(inbuf);
 
   /* Setting outbuf to NULL and returning GST_BASE_TRANSFORM_FLOW_DROPPED will signal that we finished doing business */
-  outbuf = nullptr;
   return GST_BASE_TRANSFORM_FLOW_DROPPED;
 }
 

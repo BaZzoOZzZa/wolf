@@ -1,4 +1,5 @@
 #include <api/api.hpp>
+#include <boost/uuid/name_generator_sha1.hpp>
 #include <control/input_handler.hpp>
 #include <core/docker.hpp>
 #include <rtp/udp-ping.hpp>
@@ -10,11 +11,13 @@ namespace wolf::api {
 
 void UnixSocketServer::endpoint_Events(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   // curl -N --unix-socket /tmp/wolf.sock http://localhost/api/v1/events
-  state_->sockets.push_back(socket);
-  send_http(socket,
-            200,
-            {{"Content-Type: text/event-stream"}, {"Connection: keep-alive"}, {"Cache-Control: no-cache"}},
-            ""); // Inform clients this is going to be SS
+  boost::asio::dispatch(state_->strand, [this, socket] {
+    send_http(socket,
+              200,
+              {{"Content-Type: text/event-stream"}, {"Connection: keep-alive"}, {"Cache-Control: no-cache"}},
+              "");
+    state_->sockets.push_back(socket);
+  });
 }
 
 void UnixSocketServer::endpoint_PendingPairRequest(const HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
@@ -304,6 +307,8 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto video_session = start_req.value().video_session;
       video_session.session_id = session_id; // Can't be JSON encoded
+      video_session.connection_scope = session->connection_scope;
+      video_session.run_scope = session->run_scope;
       if (video_session.render_node.empty()) {
         video_session.render_node = session->app->render_node;
       }
@@ -311,12 +316,14 @@ void UnixSocketServer::endpoint_StreamSessionStart(const HTTPRequest &req, std::
 
       auto audio_session = start_req.value().audio_session;
       audio_session.session_id = session_id; // Can't be JSON encoded
+      audio_session.connection_scope = session->connection_scope;
+      audio_session.run_scope = session->run_scope;
       state_->app_state->event_bus->fire_event(immer::box<events::AudioSession>(audio_session));
 
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
     } else {
-      logs::log(logs::warning, "[API] Invalid session_id: {}", session.value().session_id);
+      logs::log(logs::warning, "[API] Invalid session_id: {}", session_id);
       auto res = GenericErrorResponse{.error = "Invalid session_id"};
       send_http(socket, 500, rfl::json::write(res));
     }
@@ -332,9 +339,9 @@ void UnixSocketServer::endpoint_StreamSessionPause(const HTTPRequest &req, std::
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
     auto session_id = std::stoul(session.value().session_id);
-    if (state::get_session_by_id(sessions.get(), session_id)) {
-      this->state_->app_state->event_bus->fire_event(
-          immer::box<events::PauseStreamEvent>(events::PauseStreamEvent{.session_id = session_id}));
+    if (auto target = state::get_session_by_id(sessions.get(), session_id)) {
+      this->state_->app_state->event_bus->fire_event(immer::box<events::PauseStreamEvent>(
+          events::PauseStreamEvent{.session_id = session_id, .connection_scope = target->connection_scope}));
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
     } else {
@@ -354,9 +361,9 @@ void UnixSocketServer::endpoint_StreamSessionStop(const HTTPRequest &req, std::s
   if (session) {
     auto sessions = state_->app_state->running_sessions->load();
     auto session_id = std::stoul(session.value().session_id);
-    if (state::get_session_by_id(sessions.get(), session_id)) {
-      this->state_->app_state->event_bus->fire_event(
-          immer::box<events::StopStreamEvent>(events::StopStreamEvent{.session_id = session_id}));
+    if (auto target = state::get_session_by_id(sessions.get(), session_id)) {
+      this->state_->app_state->event_bus->fire_event(immer::box<events::GameStopRequest>(
+          events::GameStopRequest{.session_id = std::to_string(session_id), .run_scope = target->run_scope}));
       auto res = GenericSuccessResponse{.success = true};
       send_http(socket, 200, rfl::json::write(res));
       return;
@@ -380,9 +387,10 @@ void UnixSocketServer::endpoint_StreamSessionHandleInput(const HTTPRequest &req,
     if (auto session = state::get_session_by_id(sessions.get(), session_id)) {
       auto hex_pkt = input_request.value().input_packet_hex.get();
       auto pkt_parsed = crypto::hex_to_str(hex_pkt);
-      control::INPUT_PKT *input_pkt = reinterpret_cast<control::INPUT_PKT *>(pkt_parsed.data());
-      control::handle_input(session.value(), {}, input_pkt);
-
+      if (!control::handle_input(session.value(), {}, std::string_view{pkt_parsed})) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid input packet"}));
+        return;
+      }
       send_http(socket, 200, rfl::json::write(GenericSuccessResponse{.success = true}));
     } else {
       logs::log(logs::warning, "[API] Invalid session_id: {}", input_request.value().session_id);
@@ -410,6 +418,17 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
     auto default_client_settings = state::ClientSettings{};
     auto client_settings = event.value().client_settings.value().value_or(PartialClientSettings{});
     auto lobby_id = state::gen_uuid();
+    if (auto key = req.headers.find("Idempotency-Key"); key != req.headers.end()) {
+      if (key->second.empty() || key->second.size() > 128 || req.headers.count("Idempotency-Key") != 1) {
+        send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid Idempotency-Key"}));
+        return;
+      }
+      // Stable opaque ID, scoped to the caller's profile. Changed payloads using
+      // the same key are rejected by the lifecycle fingerprint check.
+      boost::uuids::name_generator_sha1 generator(boost::uuids::ns::url());
+      lobby_id =
+          boost::uuids::to_string(generator(rfl::json::write(event.value().profile_id.get()) + "\n" + key->second));
+    }
     auto create_lobby_ev = events::CreateLobbyEvent{
         .id = lobby_id,
         .profile_id = event.value().profile_id.get(),
@@ -436,14 +455,24 @@ void UnixSocketServer::endpoint_LobbyCreate(const wolf::api::HTTPRequest &req, s
                     default_client_settings.motion_controller_override)},
         .runner_state_folder = event.value().runner_state_folder,
         .runner = state::get_runner(event.value().runner, this->state_->app_state->event_bus)};
-    // Fire the event
-    state_->app_state->event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create_lobby_ev));
-
     auto setup_over_future = create_lobby_ev.on_setup_over.get()->get_future();
+    state_->app_state->event_bus->fire_event(immer::box<events::CreateLobbyEvent>(create_lobby_ev));
     auto result = setup_over_future.wait_for(std::chrono::seconds(20));
     if (result == std::future_status::timeout) {
       logs::log(logs::warning, "[API] Lobby setup timed out");
-      send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = "Lobby setup timed out"}));
+      send_http(socket,
+                504,
+                rfl::json::write(
+                    GenericErrorResponse{.error = "Lobby setup timed out; launch remains reserved. Retry with the same "
+                                                  "Idempotency-Key or inspect /lobbies. Lobby ID: " +
+                                                  lobby_id}));
+    } else if (!setup_over_future.get()) {
+      send_http(socket,
+                409,
+                rfl::json::write(GenericErrorResponse{
+                    .error = "Lobby launch is pending, stopped, conflicts with an existing resource, "
+                             "or admission is exhausted. Lobby ID: " +
+                             lobby_id}));
     } else {
       auto res = LobbyCreateResponse{.lobby_id = lobby_id};
       send_http(socket, 200, rfl::json::write(res));
@@ -476,6 +505,14 @@ void UnixSocketServer::endpoint_LobbyJoin(const wolf::api::HTTPRequest &req, std
       return;
     }
     auto lobby_ev = event.value();
+    auto target = state::get_session_by_id(state_->app_state->running_sessions->load(), lobby_ev.moonlight_session_id);
+    auto lobby = state::get_lobby_by_id(lobbies.get(), lobby_ev.lobby_id);
+    if (!target || !lobby) {
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid lobby or session"}));
+      return;
+    }
+    lobby_ev.connection_scope = target->connection_scope;
+    lobby_ev.lobby_scope = lobby->run_scope;
     lobby_ev.error_message = std::make_shared<std::promise<std::string>>();
     state_->app_state->event_bus->fire_event(immer::box<events::JoinLobbyEvent>(lobby_ev));
 
@@ -499,7 +536,16 @@ void UnixSocketServer::endpoint_LobbyJoin(const wolf::api::HTTPRequest &req, std
 void UnixSocketServer::endpoint_LobbyLeave(const wolf::api::HTTPRequest &req, std::shared_ptr<UnixSocket> socket) {
   auto event = rfl::json::read<events::LeaveLobbyEvent>(req.body);
   if (event) {
-    state_->app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>(event.value()));
+    auto lobby = state::get_lobby_by_id(state_->app_state->lobbies->load(), event->lobby_id);
+    auto target = state::get_session_by_id(state_->app_state->running_sessions->load(), event->moonlight_session_id);
+    if (!target || !lobby) {
+      send_http(socket, 400, rfl::json::write(GenericErrorResponse{.error = "Invalid lobby or session"}));
+      return;
+    }
+    auto scoped = event.value();
+    scoped.lobby_scope = lobby->run_scope;
+    scoped.connection_scope = target->connection_scope;
+    state_->app_state->event_bus->fire_event(immer::box<events::LeaveLobbyEvent>(scoped));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());
@@ -515,7 +561,9 @@ void UnixSocketServer::endpoint_LobbyStop(const wolf::api::HTTPRequest &req, std
       send_http(socket, 500, rfl::json::write(GenericErrorResponse{.error = err.value()}));
       return;
     }
-    state_->app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(event.value()));
+    auto scoped = event.value();
+    scoped.run_scope = state::get_lobby_by_id(lobbies.get(), scoped.lobby_id)->run_scope;
+    state_->app_state->event_bus->fire_event(immer::box<events::StopLobbyEvent>(scoped));
     send_http(socket, 200, rfl::json::write(GenericSuccessResponse{}));
   } else {
     logs::log(logs::warning, "[API] Invalid event: {} - {}", req.body, event.error().what());

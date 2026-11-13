@@ -12,12 +12,16 @@ namespace crypto {
 std::string sha256(std::string_view str) {
   unsigned char md_value[EVP_MAX_MD_SIZE];
   unsigned int md_len;
-  auto mdctx = EVP_MD_CTX_new();
+  signature::EVP_MD_CTX_ptr mdctx(EVP_MD_CTX_new(), ::EVP_MD_CTX_free);
+  if (!mdctx)
+    handle_openssl_error("EVP_MD_CTX_new failed");
 
-  EVP_DigestInit_ex(mdctx, EVP_sha256(), nullptr);
-  EVP_DigestUpdate(mdctx, str.data(), str.size());
-  EVP_DigestFinal_ex(mdctx, md_value, &md_len);
-  EVP_MD_CTX_free(mdctx);
+  if (EVP_DigestInit_ex(mdctx.get(), EVP_sha256(), nullptr) != 1)
+    handle_openssl_error("EVP_DigestInit_ex failed");
+  if (EVP_DigestUpdate(mdctx.get(), str.data(), str.size()) != 1)
+    handle_openssl_error("EVP_DigestUpdate failed");
+  if (EVP_DigestFinal_ex(mdctx.get(), md_value, &md_len) != 1)
+    handle_openssl_error("EVP_DigestFinal_ex failed");
 
   std::stringstream ss;
   for (int i = 0; i < md_len; ++i) {
@@ -39,11 +43,13 @@ std::string str_to_hex(std::string_view input) {
 }
 
 std::string hex_to_str(std::string_view hex, bool reverse = true) {
+  if (hex.empty())
+    return {};
   std::string buf;
 
   static char constexpr shift_bit = 'a' - 'A';
   auto is_convertable = [](char ch) -> bool {
-    if (isdigit(ch)) {
+    if (isdigit(static_cast<unsigned char>(ch))) {
       return true;
     }
     ch |= shift_bit;
@@ -112,27 +118,34 @@ std::string aes_decrypt_cbc(std::string_view msg, std::string_view enc_key, std:
   return aes::decrypt_symmetric(ctx.get(), msg);
 }
 
+// Set the IV length before passing its memory to OpenSSL. Initialising with
+// the default (12-byte) IV first can overread a shorter caller-provided buffer.
+static aes::CIPHER_CTX_ptr
+gcm_context(std::string_view key, std::string_view iv, int iv_size, bool encrypt, bool padding) {
+  if (iv_size == -1)
+    iv_size = static_cast<int>(iv.size());
+  if (key.size() != 16 || iv_size <= 0 || static_cast<size_t>(iv_size) > iv.size())
+    throw std::runtime_error("Invalid AES-GCM key or IV length");
+  aes::CIPHER_CTX_ptr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
+  if (!ctx || EVP_CipherInit_ex(ctx.get(), EVP_aes_128_gcm(), nullptr, nullptr, nullptr, encrypt) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, iv_size, nullptr) != 1 ||
+      EVP_CipherInit_ex(ctx.get(),
+                        nullptr,
+                        nullptr,
+                        reinterpret_cast<const unsigned char *>(key.data()),
+                        reinterpret_cast<const unsigned char *>(iv.data()),
+                        encrypt) != 1 ||
+      EVP_CIPHER_CTX_set_padding(ctx.get(), padding) != 1)
+    handle_openssl_error("AES-GCM initialization failed");
+  return ctx;
+}
+
 std::pair<std::string, std::string> aes_encrypt_gcm(std::string_view msg,
                                                     std::string_view enc_key,
                                                     std::string_view iv = random(AES_BLOCK_SIZE),
                                                     int iv_size = -1,
                                                     bool padding = false) {
-  auto ctx = aes::init(EVP_aes_128_gcm(), enc_key, iv, false, padding);
-
-  if (iv_size != -1) {
-    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, iv_size, nullptr) != 1)
-      handle_openssl_error("EVP_CTRL_GCM_SET_IVLEN failed");
-
-    if (EVP_DecryptInit_ex(ctx.get(),
-                           nullptr,
-                           nullptr,
-                           (const std::uint8_t *)enc_key.data(),
-                           (const std::uint8_t *)iv.data()) != 1)
-      handle_openssl_error("EVP_DecryptInit_ex (2) failed");
-
-    EVP_CIPHER_CTX_set_padding(ctx.get(), padding);
-  }
-
+  auto ctx = gcm_context(enc_key, iv, iv_size, true, padding);
   return aes::encrypt_authenticated(ctx.get(), msg);
 }
 
@@ -142,22 +155,7 @@ std::string aes_decrypt_gcm(std::string_view msg,
                             std::string_view iv = random(AES_BLOCK_SIZE),
                             int iv_size = -1,
                             bool padding = false) {
-  auto ctx = aes::init(EVP_aes_128_gcm(), enc_key, iv, false, padding);
-
-  if (iv_size != -1) {
-    if (EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, iv_size, nullptr) != 1)
-      handle_openssl_error("EVP_CTRL_GCM_SET_IVLEN failed");
-
-    if (EVP_DecryptInit_ex(ctx.get(),
-                           nullptr,
-                           nullptr,
-                           (const std::uint8_t *)enc_key.data(),
-                           (const std::uint8_t *)iv.data()) != 1)
-      handle_openssl_error("EVP_DecryptInit_ex (2) failed");
-
-    EVP_CIPHER_CTX_set_padding(ctx.get(), padding);
-  }
-
+  auto ctx = gcm_context(enc_key, iv, iv_size, false, padding);
   return aes::decrypt_authenticated(ctx.get(), msg, tag);
 }
 
@@ -167,11 +165,13 @@ std::string sign(std::string_view msg, std::string_view private_key) {
 }
 
 bool verify(std::string_view msg, std::string_view signature, std::string_view public_key) {
-  auto p_key = signature::create_key(public_key, false);
-  if (!p_key) {
+  // An unparseable or unusable public key can't have produced a valid signature
+  try {
+    auto p_key = signature::create_key(public_key, false);
+    return signature::verify(msg, signature, p_key.get(), EVP_sha256());
+  } catch (const std::runtime_error &) {
     return false;
   }
-  return signature::verify(msg, signature, p_key.get(), EVP_sha256());
 }
 
 } // namespace crypto

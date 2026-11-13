@@ -67,25 +67,44 @@ FetchContent_Declare(
         # Forked from https://gitlab.com/eidheim/Simple-Web-Server in order to support latest boost
         # see: https://gitlab.com/eidheim/Simple-Web-Server/-/merge_requests/283
         GIT_REPOSITORY https://gitlab.com/ReenigneArcher/Simple-Web-Server.git
-        GIT_TAG 546895a9)
+        GIT_TAG 546895a93a29062bb178367b46c7afb72da9881e
+        PATCH_COMMAND ${CMAKE_COMMAND}
+            -DSIMPLEWEBSERVER_SOURCE_DIR=<SOURCE_DIR>
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/PatchSimpleWebBoost.cmake)
 FetchContent_MakeAvailable(simplewebserver)
 target_link_libraries_system(wolf_runner PUBLIC simple-web-server)
 
 # mDNS
 FetchContent_Declare(
         mdns_cpp
-        GIT_REPOSITORY https://github.com/games-on-whales/mdns_cpp.git)
+        GIT_REPOSITORY https://github.com/games-on-whales/mdns_cpp.git
+        # Exact revision used in the MWOW-6 qualified build (see docs/mwow/MWOW-10-build.md).
+        GIT_TAG 0d57ae3db73d94ab2e7ac0a799a9165c8a221c80)
 FetchContent_MakeAvailable(mdns_cpp)
 target_link_libraries_system(wolf_runner PUBLIC mdns_cpp::mdns_cpp)
 
 
 # Enet
+file(SHA256 "${PROJECT_SOURCE_DIR}/cmake/patches/enet-offsetof.patch" ENET_PATCH_REVISION)
 set(CMAKE_PROJECT_INCLUDE_BEFORE "${PROJECT_SOURCE_DIR}/cmake/EnableCMP0048.cmake")
 FetchContent_Declare(
         enet
         GIT_REPOSITORY https://github.com/cgutman/enet
-        GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf)
+        GIT_TAG 44c85e16279553d9c052e572bcbfcd745fb74abf
+        PATCH_COMMAND ${CMAKE_COMMAND}
+            -DENET_SOURCE_DIR=<SOURCE_DIR> -DENET_PATCH_REVISION=${ENET_PATCH_REVISION}
+            -P ${PROJECT_SOURCE_DIR}/cmake/PatchENetOffsetof.cmake)
 FetchContent_MakeAvailable(enet)
+if (FETCHCONTENT_SOURCE_DIR_ENET)
+    execute_process(COMMAND ${CMAKE_COMMAND}
+        -DENET_SOURCE_DIR=${enet_SOURCE_DIR} -DENET_VERIFY_ONLY=ON
+        -P ${PROJECT_SOURCE_DIR}/cmake/PatchENetOffsetof.cmake
+        COMMAND_ERROR_IS_FATAL ANY)
+endif ()
+if (BUILD_SHARED_LIBS)
+    # The pinned ENet builds a static archive consumed by the shared wolf_runner.
+    set_target_properties(enet PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif ()
 target_link_libraries_system(wolf_runner PUBLIC enet)
 unset(CMAKE_PROJECT_INCLUDE_BEFORE)
 
@@ -200,3 +219,7 @@ target_link_libraries(wolf wolf::runner
         #-static # enable to statically link all libraries
 )
 target_compile_features(wolf PRIVATE cxx_std_17)
+
+# Supervised direct-window pointing: owned checked XCB connection, no Xlib globals.
+pkg_check_modules(WOLF_DIRECT_XCB REQUIRED IMPORTED_TARGET xcb xcb-xtest xcb-xkb xkbcommon)
+target_link_libraries(wolf_runner PRIVATE PkgConfig::WOLF_DIRECT_XCB)

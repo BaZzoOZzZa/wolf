@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "profile_sha256": "745567f19566e8dfa0817b055b52af34995ecfc144860843a73a4fc02651839f",
+  "native_revision": "e1fdfd2e12b79bfd30e6a776478ead29ce958e67",
+  "config": {
+    "path": "/etc/wolf-wow/wolf.toml",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "image_contract": {
+    "path": "/etc/wolf-wow/image-contract.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "prefix_contract": {
+    "path": "/etc/wolf-wow/prefix-contract.json",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "private_key": "/etc/wolf-wow/server.key",
+  "certificate": "/etc/wolf-wow/server.crt",
+  "docker_socket": "/run/docker.sock",
+  "fake_udev": {
+    "path": "/srv/wolf-wow/state/fake-udev",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}

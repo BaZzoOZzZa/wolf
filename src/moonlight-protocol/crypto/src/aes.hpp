@@ -5,6 +5,8 @@
 #include <openssl/aes.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <stdexcept>
+#include <vector>
 
 namespace aes {
 using CIPHER_CTX_ptr = std::unique_ptr<EVP_CIPHER_CTX, decltype(&::EVP_CIPHER_CTX_free)>;
@@ -16,6 +18,8 @@ CIPHER_CTX_ptr init(const evp_cipher_st *chiper,
                     bool is_encryption,
                     bool padding = true) {
   CIPHER_CTX_ptr ctx(EVP_CIPHER_CTX_new(), ::EVP_CIPHER_CTX_free);
+  if (!ctx)
+    handle_openssl_error("EVP_CIPHER_CTX_new failed");
 
   if (is_encryption) {
     if (EVP_EncryptInit_ex(ctx.get(),
@@ -111,27 +115,30 @@ std::pair<std::string, std::string> encrypt_authenticated(EVP_CIPHER_CTX *ctx, s
 }
 
 std::string decrypt_authenticated(EVP_CIPHER_CTX *ctx, std::string_view ciphertext, std::string_view tag) {
+  if (tag.size() != AES_GCM_TAG_SIZE)
+    throw std::runtime_error("AES GCM tag must be exactly 16 bytes");
+
   int len;
   auto cipher_length = (int)ciphertext.length();
   /* plaintext will always be equal to or lesser than length of ciphertext*/
-  unsigned char plaintext[cipher_length];
+  std::vector<unsigned char> plaintext(cipher_length + AES_BLOCK_SIZE);
 
   /* allows reusing of 'ctx' for multiple encryption cycles */
   if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, nullptr, nullptr) != 1)
     handle_openssl_error("EVP_DecryptInit_ex failed");
 
-  if (EVP_DecryptUpdate(ctx, plaintext, &len, (const std::uint8_t *)ciphertext.data(), cipher_length) != 1)
+  if (EVP_DecryptUpdate(ctx, plaintext.data(), &len, (const std::uint8_t *)ciphertext.data(), cipher_length) != 1)
     handle_openssl_error("EVP_DecryptUpdate failed");
 
   if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, AES_GCM_TAG_SIZE, const_cast<char *>(tag.data())) != 1)
     handle_openssl_error("EVP_CTRL_GCM_SET_TAG failed");
 
   int plaintext_len = len;
-  if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) != 1)
+  if (EVP_DecryptFinal_ex(ctx, plaintext.data() + len, &len) != 1)
     handle_openssl_error("EVP_DecryptFinal_ex failed");
 
   plaintext_len += len;
-  return uc_to_str(plaintext, plaintext_len);
+  return uc_to_str(plaintext.data(), plaintext_len);
 }
 
 } // namespace aes

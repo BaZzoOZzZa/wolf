@@ -35,13 +35,20 @@ TEST_CASE("Docker API", "[DOCKER]") {
   REQUIRE(docker_api.start_by_id(first_container.value().id));
   REQUIRE(docker_api.stop_by_id(first_container.value().id));
 
-  // This should remove the first container and create a new one with the same name
-  auto second_container = docker_api.create(first_container.value(), R"({
+  // Default creation must preserve the existing instance, even when it is stopped.
+  REQUIRE(!docker_api.create(first_container.value()));
+  REQUIRE(docker_api.get_by_id(first_container->id).has_value());
+
+  // Destructive recreation requires an explicit administrative opt-in.
+  auto second_container = docker_api.create(first_container.value(),
+                                            R"({
     "Env": ["AN_ENV_VAR=true"],
     "HostConfig": {
       "IpcMode": "host"
     }
-  })");
+  })",
+                                            {},
+                                            true);
   REQUIRE(second_container.has_value());
   REQUIRE(first_container->id != second_container->id);
   REQUIRE(first_container->name == second_container->name);
