@@ -1,0 +1,48 @@
+{
+  "release": "mirror-wow-0.1.0",
+  "task": "MWOW-9",
+  "scope": "host-qualified silent MVP; source integration only",
+  "source": {
+    "base": "0e3710be36a6a7fa130f633b358d1b520a3cee9c",
+    "native": "feb3bace7ccb1e9ff459c5cf94924691a7bd61c4",
+    "rust": "9743bb30dfec1e181c1ea6f0708314cef7f127a2",
+    "image": "fb5b89f8123414e3455e4096ea198d8e33c68fca",
+    "develop_integration": "f2d44a6b32ec779e087f20eef307c85a287e6723"
+  },
+  "deployed_reported": {
+    "provenance": "accepted runtime checkpoint supplied by release owner; not remeasured during integration",
+    "guest_image_id": "sha256:2218657d347e907c4a899f4a2c82f6ae25cfd7f52cb78166f57d24bed4f54745",
+    "guest_base_image_id": "sha256:84719e0af05e1ee4720e1d6605aed0bf9c3d55d7ebf24e159aee355580632505",
+    "bundled_dll_files": 109,
+    "wolf_executable_sha256": "2d40042e03b30b6c0157f5a2c62e634292a086536a29384ebff2b79c05c39c5f",
+    "wolf_base_source": "e1fdfd2e12b79bfd30e6a776478ead29ce958e67",
+    "live_crypto_sha256": "05c2aefda65e8ec9f2289383619d4b5890fb99724f4b6b06ad89e20180144076",
+    "live_runner_sha256": "50d9439a2a94cfdc0881e2e05cb14c4cb442979755124348e42cf2dd6aa58790",
+    "installed_rust_sha256": "d80727055fb55bee989f67fefcf726331cff6b29af18e6f9af96b00385d29748",
+    "host_dso_loading": "RUNPATH; host-dependent shared objects required"
+  },
+  "operational_helper": {
+    "path": "tools/wolf-isolated/operations/launch-wow.py",
+    "sha256": "ea97771d4ddc98e27e6edcd9180a71ba35347215cecc6772767e0772442ee7a9",
+    "provenance": "byte-identical copy of release owner runtime-verified launch-wow-dxvk.py; filename only changed",
+    "accepted_invocation": "python3 tools/wolf-isolated/operations/launch-wow.py --dx11"
+  },
+  "qualification": {
+    "integrated_binary_build": false,
+    "new_tests_clippy_formal_review": "not run under explicit MVP waiver",
+    "physical_acceptance": "user accepted image and touch on iPad on current host",
+    "real_audio_capture_pass": false,
+    "other_machine_qualification": false,
+    "production_security_performance_gates": "not fully qualified",
+    "full_controller_compatibility_pass": false
+  },
+  "limitations": [
+    "Reconnect after closing/resuming Moonlight can collide with retained Docker name; controller single-CID epoch becomes Unknown; guarded operator archive and fresh epoch required.",
+    "Default Battle.net guest does not inherit DXVK override; direct WoW launch requires the operational helper.",
+    "Direct launch does not transfer the Battle.net authentication ticket; manual game authentication or normal Battle.net route required.",
+    "Battle.net updater observed CascLocked while WoW open; SSL libraries and CA are present; no established SSL root cause.",
+    "Silent mode only; no real audio capture PASS.",
+    "No other-machine qualification or production-grade claim.",
+    "After MVP acceptance, user reported Steam Deck LT/RT not working and no DualShock input; both connect by Bluetooth to iPad and are tested separately; cause unverified, separate investigation pending. No full controller PASS."
+  ]
+}
