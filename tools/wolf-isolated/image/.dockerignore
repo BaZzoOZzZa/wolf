@@ -1,0 +1,8 @@
+*
+!Dockerfile
+!package-db.sha256
+!packages.requested
+!guest.py
+!wine-session.py
+!approved-entrypoint
+!approved-wine.tar

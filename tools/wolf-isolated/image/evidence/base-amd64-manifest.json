@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:ad77cf4a18d84f94e1e678496f9f5a5f2adc8bd2a62d2f13bf15598c2b214b1b",
+    "size": 4214
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:129cf42f7a5d3019e23ac8c2534dd50c1ca1357e461895917cb31e991fe1a131",
+      "size": 134296701
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:4a46ee1b22da62c3f182f7677c96a30e1cbaf0fa23a2f00e0a53000f0a027a85",
+      "size": 8719
+    }
+  ],
+  "annotations": {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.name": "scratch",
+    "org.opencontainers.image.created": "2026-11-09T22:23:39Z",
+    "org.opencontainers.image.revision": "457808cdaf8ca50c14692f1099c2efd63049bd00",
+    "org.opencontainers.image.source": "https://gitlab.archlinux.org/archlinux/archlinux-docker.git#457808cdaf8ca50c14692f1099c2efd63049bd00:.",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/archlinux",
+    "org.opencontainers.image.version": "latest"
+  }
+}
