@@ -1,4 +1,5 @@
 """Fixed MWOW-9 policy and init. No caller-selected executable or runtime test mode."""
+import errno
 import fcntl
 import os
 from pathlib import Path
@@ -7,6 +8,7 @@ import signal
 import stat
 import subprocess
 import ctypes
+import time
 
 UID = 2001
 HOME = '/home/retro'
@@ -116,13 +118,16 @@ def wait_tree(leader):
     while True:
         try:
             pid, status = os.waitpid(-1, 0)
-        except ChildProcessError:
+        except ChildProcessError as error:
+            if error.errno != errno.ECHILD:
+                raise
             return result
         if pid == leader:
             result = os.waitstatus_to_exitcode(status)
 
 
 STOP = None
+LIFETIME_FAULT = False
 
 
 def forward(sig, _frame):
@@ -148,6 +153,16 @@ def forward(sig, _frame):
             pass
 
 
+def handle_signal(sig, frame):
+    # A handler exception must not impersonate waitpid's positive ECHILD result,
+    # escape the owned wait, or run an exit path between successful spawn and wait.
+    global LIFETIME_FAULT
+    try:
+        forward(sig, frame)
+    except BaseException:
+        LIFETIME_FAULT = True
+
+
 def wine_session(env, args, run=subprocess.run):
     require(not args)
     check_authority()
@@ -171,8 +186,9 @@ def wine_session(env, args, run=subprocess.run):
 
 
 def entry(env, args):
+    global LIFETIME_FAULT
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(sig, forward)
+        signal.signal(sig, handle_signal)
     require(os.getpid() == 1)  # This Python process is the guest init, no external init.
     check_authority()
     clean, values = inputs(env, args)
@@ -187,12 +203,33 @@ def entry(env, args):
     lease = acquire_prefix(PREFIX)
     try:
         subreaper()
-        require(STOP is None)
+        require(STOP is None and not LIFETIME_FAULT)
         child = subprocess.Popen(gamescope_command(values), env=clean, cwd=HOME)
-        if STOP is not None:
-            forward(STOP, None)
-        result = wait_tree(child.pid)
+    except BaseException:
+        # No successful spawn: no owned workload, so setup failure may release.
+        os.close(lease)
+        raise
+
+    # Owned state: no finally-close or escaping error path. Unknown wait/handler
+    # failures retain this actual PID1 and fd; retry until waitpid proves ECHILD.
+    # There is deliberately no retry budget, detach, kill-to-prove-drain or ACK.
+    pending_signal = True
+    while True:
+        try:
+            if pending_signal:
+                pending_signal = False
+                if STOP is not None:
+                    forward(STOP, None)
+            result = wait_tree(child.pid)
+        except BaseException:
+            LIFETIME_FAULT = True  # sticky Unknown; even eventual drain reports failure
+            try:
+                time.sleep(0.1)
+            except BaseException:
+                pass  # a backoff/handler fault grants no permission to abandon owners
+            continue
+        # Only a normal return from the ECHILD drain authorizes release/exit.
         child.returncode = result
-        return result if result >= 0 else 128 - result
-    finally:
-        os.close(lease)  # Only after every descendant is gone, including orphans.
+        os.close(lease)
+        result = result if result >= 0 else 128 - result
+        return result or int(LIFETIME_FAULT)

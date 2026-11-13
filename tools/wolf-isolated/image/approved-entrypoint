@@ -7,4 +7,5 @@ import guest
 try:
     sys.exit(guest.entry(dict(__import__('os').environ), sys.argv[1:]))
 except (guest.Refused, OSError):
-    sys.exit('MWOW-9 guest init refused; no launch grant')
+    # entry retains post-spawn ownership internally until positive descendant drain.
+    sys.exit('MWOW-9 guest init failed; no readiness grant')

@@ -58,7 +58,14 @@ lease и provisioning. Эта ветка основана на native `0e3710b`:
    от outer `launcher/prefix-<dev>-<ino>.lock`. PID 1 держит flock до исчезновения
    всех потомков, включая orphan/double-fork; session ждёт `wineserver -w` того же
    prefix. Сигналы направляются только собственному private PID tree. Завершение
-   launcher не считается завершением игры. Нужна поздняя реальная проверка
+   launcher не считается завершением игры. R41-1: до успешного Popen ошибка
+   setup освобождает lease; после Popen wait/handler exception записывает sticky
+   Unknown, сохраняет настоящий PID1/fd и повторяет drain с backoff 0.1s.
+   Обработчик сигналов не выбрасывает исключения. Освобождение разрешает только
+   нормальный возврат drain после kernel ECHILD; неизвестность даёт ненулевой
+   итог даже после позднего drain. Нет retry-budget/forced-exit/detach.
+   Тестовый watchdog ограничивает только synthetic fixture, timeout всегда failure.
+   Нужна поздняя реальная проверка
    Gamescope/Wine/signals; тесты используют только синтетические факты/процессы.
 
 5. **Блокирующие gates.** RO game не обеспечивает WTF/Logs/Cache/settings/updates;
