@@ -117,6 +117,36 @@ impl Source for NativeSource {
         }
         Ok((m.dev(), m.ino()))
     }
+    fn gpu_nodes(&mut self, render: &str) -> Result<Vec<String>, String> {
+        let name = Path::new(render)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(err)?;
+        let mut found = Vec::new();
+        let mut count = 0;
+        for entry in fs::read_dir(format!("/sys/class/drm/{name}/device/drm")).map_err(|_| err())? {
+            count += 1;
+            if count > 32 {
+                return Err(err());
+            }
+            let name = entry.map_err(|_| err())?.file_name();
+            let name = name.to_str().ok_or_else(err)?;
+            if ["card", "renderD"].iter().any(|p| {
+                name.strip_prefix(p)
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+            }) {
+                found.push(format!("/dev/dri/{name}"));
+            }
+        }
+        found.sort();
+        if found.len() != 2
+            || !found.iter().any(|p| p.starts_with("/dev/dri/card"))
+            || !found.iter().any(|p| p == render)
+        {
+            return Err(err());
+        }
+        Ok(found)
+    }
     fn gpu_vendor(&mut self, node: &str) -> Result<String, String> {
         let name = Path::new(node)
             .file_name()
@@ -133,7 +163,7 @@ impl Source for NativeSource {
         }
     }
 }
-fn private_file(path: &Path, uid: u32, limit: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn private_file(path: &Path, uid: u32, limit: u64) -> Result<Vec<u8>, String> {
     let m = crate::metadata(path.to_str().ok_or_else(err)?)?;
     if !m.is_file() || m.uid() != uid || m.mode() & 0o077 != 0 || m.len() > limit {
         return Err(err());
@@ -150,7 +180,7 @@ fn private_file(path: &Path, uid: u32, limit: u64) -> Result<Vec<u8>, String> {
     }
     Ok(b)
 }
-fn exclusive(path: &Path, uid: u32) -> Result<File, Fault> {
+pub(crate) fn exclusive(path: &Path, uid: u32) -> Result<File, Fault> {
     if let Ok(m) = fs::symlink_metadata(path) {
         if !m.is_file() || m.uid() != uid || m.mode() & 0o077 != 0 {
             return Err(Fault);
@@ -169,7 +199,7 @@ fn exclusive(path: &Path, uid: u32) -> Result<File, Fault> {
     }
     Ok(f)
 }
-fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Fault> {
+pub(crate) fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> Result<(), Fault> {
     let tmp = dir.join(format!(".{name}.tmp"));
     let mut f = OpenOptions::new()
         .write(true)
@@ -243,13 +273,12 @@ fn get(socket: &str, path: &str) -> Result<Value, Fault> {
         "GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
     )
     .map_err(|_| Fault)?;
-    let mut b = Vec::new();
-    s.take(256 * 1024 + 1)
-        .read_to_end(&mut b)
-        .map_err(|_| Fault)?;
-    if b.len() > 256 * 1024 {
-        return Err(Fault);
-    }
+    let mut budget = crate::request_io::Budget::new(
+        crate::request_io::NativeClock::new(|| STOP.load(Ordering::Relaxed)),
+        Duration::from_millis(500),
+    )
+    .map_err(|_| Fault)?;
+    let b = crate::request_io::read_response(&mut s, &mut budget, 256 * 1024).map_err(|_| Fault)?;
     let split = b.windows(4).position(|s| s == b"\r\n\r\n").ok_or(Fault)?;
     let h = std::str::from_utf8(&b[..split]).map_err(|_| Fault)?;
     if !h
@@ -263,7 +292,11 @@ fn get(socket: &str, path: &str) -> Result<Value, Fault> {
     serde_json::from_slice(&b[split + 4..]).map_err(|_| Fault)
 }
 /// Decode the real Docker GET inspect path; uncertain/dead is never an exit receipt.
-pub fn decode_inspection(d: &Value, id: &str) -> Result<Guest, Fault> {
+pub fn decode_inspection(
+    d: &Value,
+    id: &str,
+    _expected: &crate::inspection::Policy,
+) -> Result<Guest, Fault> {
     if d["Id"] != id || id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Fault);
     }
@@ -332,6 +365,7 @@ struct NativeIo {
     key: Key,
     listener: Option<UnixListener>,
     started: Instant,
+    inspection: crate::inspection::Policy,
 }
 impl Drop for NativeIo {
     fn drop(&mut self) {
@@ -350,39 +384,23 @@ impl Io for NativeIo {
         Ok(self.started.elapsed())
     }
     fn reserve(&mut self, key: &Key) -> Result<(), Fault> {
-        let mut domain = exclusive(&self.dir.join("domain.lock"), self.uid)?;
+        let store = crate::epoch::Store::new(&self.dir, self.uid);
+        let domain = store.lease()?;
         let prefix = exclusive(
             &self
                 .dir
                 .join(format!("prefix-{}-{}.lock", self.prefix.0, self.prefix.1)),
             self.uid,
         )?;
-        let journal = self.dir.join("journal.json");
-        let marker =
-            private_file(&self.dir.join("domain.lock"), self.uid, 4096).map_err(|_| Fault)?;
-        if journal.exists() {
-            let b = private_file(&journal, self.uid, 8192).map_err(|_| Fault)?;
-            let old: Journal = serde_json::from_slice(&b).map_err(|_| Fault)?;
-            let prior: Key = serde_json::from_slice(&marker).map_err(|_| Fault)?;
-            if old.key != prior || !matches!(old.phase, Phase::Stopped | Phase::Refused) {
+        let listener = store.begin_control(key, || {
+            let control = self.dir.join("control.sock");
+            if control.exists() {
                 return Err(Fault);
             }
-        } else if !marker.is_empty() {
-            return Err(Fault);
-        }
-        // Durable epoch marker precedes first journal publication and ALL child effects.
-        // If a journal write later fails, an older terminal journal cannot free this epoch.
-        domain.set_len(0).map_err(|_| Fault)?;
-        domain
-            .write_all(&serde_json::to_vec(key).map_err(|_| Fault)?)
-            .map_err(|_| Fault)?;
-        domain.sync_all().map_err(|_| Fault)?;
-        let control = self.dir.join("control.sock");
-        if control.exists() {
-            return Err(Fault);
-        }
-        let listener = UnixListener::bind(control).map_err(|_| Fault)?;
-        listener.set_nonblocking(true).map_err(|_| Fault)?;
+            let listener = UnixListener::bind(control).map_err(|_| Fault)?;
+            listener.set_nonblocking(true).map_err(|_| Fault)?;
+            Ok(listener)
+        })?;
         self.listener = Some(listener);
         self.locks = Some((domain, prefix));
         self.key = key.clone();
@@ -392,11 +410,7 @@ impl Io for NativeIo {
         if self.locks.is_none() || j.key != self.key {
             return Err(Fault);
         }
-        atomic_write(
-            &self.dir,
-            "journal.json",
-            &serde_json::to_vec(j).map_err(|_| Fault)?,
-        )
+        crate::epoch::Store::new(&self.dir, self.uid).publish(j)
     }
     fn spawn(&mut self, p: &Prepared) -> Result<ChildId, SpawnError> {
         let config = labeled_config(p, &self.key).map_err(|_| SpawnError::NoChild)?;
@@ -470,7 +484,7 @@ impl Io for NativeIo {
                 return Err(Fault);
             }
             let detail = get(&self.socket, &format!("/v1.40/containers/{id}/json"))?;
-            out.push(decode_inspection(&detail, id)?);
+            out.push(decode_inspection(&detail, id, &self.inspection)?);
         }
         Ok(out)
     }
@@ -556,12 +570,10 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
         }
         let dir = PathBuf::from(format!("{}/launcher", p.remote_home));
         source.private_dir(dir.to_str().unwrap(), p.remote_uid)?;
-        let j: Journal = serde_json::from_slice(&private_file(
-            &dir.join("journal.json"),
-            p.remote_uid,
-            8192,
-        )?)
-        .map_err(|_| err())?;
+        let j = match crate::epoch::Store::new(&dir, p.remote_uid).snapshot() {
+            Ok(j) => j,
+            Err(_) => return Ok(view(Phase::Unknown)),
+        };
         if j.key.profile != digest(&pb.bytes) || j.key.spec != digest(&sb.bytes) {
             return Err(err());
         }
@@ -570,10 +582,13 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
         if !owner_alive {
             // Dead owner: report only the durable journal verdict. Never signal anything,
             // and never infer completion from owner absence alone.
-            return Ok(view(match j.phase {
-                Phase::Stopped | Phase::Refused if j.key.boot == boot()? => j.phase,
-                _ => Phase::Unknown,
-            }));
+            return Ok(view(
+                crate::epoch::Store::new(&dir, p.remote_uid).phase_when_dead(
+                    &boot()?,
+                    &digest(&pb.bytes),
+                    &digest(&sb.bytes),
+                ),
+            ));
         }
         check_key(&j, &digest(&pb.bytes), &digest(&sb.bytes))?;
         let mut stream = UnixStream::connect(dir.join("control.sock")).map_err(|_| err())?;
@@ -636,6 +651,7 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
         key: key.clone(),
         listener: None,
         started: Instant::now(),
+        inspection: p.inspection.clone(),
     };
     struct Signals(usize, usize);
     impl Drop for Signals {

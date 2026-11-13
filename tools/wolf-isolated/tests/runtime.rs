@@ -44,6 +44,9 @@ impl Source for Files {
             Err("missing group".into())
         }
     }
+    fn gpu_nodes(&mut self, render: &str) -> Result<Vec<String>, String> {
+        Ok(vec!["/dev/dri/card0".into(), render.into()])
+    }
     fn gpu_vendor(&mut self, _: &str) -> Result<String, String> {
         Ok("INTEL".into())
     }
@@ -100,6 +103,11 @@ fn fixture() -> (Files, Profile, Spec, Key) {
         &mut files,
         "/etc/group",
         b"wolf-wow-input:x:2002:remote\nwolf-wow-uinput:x:2004:remote\n".to_vec(),
+    );
+    insert(
+        &mut files,
+        "/proc/devices",
+        b"Character devices:\n13 input\n240 hidraw\nBlock devices:\n".to_vec(),
     );
     let c = config(&p);
     let image = ImageContract {
@@ -580,16 +588,17 @@ fn actual_single_deadline_does_not_reset_and_backward_clock_fails_closed() {
 #[test]
 fn actual_inspect_decoder_requires_exact_terminal_task_state() {
     let id = "a".repeat(64);
-    let mut d = json!({"Id":id,"Image":format!("sha256:{}","b".repeat(64)),"Config":{"Labels":{"mwow.nonce":"n","mwow.profile":"p"}},"State":{"Status":"running","Running":true,"Pid":100,"Paused":false,"Restarting":false,"Dead":false}});
+    let (prepared, _) = ready();
+    let mut d = valid_inspection(&id, "running");
     assert_eq!(
-        wolf_isolated::supervisor::decode_inspection(&d, &id)
+        wolf_isolated::supervisor::decode_inspection(&d, &id, prepared.inspection_policy())
             .unwrap()
             .state,
         GuestState::Running
     );
     d["State"]["Status"] = "exited".into();
     assert_eq!(
-        wolf_isolated::supervisor::decode_inspection(&d, &id)
+        wolf_isolated::supervisor::decode_inspection(&d, &id, prepared.inspection_policy())
             .unwrap()
             .state,
         GuestState::Other
@@ -597,27 +606,33 @@ fn actual_inspect_decoder_requires_exact_terminal_task_state() {
     d["State"]["Running"] = false.into();
     d["State"]["Pid"] = 0.into();
     assert_eq!(
-        wolf_isolated::supervisor::decode_inspection(&d, &id)
+        wolf_isolated::supervisor::decode_inspection(&d, &id, prepared.inspection_policy())
             .unwrap()
             .state,
         GuestState::Exited
     );
     d["State"]["Dead"] = true.into();
     assert_eq!(
-        wolf_isolated::supervisor::decode_inspection(&d, &id)
+        wolf_isolated::supervisor::decode_inspection(&d, &id, prepared.inspection_policy())
             .unwrap()
             .state,
         GuestState::Other
     );
-    assert!(wolf_isolated::supervisor::decode_inspection(&d, &"c".repeat(64)).is_err());
+    assert!(wolf_isolated::supervisor::decode_inspection(
+        &d,
+        &"c".repeat(64),
+        prepared.inspection_policy()
+    )
+    .is_err());
 }
 
 #[test]
 fn inspect_decoder_rejects_host_escape_hatches() {
     let id = "a".repeat(64);
-    let base = json!({"Id":id,"Image":format!("sha256:{}","b".repeat(64)),"Config":{"Labels":{"mwow.nonce":"n","mwow.profile":"p"}},"State":{"Status":"exited","Running":false,"Pid":0,"Paused":false,"Restarting":false,"Dead":false},"HostConfig":{"Privileged":false,"NetworkMode":"bridge"},"Mounts":[{"Source":"/run/media/x/state"}]});
+    let (prepared, _) = ready();
+    let base = valid_inspection(&id, "exited");
     assert_eq!(
-        wolf_isolated::supervisor::decode_inspection(&base, &id)
+        wolf_isolated::supervisor::decode_inspection(&base, &id, prepared.inspection_policy())
             .unwrap()
             .state,
         GuestState::Exited
@@ -637,8 +652,82 @@ fn inspect_decoder_rejects_host_escape_hatches() {
             *d.pointer_mut(ptr).unwrap() = v;
         }
         assert!(
-            wolf_isolated::supervisor::decode_inspection(&d, &id).is_err(),
+            wolf_isolated::supervisor::decode_inspection(&d, &id, prepared.inspection_policy())
+                .is_err(),
             "{ptr}"
         );
     }
+}
+
+fn valid_inspection(id: &str, state: &str) -> serde_json::Value {
+    let (_, p, _, _) = fixture();
+    let c = config(&p);
+    let mut j: serde_json::Value = serde_json::from_str(
+        c["profiles"][0]["apps"][0]["runner"]["base_create_json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    for name in ["UTSMode", "UsernsMode"] {
+        j["HostConfig"][name] = json!("");
+    }
+    j["HostConfig"]["DeviceCgroupRules"] = json!(["c 240:* rwm", "c 13:* rwm"]);
+    j["HostConfig"]["Devices"] = json!([{"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":"mrw"},{"PathOnHost":"/dev/dri/renderD128","PathInContainer":"/dev/dri/renderD128","CgroupPermissions":"mrw"}]);
+    j["HostConfig"]["DeviceRequests"] = json!(null);
+    j["HostConfig"]["PortBindings"] = json!({});
+    let mounts = json!([
+ {"Type":"bind","Source":"/srv/wolf-wow/prefix","Destination":"/home/retro/prefix","RW":true},
+ {"Type":"bind","Source":"/srv/wow-game-data","Destination":"/games/wow","RW":false},
+ {"Type":"bind","Source":"/srv/wolf-wow/state/client/WoW","Destination":"/home/retro","RW":true},
+ {"Type":"bind","Source":"/srv/wolf-wow/state/client/WoW/udev","Destination":"/run/udev","RW":true},
+ {"Type":"bind","Source":"/srv/wolf-wow/state/fake-udev","Destination":"/usr/bin/fake-udev","RW":true},
+ {"Type":"bind","Source":"/run/user/2001/pulse-socket","Destination":"/run/user/2001/pulse-socket","RW":true},
+ {"Type":"bind","Source":"/run/user/2001/wayland-7","Destination":"/run/user/2001/wayland-7","RW":true}]);
+    json!({"Id":id,"Image":format!("sha256:{}","a".repeat(64)),"Config":{"Labels":{"mwow.nonce":"n","mwow.profile":"p"},"User":"2001","Entrypoint":["/opt/wolf/approved-entrypoint"],"Env":["WAYLAND_DISPLAY=wayland-7","PULSE_SERVER=/run/user/2001/pulse-socket","XDG_RUNTIME_DIR=/run/user/2001"]},"State":{"Status":state,"Running":state=="running","Pid":if state=="running"{100}else{0},"Paused":false,"Restarting":false,"Dead":false},"HostConfig":j["HostConfig"],"Mounts":mounts})
+}
+#[test]
+fn r39_inspection_requires_mandatory_expected_envelope() {
+    let (p, _) = ready();
+    let id = "a".repeat(64);
+    let base = valid_inspection(&id, "exited");
+    let mut accepted = Vec::new();
+    for (name, ptr, value) in [
+        ("missing HC", "/HostConfig", json!(null)),
+        ("wrong HC", "/HostConfig", json!([])),
+        ("missing mounts", "/Mounts", json!(null)),
+        ("wrong mounts", "/Mounts", json!({})),
+        (
+            "foreign net",
+            "/HostConfig/NetworkMode",
+            json!("container:foreign"),
+        ),
+        (
+            "foreign ipc",
+            "/HostConfig/IpcMode",
+            json!("container:foreign"),
+        ),
+        (
+            "foreign pid",
+            "/HostConfig/PidMode",
+            json!("container:foreign"),
+        ),
+        ("extra cap", "/HostConfig/CapAdd", json!(["SYS_ADMIN"])),
+        ("wrong user", "/Config/User", json!("0")),
+        (
+            "extra mount",
+            "/Mounts/0/Source",
+            json!("/srv/wolf-wow/other"),
+        ),
+        ("missing devices", "/HostConfig/Devices", json!(null)),
+    ] {
+        let mut d = base.clone();
+        *d.pointer_mut(ptr).unwrap() = value;
+        if wolf_isolated::supervisor::decode_inspection(&d, &id, p.inspection_policy()).is_ok() {
+            accepted.push(name);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "incomplete/foreign envelopes accepted: {accepted:?}"
+    );
 }

@@ -66,6 +66,7 @@ pub trait Source {
     fn directory_identity(&mut self, path: &str) -> Result<(u64, u64), String>;
     fn gpu_vendor(&mut self, node: &str) -> Result<String, String>;
     fn groups(&mut self) -> Result<Vec<u32>, String>;
+    fn gpu_nodes(&mut self, render: &str) -> Result<Vec<String>, String>;
     fn boot_id(&mut self) -> Result<String, String>;
     fn process_live(&mut self, id: &crate::runtime::ChildId) -> Result<bool, String>;
 }
@@ -85,6 +86,12 @@ pub struct Prepared {
     pub(crate) uid: u32,
     pub(crate) image_id: String,
     pub(crate) image_ref: String,
+    pub(crate) inspection: crate::inspection::Policy,
+}
+impl Prepared {
+    pub fn inspection_policy(&self) -> &crate::inspection::Policy {
+        &self.inspection
+    }
 }
 fn fail() -> String {
     "not provisioned or incompatible fixed runtime contract".into()
@@ -324,6 +331,38 @@ pub fn prepare<S: Source>(
         })
         .collect::<Vec<_>>()
         .join(":");
+    let gpu = s.gpu_nodes(&p.render_node)?;
+    if gpu.len() != 2 || !gpu.contains(&p.render_node) {
+        return Err(fail());
+    }
+    let proc = root(s, "/proc/devices", 65536)?;
+    let proc = std::str::from_utf8(&proc).map_err(|_| fail())?;
+    let mut input = None;
+    let mut hidraw = None;
+    for line in proc.lines().take_while(|l| *l != "Block devices:") {
+        let mut f = line.split_whitespace();
+        if let (Some(n), Some(name)) = (f.next(), f.next()) {
+            if let Ok(n) = n.parse::<u32>() {
+                match name {
+                    "input" => input = Some(n),
+                    "hidraw" => hidraw = Some(n),
+                    _ => (),
+                }
+            }
+        }
+    }
+    let rules = match (hidraw, input) {
+        (Some(h), Some(i)) => vec![format!("c {h}:* rwm"), format!("c {i}:* rwm")],
+        _ => vec![],
+    };
+    let inspection = crate::inspection::Policy::new(
+        &p,
+        &state,
+        &spec.fake_udev.path,
+        gpu,
+        rules,
+        &image.image_id,
+    );
     Ok(Prepared {
         wolf: p
             .artifacts
@@ -345,6 +384,7 @@ pub fn prepare<S: Source>(
         image_ref: p.image,
         spec,
         config,
+        inspection,
     })
 }
 pub fn validate_config(p: &Profile, c: &toml::Value, i: &ImageContract) -> Result<(), String> {
