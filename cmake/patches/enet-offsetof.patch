@@ -1,0 +1,13 @@
+--- a/protocol.c
++++ b/protocol.c
+@@ -4,0 +5 @@
++#include <stddef.h>
+@@ -1021 +1022 @@
+-    if (host -> receivedDataLength < (size_t) & ((ENetProtocolHeader *) 0) -> sentTime)
++    if (host -> receivedDataLength < offsetof (ENetProtocolHeader, sentTime))
+@@ -1031 +1032 @@
+-    headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : (size_t) & ((ENetProtocolHeader *) 0) -> sentTime);
++    headerSize = (flags & ENET_PROTOCOL_HEADER_FLAG_SENT_TIME ? sizeof (ENetProtocolHeader) : offsetof (ENetProtocolHeader, sentTime));
+@@ -1687 +1688 @@
+-          host -> buffers -> dataLength = (size_t) & ((ENetProtocolHeader *) 0) -> sentTime;
++          host -> buffers -> dataLength = offsetof (ENetProtocolHeader, sentTime);

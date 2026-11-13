@@ -74,8 +74,17 @@ void Server<HTTPS>::accept() {
 }
 
 x509::x509_ptr Server<HTTPS>::get_client_cert(const std::shared_ptr<typename ServerBase<HTTPS>::Request> &request) {
-  auto connection = request->connection.lock();
-  auto cert = SSL_get_peer_certificate(connection->socket->native_handle());
+  if (!request)
+    return {};
+  auto connection = request->connection.lock(); // retain through SSL_get_peer_certificate
+  if (!connection || !connection->socket)
+    return {};
+  auto ssl = connection->socket->native_handle();
+  if (!ssl)
+    return {};
+  auto cert = SSL_get_peer_certificate(ssl); // transfer-full reference, caller owns X509_free
+  if (!cert)
+    return {};
   return x509::x509_ptr(cert, X509_free);
 }
 

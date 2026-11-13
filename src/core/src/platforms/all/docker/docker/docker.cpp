@@ -73,6 +73,11 @@ using curl_ptr = std::unique_ptr<CURL, decltype(&curl_easy_cleanup)>;
  */
 std::optional<curl_ptr> docker_connect(const std::string &socket_path, bool debug = false) {
   if (auto curl = curl_easy_init()) {
+    // Each transfer is bounded, including version negotiation and exec. A timeout
+    // of a mutating call means an unknown outcome, not permission to repeat it.
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 2000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 10000L);
     curl_easy_setopt(curl, CURLOPT_UNIX_SOCKET_PATH, socket_path.c_str()); // TODO: support also tcp://
     if (debug)
       curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
@@ -92,7 +97,13 @@ req(CURL *handle,
     std::string_view post_body = {},
     const std::vector<std::string> &header_params = {}) {
   logs::log(logs::trace, "[CURL] Sending [{}] -> {}", (int)method, target);
-  curl_easy_setopt(handle, CURLOPT_URL, target.data());
+  const std::string url(target);
+  curl_easy_setopt(handle, CURLOPT_URL, url.c_str());
+
+  // Handles are reused by exec and create. Clear POST state from the last call.
+  curl_easy_setopt(handle, CURLOPT_POSTFIELDS, nullptr);
+  curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE, 0L);
+  curl_easy_setopt(handle, CURLOPT_POST, 0L);
 
   /* Set method */
   switch (method) {
@@ -121,6 +132,7 @@ req(CURL *handle,
     headers = curl_slist_append(headers, "Transfer-Encoding: chunked");
     headers = curl_slist_append(headers, "Content-type: application/json");
     curl_easy_setopt(handle, CURLOPT_POSTFIELDS, post_body.data());
+    curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(post_body.size()));
   }
   curl_easy_setopt(handle, CURLOPT_HTTPHEADER, headers);
 
@@ -150,17 +162,31 @@ req(CURL *handle,
 }
 
 std::optional<Container> DockerAPI::get_by_id(std::string_view id) const {
+  return inspect_by_id(id).container;
+}
+
+InspectResult DockerAPI::inspect_by_id(std::string_view id) const {
   if (auto conn = docker_connect(socket_path)) {
     auto url = fmt::format("http://localhost/{}/containers/{}/json", docker_api_version, id);
     auto raw_msg = req(conn.value().get(), GET, url);
+    if (raw_msg && raw_msg->first == 404) {
+      return {InspectState::missing, std::nullopt};
+    }
     if (raw_msg && raw_msg->first == 200) {
-      auto json = parse_json(raw_msg->second);
-      return json::value_to<Container>(json);
+      try {
+        auto container = json::value_to<Container>(json::parse(raw_msg->second));
+        if (container.id.empty()) {
+          logs::log(logs::warning, "[DOCKER] Inspect returned an unexpected container ID");
+          return {};
+        }
+        return {InspectState::present, std::move(container)};
+      } catch (const std::exception &e) {
+        logs::log(logs::warning, "[DOCKER] Invalid inspect response: {}", e.what());
+      }
     } else if (raw_msg) {
       logs::log(logs::warning, "[CURL] error {} - {}", raw_msg->first, raw_msg->second);
     }
   }
-
   return {};
 }
 
@@ -199,7 +225,20 @@ std::optional<Container> DockerAPI::create(const Container &container,
                                            std::string_view custom_params,
                                            std::string_view registry_auth,
                                            bool force_recreate_if_present) const {
-  if (auto conn = docker_connect(socket_path)) {
+  return create_with_outcome(container, custom_params, registry_auth, force_recreate_if_present).container;
+}
+
+CreateResult DockerAPI::create_with_outcome(const Container &container,
+                                            std::string_view custom_params,
+                                            std::string_view registry_auth,
+                                            bool force_recreate_if_present) const {
+  bool pulled = false;
+  bool recreated = false;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    auto conn = docker_connect(socket_path);
+    if (!conn) {
+      return {CreateState::rejected, {}}; // No request was submitted.
+    }
     auto url = fmt::format("http://localhost/{}/containers/create?name={}", docker_api_version, container.name);
     // See: https://stackoverflow.com/a/39149767 and https://github.com/moby/moby/issues/3039
     auto exposed_ports = json::object();
@@ -226,28 +265,50 @@ std::optional<Container> DockerAPI::create(const Container &container,
     auto json_payload = json::serialize(post_params);
     auto raw_msg = req(conn.value().get(), POST, url, json_payload);
     if (raw_msg && raw_msg->first == 201) {
-      auto json = parse_json(raw_msg->second);
-      auto created_id = json.at("Id").as_string();
-      return get_by_id(std::string_view{created_id.data(), created_id.size()});
-    } else if (raw_msg && raw_msg->first == 404) { // 404 returned when the image is not present
-      logs::log(logs::warning, "[DOCKER] Image {} not present, downloading...", container.image);
-      if (pull_image(container.image, registry_auth)) { // Download the image
-        return create(container, custom_params, registry_auth,
-                      force_recreate_if_present); // Then retry creating
-      } else if (raw_msg) {
-        logs::log(logs::warning, "[DOCKER] error {} - {}", raw_msg->first, raw_msg->second);
+      std::string id;
+      try {
+        const auto response = json::parse(raw_msg->second);
+        id = json::value_to<std::string>(response.at("Id"));
+        if (id.empty()) {
+          return {};
+        }
+      } catch (const std::exception &e) {
+        logs::log(logs::warning, "[DOCKER] Created container but ID is unknown: {}", e.what());
+        return {};
       }
-    } else if (raw_msg && force_recreate_if_present &&
+      if (auto inspected = get_by_id(id)) {
+        return {CreateState::created, std::move(inspected)};
+      }
+      // Creation succeeded. Never lose ownership just because the subsequent
+      // inspect is unavailable; the runner will reconcile this exact ID.
+      auto created = container;
+      created.id = id;
+      created.status = UNKNOWN;
+      return {CreateState::created, std::move(created)};
+    } else if (raw_msg && raw_msg->first == 404 && !pulled) { // image not present
+      logs::log(logs::warning, "[DOCKER] Image {} not present, downloading...", container.image);
+      pulled = true;
+      if (pull_image(container.image, registry_auth)) {
+        continue;
+      }
+      return {CreateState::rejected, {}}; // No container create was accepted.
+    } else if (raw_msg && force_recreate_if_present && !recreated &&
                is_container_name_conflict_response(raw_msg->first, raw_msg->second)) {
       logs::log(logs::warning, "[DOCKER] Container {} already present, removing first", container.name);
+      recreated = true;
       if (remove_by_name(container.name, true, true, false)) {
-        return create(container, custom_params, registry_auth, force_recreate_if_present);
+        continue;
       }
+    } else if (raw_msg && is_container_name_conflict_response(raw_msg->first, raw_msg->second)) {
+      return {CreateState::conflict, {}};
     } else if (raw_msg) {
       logs::log(logs::warning, "[DOCKER] error {} - {}", raw_msg->first, raw_msg->second);
+      if (raw_msg->first >= 400 && raw_msg->first < 500) {
+        return {CreateState::rejected, {}};
+      }
     }
+    return {}; // No blind retry after a timeout or an ambiguous mutation.
   }
-
   return {};
 }
 
@@ -386,6 +447,8 @@ bool DockerAPI::pull_image(std::string_view image_name,
       return data_size;
     };
 
+    // Pulls can take longer than normal lifecycle calls, but are still finite.
+    curl_easy_setopt(conn->get(), CURLOPT_TIMEOUT_MS, 300000L);
     curl_easy_setopt(conn->get(), CURLOPT_URL, api_url.c_str());
     curl_easy_setopt(conn->get(), CURLOPT_POST, 1L);
     curl_easy_setopt(conn->get(), CURLOPT_POSTFIELDS, "");

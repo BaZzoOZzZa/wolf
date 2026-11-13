@@ -4,12 +4,17 @@
 #include <core/docker.hpp>
 #include <events/events.hpp>
 #include <state/data-structures.hpp>
+#include <streaming/consumer_runtime.hpp>
 
 namespace wolf::core::sessions {
 
 static constexpr int DEFAULT_SESSION_TIMEOUT_MILLIS = 4000;
 
 using namespace wolf::core;
+
+class ConsumerComposition;
+std::shared_ptr<ConsumerComposition> make_consumer_composition(state::SessionsAtoms);
+std::shared_ptr<streaming::ConsumerRuntime> consumer_runtime(const std::shared_ptr<ConsumerComposition> &);
 
 struct AudioServer {
   std::shared_ptr<audio::Server> server;
@@ -20,6 +25,13 @@ immer::vector<immer::box<events::EventBusHandlers>>
 setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
                          const std::string &runtime_dir,
                          const std::optional<AudioServer> &audio_server);
+
+// Explicit composition overload: this exact Runtime is also retained by protected orchestration.
+immer::vector<immer::box<events::EventBusHandlers>>
+setup_moonlight_handlers(const immer::box<state::AppState> &app_state,
+                         const std::string &runtime_dir,
+                         const std::optional<AudioServer> &audio_server,
+                         std::shared_ptr<streaming::ConsumerRuntime> consumers);
 
 immer::vector<immer::box<events::EventBusHandlers>>
 setup_lobbies_handlers(const immer::box<state::AppState> &app_state,
@@ -41,14 +53,26 @@ struct RunnerArgs {
   const std::string &xdg_runtime_dir;
 
   immer::box<config::ClientSettings> client_settings;
+  // Lobby finalization owns its sink, including failures before a runner exists.
+  bool cleanup_audio_sink = true;
+  sessions::RunScope run_scope;
+};
+
+struct RunnerOutcome {
+  enum class State {
+    ended,
+    unknown
+  };
+  State state = State::ended;
+  std::string identity;
 };
 
 /**
  * Setup and starts the runner. The current thread will be blocked until the
  * runner is stopped.
  */
-void start_runner(std::shared_ptr<events::Runner> runner,
-                  std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
-                  immer::box<RunnerArgs> args);
+RunnerOutcome start_runner(std::shared_ptr<events::Runner> runner,
+                           std::shared_ptr<events::devices_atom_queue> plugged_devices_queue,
+                           immer::box<RunnerArgs> args);
 
 } // namespace wolf::core::sessions

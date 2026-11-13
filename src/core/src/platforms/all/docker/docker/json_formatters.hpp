@@ -90,7 +90,7 @@ inline docker::Container tag_invoke(value_to_tag<docker::Container>, value const
     status = docker::DEAD;
     break;
   default:
-    status = docker::CREATED;
+    status = docker::UNKNOWN;
   }
 
   const auto &host_config = obj.at("HostConfig");
