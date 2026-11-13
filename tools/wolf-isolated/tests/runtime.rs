@@ -827,6 +827,7 @@ struct SharedFiles {
     boot_override: Option<String>,
 }
 impl Source for SharedFiles {
+    fn uinput_rw_access(&mut self) -> Result<(), String> { self.inner.device("/dev/uinput",2004) }
     fn root_file(&mut self, p: &str, n: u64) -> Result<Record, String> {
         self.inner.root_file(p, n)
     }
@@ -898,6 +899,7 @@ fn shared_fixture() -> (SharedFiles, Profile, Spec) {
     (prefix.working_dev, prefix.working_ino) = wolf_isolated::EXISTING_PREFIX_ID;
     prefix.migration_receipt_sha256.clear();
     let receipt = SharedCleanStopReceipt {
+        observation_kind: SharedObservation::DrainedProcesses,
         schema: 1,
         profile_sha256: spec.profile_sha256.clone(),
         boot_id: prefix.boot_id.clone(),

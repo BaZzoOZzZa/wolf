@@ -19,6 +19,7 @@ use std::{
 };
 unsafe extern "C" {
     fn geteuid() -> u32;
+    fn faccessat(dirfd: i32, path: *const std::ffi::c_char, mode: i32, flags: i32) -> i32;
     fn flock(fd: i32, op: i32) -> i32;
     fn pidfd_open(pid: i32, flags: u32) -> i32;
     fn pidfd_send_signal(fd: i32, sig: i32, info: *const std::ffi::c_void, flags: u32) -> i32;
@@ -78,6 +79,15 @@ impl Source for NativeSource {
             || m.mode() & 0o007 != 0
             || m.mode() & 0o060 != 0o060
         {
+            return Err(err());
+        }
+        Ok(())
+    }
+    fn uinput_rw_access(&mut self) -> Result<(), String> {
+        let m = crate::metadata("/dev/uinput")?;
+        if unsafe { geteuid() } != 2001 || !m.file_type().is_char_device()
+            || m.mode() & 0o007 != 0
+            || unsafe { faccessat(-100, c"/dev/uinput".as_ptr(), 6, 0x200) } != 0 {
             return Err(err());
         }
         Ok(())

@@ -55,10 +55,15 @@ pub struct PrefixContract {
     pub boot_id: String,
     pub original_processes: Vec<crate::runtime::ChildId>,
 }
+#[derive(Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SharedObservation { #[default] DrainedProcesses, IdlePrefix }
 /// Root-pinned operator receipt; this parser does not perform a clean stop.
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SharedCleanStopReceipt {
+    #[serde(default)]
+    pub observation_kind: SharedObservation,
     pub schema: u32,
     pub profile_sha256: String,
     pub boot_id: String,
@@ -107,6 +112,8 @@ pub trait Source {
     fn socket(&mut self, path: &str, uid: Option<u32>) -> Result<(), String>;
     fn device(&mut self, path: &str, gid: u32) -> Result<(), String>;
     fn uid(&self) -> u32;
+    /// Exact /dev/uinput DAC/ACL check for the shared-existing UID2001 service, without opening it.
+    fn uinput_rw_access(&mut self) -> Result<(), String> { Err(fail()) }
     fn directory_identity(&mut self, path: &str) -> Result<(u64, u64), String>;
     fn gpu_vendor(&mut self, node: &str) -> Result<String, String>;
     fn groups(&mut self) -> Result<Vec<u32>, String>;
@@ -291,7 +298,9 @@ pub fn prepare<S: Source>(
         }
         required.push(gid);
         if name == "wolf-wow-uinput" {
-            s.device("/dev/uinput", gid)?;
+            if p.prefix.mode == crate::PrefixMode::SharedExistingExclusive {
+                s.uinput_rw_access()?;
+            } else { s.device("/dev/uinput", gid)?; }
         }
     }
     let effective = s.groups()?;
@@ -363,7 +372,10 @@ pub fn prepare<S: Source>(
             || receipt.game_path != crate::EXISTING_GAME
             || (receipt.game_dev, receipt.game_ino) != crate::EXISTING_GAME_ID
             || receipt.original_processes != prefix.original_processes
-            || receipt.original_processes.is_empty()
+            || match receipt.observation_kind {
+                SharedObservation::DrainedProcesses => receipt.original_processes.is_empty(),
+                SharedObservation::IdlePrefix => !receipt.original_processes.is_empty(),
+            }
             || receipt.original_processes.iter().enumerate().any(|(i, x)| {
                 receipt.original_processes[..i]
                     .iter()
