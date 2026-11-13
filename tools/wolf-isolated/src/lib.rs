@@ -245,11 +245,11 @@ pub fn validate(p: &Profile) -> Vec<String> {
         e.push("existing WoW write role requires exact shared-existing profile".into());
     }
     // Fixed mount roles, never caller-provided arbitrary host mount tables.
-    for s in [&p.prefix.working, &p.game_data, &p.remote_home] {
+    for (role, s) in [&p.prefix.working, &p.game_data, &p.remote_home].into_iter().enumerate() {
         let exact_shared_role = p.prefix.mode == PrefixMode::SharedExistingExclusive
             && prefix_ok
-            && ((s == &p.prefix.working && s.as_str() == EXISTING_PREFIX)
-                || (s == &p.game_data && s.as_str() == EXISTING_GAME));
+            && ((role == 0 && s.as_str() == EXISTING_PREFIX)
+                || (role == 1 && s.as_str() == EXISTING_GAME));
         if ["/dev", "/proc", "/sys", "/run", "/tmp", "/var/run"]
             .iter()
             .any(|bad| within(s, bad) && !(exact_shared_role && *bad == "/run"))
