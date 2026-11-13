@@ -1,0 +1,60 @@
+{
+  "schema": 1,
+  "kind": "wow-isolated-v1",
+  "desktop_uid": 1000,
+  "remote_uid": 2001,
+  "desktop_home": "/home/desktop",
+  "remote_home": "/srv/wolf-wow",
+  "runtime": "/run/user/2001",
+  "prefix": {
+    "source": "/APPROVAL_REQUIRED/original-prefix",
+    "source_dev": 1,
+    "source_ino": 1,
+    "working": "/srv/wolf-wow/prefix",
+    "wine_arch": "win64"
+  },
+  "game_data": "/srv/wow-game-data",
+  "image": "approved/wow@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "capabilities": [],
+  "allow_mknod": false,
+  "no_new_privileges": true,
+  "private_dev": true,
+  "host_network": false,
+  "host_ipc": false,
+  "artifacts": [
+    {
+      "role": "wolf",
+      "path": "/APPROVAL_REQUIRED/wolf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "gamescope",
+      "path": "/APPROVAL_REQUIRED/gamescope",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "wine",
+      "path": "/APPROVAL_REQUIRED/wine",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "entrypoint",
+      "path": "/APPROVAL_REQUIRED/entrypoint",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "compositor",
+      "path": "/APPROVAL_REQUIRED/compositor",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "interpipe",
+      "path": "/APPROVAL_REQUIRED/interpipe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "render_node": "/dev/dri/renderD128",
+  "input_node": "/dev/input/event999",
+  "input_gid": 2002,
+  "render_gid": 2003
+}

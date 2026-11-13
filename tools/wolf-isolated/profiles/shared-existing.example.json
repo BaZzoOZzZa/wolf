@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "kind": "wow-isolated-v1",
+  "desktop_uid": 1000,
+  "remote_uid": 2001,
+  "desktop_home": "/home/bazzoozza",
+  "remote_home": "/srv/wolf-wow",
+  "runtime": "/run/user/2001",
+  "prefix": {
+    "source": "/run/media/bazzoozza/Games/lutris/battlenet",
+    "source_dev": 2049,
+    "source_ino": 16646146,
+    "working": "/run/media/bazzoozza/Games/lutris/battlenet",
+    "wine_arch": "win64",
+    "mode": "shared-existing-exclusive"
+  },
+  "game_data": "/run/media/bazzoozza/Games/World of Warcraft",
+  "image": "sha256:84719e0af05e1ee4720e1d6605aed0bf9c3d55d7ebf24e159aee355580632505",
+  "capabilities": [],
+  "allow_mknod": false,
+  "no_new_privileges": true,
+  "private_dev": true,
+  "host_network": false,
+  "host_ipc": false,
+  "artifacts": [
+    {
+      "role": "wolf",
+      "path": "/APPROVAL_REQUIRED/wolf",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "gamescope",
+      "path": "/APPROVAL_REQUIRED/gamescope",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "wine",
+      "path": "/APPROVAL_REQUIRED/wine",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "entrypoint",
+      "path": "/APPROVAL_REQUIRED/entrypoint",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "compositor",
+      "path": "/APPROVAL_REQUIRED/compositor",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "role": "interpipe",
+      "path": "/APPROVAL_REQUIRED/interpipe",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "render_node": "/dev/dri/renderD128",
+  "input_node": "/dev/input/event999",
+  "input_gid": 2002,
+  "render_gid": 989,
+  "game_access": "existing-wow-rw",
+  "image_kind": "local-image-id"
+}
