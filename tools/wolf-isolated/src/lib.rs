@@ -19,7 +19,7 @@ pub struct Artifact {
     pub sha256: String,
 }
 pub const LOCAL_WOW_IMAGE_ID: &str =
-    "sha256:84719e0af05e1ee4720e1d6605aed0bf9c3d55d7ebf24e159aee355580632505";
+    "sha256:2218657d347e907c4a899f4a2c82f6ae25cfd7f52cb78166f57d24bed4f54745";
 pub const EXISTING_PREFIX: &str = "/run/media/bazzoozza/Games/lutris/battlenet";
 pub const EXISTING_GAME: &str = "/run/media/bazzoozza/Games/World of Warcraft";
 pub const EXISTING_PREFIX_ID: (u64, u64) = (2049, 16646146);
