@@ -57,6 +57,10 @@ pub enum SpawnError {
 #[derive(Debug)]
 pub struct Fault;
 pub trait Io {
+    fn observation_deadline(&mut self, _deadline: Option<std::time::Duration>) {}
+    fn take_stop_yield(&mut self) -> bool {
+        false
+    }
     fn monotonic(&mut self) -> Result<std::time::Duration, Fault>;
     fn reserve(&mut self, key: &Key) -> Result<(), Fault>;
     fn save(&mut self, journal: &Journal) -> Result<(), Fault>;
@@ -171,8 +175,17 @@ impl<I: Io> Controller<I> {
             return self.journal.phase;
         }
         self.poll_deadline();
+        self.io.observation_deadline(
+            self.stop_started
+                .and_then(|s| s.checked_add(std::time::Duration::from_secs(5))),
+        );
         let guests = match self.io.guests(&self.journal.key) {
             Ok(v) if v.len() <= 1 => v,
+            Err(_) if self.io.take_stop_yield() => {
+                self.stop(&self.journal.key.clone());
+                self.poll_deadline();
+                return self.journal.phase;
+            }
             _ => {
                 self.unknown();
                 return self.journal.phase;

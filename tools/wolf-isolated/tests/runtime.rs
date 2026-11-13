@@ -214,6 +214,8 @@ struct Mock {
     saves: usize,
     save_error: bool,
     now_ms: u64,
+    yielded: bool,
+    decision_deadline: Option<std::time::Duration>,
 }
 impl Mock {
     fn new() -> Self {
@@ -229,6 +231,8 @@ impl Mock {
             saves: 0,
             save_error: false,
             now_ms: 0,
+            yielded: false,
+            decision_deadline: None,
         }
     }
     fn guest(k: &Key, state: GuestState) -> Guest {
@@ -242,6 +246,12 @@ impl Mock {
     }
 }
 impl Io for Mock {
+    fn observation_deadline(&mut self, d: Option<std::time::Duration>) {
+        self.decision_deadline = d;
+    }
+    fn take_stop_yield(&mut self) -> bool {
+        std::mem::take(&mut self.yielded)
+    }
     fn monotonic(&mut self) -> Result<std::time::Duration, Fault> {
         Ok(std::time::Duration::from_millis(self.now_ms))
     }
@@ -268,7 +278,7 @@ impl Io for Mock {
         }
     }
     fn guests(&mut self, _: &Key) -> Result<Vec<Guest>, Fault> {
-        if self.engine_error {
+        if self.engine_error || self.yielded {
             Err(Fault)
         } else {
             Ok(self.guests.clone())
@@ -674,6 +684,8 @@ fn valid_inspection(id: &str, state: &str) -> serde_json::Value {
     j["HostConfig"]["DeviceCgroupRules"] = json!(["c 240:* rwm", "c 13:* rwm"]);
     j["HostConfig"]["Devices"] = json!([{"PathOnHost":"/dev/dri/card0","PathInContainer":"/dev/dri/card0","CgroupPermissions":"mrw"},{"PathOnHost":"/dev/dri/renderD128","PathInContainer":"/dev/dri/renderD128","CgroupPermissions":"mrw"}]);
     j["HostConfig"]["DeviceRequests"] = json!(null);
+    j["HostConfig"]["PublishAllPorts"] = json!(false);
+    j["HostConfig"]["CgroupnsMode"] = json!("private");
     j["HostConfig"]["PortBindings"] = json!({});
     let mounts = json!([
  {"Type":"bind","Source":"/srv/wolf-wow/prefix","Destination":"/home/retro/prefix","RW":true},
@@ -683,7 +695,22 @@ fn valid_inspection(id: &str, state: &str) -> serde_json::Value {
  {"Type":"bind","Source":"/srv/wolf-wow/state/fake-udev","Destination":"/usr/bin/fake-udev","RW":true},
  {"Type":"bind","Source":"/run/user/2001/pulse-socket","Destination":"/run/user/2001/pulse-socket","RW":true},
  {"Type":"bind","Source":"/run/user/2001/wayland-7","Destination":"/run/user/2001/wayland-7","RW":true}]);
-    json!({"Id":id,"Image":format!("sha256:{}","a".repeat(64)),"Config":{"Labels":{"mwow.nonce":"n","mwow.profile":"p"},"User":"2001","Entrypoint":["/opt/wolf/approved-entrypoint"],"Env":["WAYLAND_DISPLAY=wayland-7","PULSE_SERVER=/run/user/2001/pulse-socket","XDG_RUNTIME_DIR=/run/user/2001"]},"State":{"Status":state,"Running":state=="running","Pid":if state=="running"{100}else{0},"Paused":false,"Restarting":false,"Dead":false},"HostConfig":j["HostConfig"],"Mounts":mounts})
+    j["HostConfig"]["Binds"] = serde_json::Value::Array(
+        mounts
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                json!(format!(
+                    "{}:{}:{}",
+                    m["Source"].as_str().unwrap(),
+                    m["Destination"].as_str().unwrap(),
+                    if m["RW"] == true { "rw" } else { "ro" }
+                ))
+            })
+            .collect(),
+    );
+    json!({"Id":id,"Image":format!("sha256:{}","a".repeat(64)),"Config":{"Labels":{"mwow.nonce":"n","mwow.profile":"p"},"User":"2001","Entrypoint":["/opt/wolf/approved-entrypoint"],"Env":["WAYLAND_DISPLAY=wayland-7","PULSE_SERVER=/run/user/2001/pulse-socket","XDG_RUNTIME_DIR=/run/user/2001","WINEPREFIX=/home/retro/prefix","HOME=/home/retro"]},"State":{"Status":state,"Running":state=="running","Pid":if state=="running"{100}else{0},"Paused":false,"Restarting":false,"Dead":false},"HostConfig":j["HostConfig"],"Mounts":mounts})
 }
 #[test]
 fn r39_inspection_requires_mandatory_expected_envelope() {
@@ -730,4 +757,61 @@ fn r39_inspection_requires_mandatory_expected_envelope() {
         accepted.is_empty(),
         "incomplete/foreign envelopes accepted: {accepted:?}"
     );
+}
+
+#[test]
+fn bounded_io_stop_yield_preserves_owner_and_existing_single_deadline() {
+    let (p, k) = ready();
+    let mut c = Controller::start(Mock::new(), &p, k.clone()).ok().unwrap();
+    c.io.yielded = true;
+    assert_eq!(c.tick(), Phase::Stopping);
+    assert_eq!(c.io.stops, vec![ChildId { pid: 42, start: 77 }]);
+    assert_eq!(c.io.releases, 0);
+    c.io.guests = vec![Mock::guest(&k, GuestState::Running)];
+    c.io.now_ms = 4999;
+    assert_eq!(c.tick(), Phase::Stopping);
+    assert_eq!(
+        c.io.decision_deadline,
+        Some(std::time::Duration::from_secs(5))
+    );
+    c.io.now_ms = 5000;
+    assert_eq!(c.tick(), Phase::Unknown);
+}
+#[test]
+fn inspection_rejects_consistent_but_unexpected_mounts_duplicates_and_missing_fields() {
+    let (p, _) = ready();
+    let id = "a".repeat(64);
+    let base = valid_inspection(&id, "exited");
+    for mutation in 0..8 {
+        let mut d = base.clone();
+        match mutation {
+            0 => {
+                d["Mounts"][0]["Source"] = json!("/srv/wolf-wow/sibling");
+                d["HostConfig"]["Binds"][0] = json!("/srv/wolf-wow/sibling:/home/retro/prefix:rw");
+            }
+            1 => {
+                d.as_object_mut().unwrap().remove("Mounts");
+            }
+            2 => {
+                d.as_object_mut().unwrap().remove("HostConfig");
+            }
+            3 => {
+                d["HostConfig"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("NetworkMode");
+            }
+            4 => {
+                let mount = d["Mounts"][0].clone();
+                d["Mounts"][1] = mount;
+            }
+            5 => d["HostConfig"]["Devices"][0]["PathOnHost"] = json!("/dev/input/event0"),
+            6 => d["Config"]["Env"][0] = json!("WAYLAND_DISPLAY=../foreign"),
+            _ => d["HostConfig"]["DeviceCgroupRules"] = json!(["c *:* rwm"]),
+        };
+        assert!(
+            wolf_isolated::supervisor::decode_inspection(&d, &id, p.inspection_policy()).is_err(),
+            "mutation {mutation}"
+        );
+    }
 }

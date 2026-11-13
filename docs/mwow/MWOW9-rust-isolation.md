@@ -328,3 +328,49 @@ Docker (GET) и владеет lease/journal. Мёртвый владелец: `
 privileged/host-namespace и mounts docker.sock/X11/`/dev/input`/udev. Неверифицировано: совместимость
 Pulse `unix:` пути с нативным mount, образ/entrypoint/кэпы, миграция префикса. Provisioning, запуск
 и приёмка изоляции — отдельные решения Manager/пользователя.
+
+
+## R39 correction checkpoint (software source only)
+
+This section supersedes the old journal-only dead-owner verdict / inspect-blacklist description.
+
+- Current journal and domain marker are read under a separate short nonblocking epoch file gate.
+  Marker/journal mismatch, missing/partial data or busy writer => Unknown, never stale terminal
+  completion. Reserve and journal publication use the same gate. Bind factory/capture release and
+  all socket work are outside it. Status checks the epoch before IPC and after its reply; the owner
+  also checks current epoch before any control action/reply. Old scoped writes cannot overwrite a
+  new epoch. These are point-in-time observations, not input/runner permission grants.
+- Every production socket path uses nonblocking connect/write/read and ONE absolute monotonic
+  budget per request: Docker <=500ms (also capped by remaining single5s stop decision), control
+  client2s, control server100ms. Poll slices <=10ms check the same budget/cancellation. No per-byte
+  reset, blocking connect, new worker or blind global retry. Linux backlog EAGAIN refuses promptly.
+  A pending signal yields engine observation to the same controller's exact child-stop path;
+  cancellation itself is not an unrelated-domain fault. Engine timeout/error => sticky Unknown.
+  An invalid/slow unreserved control frame provides no completion receipt and does not acquire
+  authority over a healthy owner. All decision durations are policy, not physical/scheduler/disk
+  completion guarantees. The caller must still drive the owner loop.
+- Decode requires typed HostConfig, Config/Env and Mounts; exact fixed namespaces, helper cap set,
+  NNP, private tmpfs declaration, empty port bindings/device requests, and matching guest user/image.
+  Expected topology is retained from Prepared, not synthesized from inspect data. Native linked
+  primary/render nodes are discovered from bounded sysfs metadata for the already-supported
+  Intel/AMD path (no GPU open); native input/hidraw cgroup additions are captured from /proc/devices.
+  Exactly two configured mounts plus native app-state/udev/helper/Pulse/Wayland bind mounts must
+  match sources/destinations/RW, with identical HostConfig.Binds. Wayland has one bounded basename
+  from the actual Env and exactly one matching private-runtime mount; no path-prefix wildcard.
+  Missing/foreign namespace/cap/device/mount shapes fail closed. The actual static event node is
+  still NOT a runtime prerequisite; native ARRIVAL/queue creates it later.
+
+The decoder's inspect field/API representation is deliberately strict. Absent CgroupnsMode or
+DeviceRequests and unsupported tmpfs Mounts representations remain Unknown; actual daemon/API
+shape and Pulse canonical path interoperability need deployment evidence before acceptance/use.
+A proposed permissive compatibility change was rejected by automatic approval review and NOT
+applied. There is no claim of universal Docker-version compatibility, kernel delivery, fresh-node
+ACL/open-FD proof, Wine caps or physical isolation from these software fixtures.
+
+Evidence: author thread-storage checks/r39, with semantic RED actual store/drip/decoder assertions,
+then GREEN regression bodies; two previous positive decoder fixtures required new mandatory typed
+fields and the captured expectation argument. Their old assertions were retained. All old foundation
+fixture bytes remain unchanged. The final unfiltered chain binds actual Cargo exit status, argv/env,
+source/log/binary hashes; prior filtered Claude output is historical and is not a final PASS receipt.
+Read-only deployment checklist: author storage analysis/deployment-readiness-7b8/report.md (458words).
+No e1 source/build/lib, game/prefix, daemon/user/udev/service or provisioning change in this correction.

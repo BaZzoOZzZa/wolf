@@ -9,7 +9,7 @@ use std::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             fs::{FileTypeExt, MetadataExt, OpenOptionsExt},
-            net::{UnixListener, UnixStream},
+            net::UnixListener,
         },
     },
     path::{Path, PathBuf},
@@ -181,6 +181,9 @@ pub(crate) fn private_file(path: &Path, uid: u32, limit: u64) -> Result<Vec<u8>,
     Ok(b)
 }
 pub(crate) fn exclusive(path: &Path, uid: u32) -> Result<File, Fault> {
+    advisory_lock(path, uid, 2 | 4)
+}
+pub(crate) fn advisory_lock(path: &Path, uid: u32, operation: i32) -> Result<File, Fault> {
     if let Ok(m) = fs::symlink_metadata(path) {
         if !m.is_file() || m.uid() != uid || m.mode() & 0o077 != 0 {
             return Err(Fault);
@@ -194,7 +197,7 @@ pub(crate) fn exclusive(path: &Path, uid: u32) -> Result<File, Fault> {
         .mode(0o600)
         .open(path)
         .map_err(|_| Fault)?;
-    if unsafe { flock(f.as_raw_fd(), 2 | 4) } != 0 {
+    if unsafe { flock(f.as_raw_fd(), operation) } != 0 {
         return Err(Fault);
     }
     Ok(f)
@@ -259,71 +262,72 @@ fn escape(s: &str) -> String {
         })
         .collect()
 }
-fn get(socket: &str, path: &str) -> Result<Value, Fault> {
-    if !path.starts_with("/v1.40/") || path.bytes().any(|b| b == b'\r' || b == b'\n') {
-        return Err(Fault);
+fn get(socket: &str, path: &str) -> Result<Value, crate::request_io::Error> {
+    get_with_limit(socket, path, Duration::from_millis(500))
+}
+fn get_with_limit(
+    socket: &str,
+    path: &str,
+    limit: Duration,
+) -> Result<Value, crate::request_io::Error> {
+    use crate::request_io::{
+        connect, read_response, write_request, Budget, Error, NativeClock, UnixConnector,
+    };
+    if !path.starts_with("/v1.40/")
+        || path.len() > 4096
+        || path.bytes().any(|b| b == b'\r' || b == b'\n')
+    {
+        return Err(Error::Fault);
     }
-    let mut s = UnixStream::connect(socket).map_err(|_| Fault)?;
-    s.set_read_timeout(Some(Duration::from_millis(500)))
-        .map_err(|_| Fault)?;
-    s.set_write_timeout(Some(Duration::from_millis(500)))
-        .map_err(|_| Fault)?;
-    write!(
-        s,
-        "GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n"
-    )
-    .map_err(|_| Fault)?;
-    let mut budget = crate::request_io::Budget::new(
-        crate::request_io::NativeClock::new(|| STOP.load(Ordering::Relaxed)),
-        Duration::from_millis(500),
-    )
-    .map_err(|_| Fault)?;
-    let b = crate::request_io::read_response(&mut s, &mut budget, 256 * 1024).map_err(|_| Fault)?;
-    let split = b.windows(4).position(|s| s == b"\r\n\r\n").ok_or(Fault)?;
-    let h = std::str::from_utf8(&b[..split]).map_err(|_| Fault)?;
-    if !h
+    let mut budget = Budget::new(NativeClock::new(|| STOP.load(Ordering::Relaxed)), limit)?;
+    let mut connector = UnixConnector::new(Path::new(socket)).map_err(|_| Error::Fault)?;
+    let mut stream = connect(&mut connector, &mut budget)?;
+    let request = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    write_request(&mut stream, &mut budget, request.as_bytes())?;
+    stream
+        .shutdown(std::net::Shutdown::Write)
+        .map_err(|_| Error::Fault)?;
+    let b = read_response(&mut stream, &mut budget, 256 * 1024)?;
+    let split = b
+        .windows(4)
+        .position(|s| s == b"\r\n\r\n")
+        .ok_or(Error::Fault)?;
+    if split > 8192 {
+        return Err(Error::Fault);
+    }
+    let header = std::str::from_utf8(&b[..split]).map_err(|_| Error::Fault)?;
+    if !header
         .lines()
         .next()
         .is_some_and(|s| s.split_whitespace().nth(1) == Some("200"))
-        || h.to_ascii_lowercase().contains("transfer-encoding:")
+        || header.to_ascii_lowercase().contains("transfer-encoding:")
     {
-        return Err(Fault);
+        return Err(Error::Fault);
     }
-    serde_json::from_slice(&b[split + 4..]).map_err(|_| Fault)
+    let lengths = header
+        .lines()
+        .filter_map(|l| l.split_once(':'))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+        .map(|(_, v)| v.trim().parse::<usize>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| Error::Fault)?;
+    if lengths.len() > 1 || lengths.first().is_some_and(|n| *n != b.len() - split - 4) {
+        return Err(Error::Fault);
+    }
+    let result = serde_json::from_slice(&b[split + 4..]).map_err(|_| Error::Fault)?;
+    budget.remaining()?;
+    Ok(result)
 }
 /// Decode the real Docker GET inspect path; uncertain/dead is never an exit receipt.
 pub fn decode_inspection(
     d: &Value,
     id: &str,
-    _expected: &crate::inspection::Policy,
+    expected: &crate::inspection::Policy,
 ) -> Result<Guest, Fault> {
     if d["Id"] != id || id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Fault);
     }
-    // Observed host config must not carry host-shared escape hatches; otherwise the
-    // observation is not of the reviewed guest and cannot count as a receipt.
-    let hc = &d["HostConfig"];
-    if hc["Privileged"] == true
-        || ["NetworkMode", "PidMode", "IpcMode", "UTSMode", "UsernsMode"]
-            .iter()
-            .any(|k| hc[*k] == "host")
-    {
-        return Err(Fault);
-    }
-    if let Some(ms) = d["Mounts"].as_array() {
-        for m in ms {
-            let src = m["Source"].as_str().ok_or(Fault)?;
-            let bad = src.ends_with("docker.sock")
-                || src.contains(".X11-unix")
-                || src == "/"
-                || src == "/dev"
-                || src.starts_with("/dev/input")
-                || src.starts_with("/run/udev");
-            if bad {
-                return Err(Fault);
-            }
-        }
-    }
+    expected.validate(d)?;
     let state = &d["State"];
     let clean = state["Paused"] == false && state["Restarting"] == false && state["Dead"] == false;
     let status = match state["Status"].as_str() {
@@ -366,6 +370,24 @@ struct NativeIo {
     listener: Option<UnixListener>,
     started: Instant,
     inspection: crate::inspection::Policy,
+    yielded_stop: bool,
+    observation_deadline: Option<Duration>,
+}
+impl NativeIo {
+    fn observation_get(&mut self, path: &str) -> Result<Value, Fault> {
+        let mut limit = Duration::from_millis(500);
+        if let Some(deadline) = self.observation_deadline {
+            limit = limit.min(deadline.checked_sub(self.started.elapsed()).ok_or(Fault)?);
+        }
+        match get_with_limit(&self.socket, path, limit) {
+            Ok(v) => Ok(v),
+            Err(crate::request_io::Error::Interrupted) => {
+                self.yielded_stop = true;
+                Err(Fault)
+            }
+            Err(_) => Err(Fault),
+        }
+    }
 }
 impl Drop for NativeIo {
     fn drop(&mut self) {
@@ -380,6 +402,12 @@ impl Drop for NativeIo {
     }
 }
 impl Io for NativeIo {
+    fn observation_deadline(&mut self, deadline: Option<Duration>) {
+        self.observation_deadline = deadline;
+    }
+    fn take_stop_yield(&mut self) -> bool {
+        std::mem::take(&mut self.yielded_stop)
+    }
     fn monotonic(&mut self) -> Result<Duration, Fault> {
         Ok(self.started.elapsed())
     }
@@ -466,13 +494,10 @@ impl Io for NativeIo {
     }
     fn guests(&mut self, key: &Key) -> Result<Vec<Guest>, Fault> {
         let filters = json!({"label":[format!("mwow.nonce={}",key.nonce),format!("mwow.profile={}",key.profile)]});
-        let list = get(
-            &self.socket,
-            &format!(
-                "/v1.40/containers/json?all=1&filters={}",
-                escape(&filters.to_string())
-            ),
-        )?;
+        let list = self.observation_get(&format!(
+            "/v1.40/containers/json?all=1&filters={}",
+            escape(&filters.to_string())
+        ))?;
         let list = list.as_array().ok_or(Fault)?;
         if list.len() > 1 {
             return Err(Fault);
@@ -483,7 +508,7 @@ impl Io for NativeIo {
             if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
                 return Err(Fault);
             }
-            let detail = get(&self.socket, &format!("/v1.40/containers/{id}/json"))?;
+            let detail = self.observation_get(&format!("/v1.40/containers/{id}/json"))?;
             out.push(decode_inspection(&detail, id, &self.inspection)?);
         }
         Ok(out)
@@ -591,31 +616,43 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
             ));
         }
         check_key(&j, &digest(&pb.bytes), &digest(&sb.bytes))?;
-        let mut stream = UnixStream::connect(dir.join("control.sock")).map_err(|_| err())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .map_err(|_| err())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .map_err(|_| err())?;
-        stream
-            .write_all(
-                &serde_json::to_vec(&Request {
-                    action: action.into(),
-                    key: j.key,
-                })
-                .map_err(|_| err())?,
-            )
-            .map_err(|_| err())?;
-        stream
-            .shutdown(std::net::Shutdown::Write)
-            .map_err(|_| err())?;
-        let mut b = Vec::new();
-        stream.take(4097).read_to_end(&mut b).map_err(|_| err())?;
-        if b.len() > 4096 {
-            return Err(err());
+        if !crate::epoch::Store::new(&dir, p.remote_uid)
+            .snapshot()
+            .is_ok_and(|current| current.key == j.key)
+        {
+            return Ok(view(Phase::Unknown));
         }
-        return serde_json::from_slice(&b).map_err(|_| err());
+        let expected_key = j.key.clone();
+        let exchange = (|| -> Result<View, crate::request_io::Error> {
+            use crate::request_io::*;
+            let mut budget = Budget::new(NativeClock::new(|| false), Duration::from_secs(2))?;
+            let mut connector =
+                UnixConnector::new(&dir.join("control.sock")).map_err(|_| Error::Fault)?;
+            let mut stream = connect(&mut connector, &mut budget)?;
+            let bytes = serde_json::to_vec(&Request {
+                action: action.into(),
+                key: j.key,
+            })
+            .map_err(|_| Error::Fault)?;
+            write_request(&mut stream, &mut budget, &bytes)?;
+            stream
+                .shutdown(std::net::Shutdown::Write)
+                .map_err(|_| Error::Fault)?;
+            let bytes = read_response(&mut stream, &mut budget, 4096)?;
+            let reply: View = serde_json::from_slice(&bytes).map_err(|_| Error::Fault)?;
+            budget.remaining()?;
+            if reply.completion != (reply.phase == Phase::Stopped) {
+                return Err(Error::Fault);
+            }
+            Ok(reply)
+        })();
+        if !crate::epoch::Store::new(&dir, p.remote_uid)
+            .snapshot()
+            .is_ok_and(|j| j.key == expected_key)
+        {
+            return Ok(view(Phase::Unknown));
+        }
+        return Ok(exchange.unwrap_or_else(|_| view(Phase::Unknown)));
     }
     let p = prepare(&mut source, profile_path, spec_path)?;
     let image = get(
@@ -652,6 +689,8 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
         listener: None,
         started: Instant::now(),
         inspection: p.inspection.clone(),
+        yielded_stop: false,
+        observation_deadline: None,
     };
     struct Signals(usize, usize);
     impl Drop for Signals {
@@ -675,26 +714,41 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
     }
     let mut stop_at = None;
     loop {
-        if STOP.load(Ordering::Relaxed) && stop_at.is_none() {
+        if STOP.swap(false, Ordering::Relaxed) {
             c.stop(&c.journal.key.clone());
             stop_at = Some(Instant::now());
         }
         if let Ok((mut stream, _)) = c.io.listener.as_ref().ok_or_else(err)?.accept() {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-            let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-            let mut b = Vec::new();
-            if (&mut stream).take(4097).read_to_end(&mut b).is_ok() && b.len() <= 4096 {
-                if let Ok(req) = serde_json::from_slice::<Request>(&b) {
-                    if req.key == c.journal.key && ["status", "stop"].contains(&req.action.as_str())
-                    {
-                        if req.action == "stop" {
-                            c.stop(&req.key);
-                            if stop_at.is_none() {
-                                stop_at = Some(Instant::now());
+            use crate::request_io::{read_response, write_request, Budget, NativeClock};
+            if stream.set_nonblocking(true).is_ok() {
+                let mut budget = Budget::new(
+                    NativeClock::new(|| STOP.load(Ordering::Relaxed)),
+                    Duration::from_millis(100),
+                )
+                .map_err(|_| err())?;
+                if let Ok(bytes) = read_response(&mut stream, &mut budget, 4096) {
+                    if let Ok(req) = serde_json::from_slice::<Request>(&bytes) {
+                        if req.key == c.journal.key
+                            && ["status", "stop"].contains(&req.action.as_str())
+                        {
+                            let current = crate::epoch::Store::new(&c.io.dir, c.io.uid)
+                                .snapshot()
+                                .is_ok_and(|j| j.key == c.journal.key);
+                            let response = if current {
+                                if req.action == "stop" {
+                                    c.stop(&req.key);
+                                    if stop_at.is_none() {
+                                        stop_at = Some(Instant::now());
+                                    }
+                                }
+                                view(c.journal.phase)
+                            } else {
+                                view(Phase::Unknown)
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&response) {
+                                let _ = write_request(&mut stream, &mut budget, &bytes);
                             }
                         }
-                        let _ =
-                            stream.write_all(&serde_json::to_vec(&view(c.journal.phase)).unwrap());
                     }
                 }
             }
