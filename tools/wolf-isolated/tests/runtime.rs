@@ -129,6 +129,8 @@ fn fixture() -> (Files, Profile, Spec, Key) {
         input_rule: rule,
     };
     let prefix = PrefixContract {
+        mode: wolf_isolated::PrefixMode::MigratedPrivate,
+        shared_clean_stop: None,
         profile_sha256: digest(&pb),
         source_dev: 1,
         source_ino: 1,
@@ -814,4 +816,392 @@ fn inspection_rejects_consistent_but_unexpected_mounts_duplicates_and_missing_fi
             "mutation {mutation}"
         );
     }
+}
+
+// Primitive metadata provider only; all permission/config/inspect decisions are production code.
+struct SharedFiles {
+    inner: Files,
+    prefix_id: (u64, u64),
+    game_id: (u64, u64),
+    private_prefix: bool,
+    boot_override: Option<String>,
+}
+impl Source for SharedFiles {
+    fn root_file(&mut self, p: &str, n: u64) -> Result<Record, String> {
+        self.inner.root_file(p, n)
+    }
+    fn private_dir(&mut self, p: &str, u: u32) -> Result<(u64, u64), String> {
+        if p == wolf_isolated::EXISTING_PREFIX {
+            if !self.private_prefix || u != 2001 {
+                return Err("unprovisioned owner/mode".into());
+            }
+            Ok(self.prefix_id)
+        } else {
+            self.inner.private_dir(p, u)
+        }
+    }
+    fn directory_identity(&mut self, p: &str) -> Result<(u64, u64), String> {
+        if p == wolf_isolated::EXISTING_PREFIX {
+            Ok(self.prefix_id)
+        } else if p == wolf_isolated::EXISTING_GAME {
+            Ok(self.game_id)
+        } else {
+            self.inner.directory_identity(p)
+        }
+    }
+    fn socket(&mut self, p: &str, u: Option<u32>) -> Result<(), String> {
+        self.inner.socket(p, u)
+    }
+    fn device(&mut self, p: &str, g: u32) -> Result<(), String> {
+        self.inner.device(p, g)
+    }
+    fn uid(&self) -> u32 {
+        self.inner.uid()
+    }
+    fn gpu_vendor(&mut self, p: &str) -> Result<String, String> {
+        self.inner.gpu_vendor(p)
+    }
+    fn groups(&mut self) -> Result<Vec<u32>, String> {
+        self.inner.groups()
+    }
+    fn gpu_nodes(&mut self, p: &str) -> Result<Vec<String>, String> {
+        self.inner.gpu_nodes(p)
+    }
+    fn boot_id(&mut self) -> Result<String, String> {
+        match &self.boot_override {
+            Some(b) => Ok(b.clone()),
+            None => self.inner.boot_id(),
+        }
+    }
+    fn process_live(&mut self, p: &ChildId) -> Result<bool, String> {
+        self.inner.process_live(p)
+    }
+}
+fn shared_fixture() -> (SharedFiles, Profile, Spec) {
+    let (mut f, mut p, mut spec, _) = fixture();
+    p.prefix.mode = wolf_isolated::PrefixMode::SharedExistingExclusive;
+    p.prefix.source = wolf_isolated::EXISTING_PREFIX.into();
+    p.prefix.working = p.prefix.source.clone();
+    (p.prefix.source_dev, p.prefix.source_ino) = wolf_isolated::EXISTING_PREFIX_ID;
+    p.game_data = wolf_isolated::EXISTING_GAME.into();
+    p.game_access = wolf_isolated::GameAccess::ExistingWowRw;
+    p.image_kind = wolf_isolated::ImageKind::LocalImageId;
+    p.image = wolf_isolated::LOCAL_WOW_IMAGE_ID.into();
+    let bytes = serde_json::to_vec(&p).unwrap();
+    spec.profile_sha256 = digest(&bytes);
+    insert(&mut f.files, "/provision/profile.json", bytes);
+    let mut prefix: PrefixContract =
+        serde_json::from_slice(&f.files["/provision/prefix.json"].bytes).unwrap();
+    prefix.mode = p.prefix.mode;
+    prefix.profile_sha256 = spec.profile_sha256.clone();
+    (prefix.source_dev, prefix.source_ino) = wolf_isolated::EXISTING_PREFIX_ID;
+    (prefix.working_dev, prefix.working_ino) = wolf_isolated::EXISTING_PREFIX_ID;
+    prefix.migration_receipt_sha256.clear();
+    let receipt = SharedCleanStopReceipt {
+        schema: 1,
+        profile_sha256: spec.profile_sha256.clone(),
+        boot_id: prefix.boot_id.clone(),
+        prefix_path: p.prefix.source.clone(),
+        prefix_dev: prefix.source_dev,
+        prefix_ino: prefix.source_ino,
+        game_path: p.game_data.clone(),
+        game_dev: wolf_isolated::EXISTING_GAME_ID.0,
+        game_ino: wolf_isolated::EXISTING_GAME_ID.1,
+        original_processes: prefix.original_processes.clone(),
+    };
+    let pin = insert(
+        &mut f.files,
+        "/provision/actual-stop.json",
+        serde_json::to_vec(&receipt).unwrap(),
+    );
+    prefix.clean_stop_receipt_sha256 = pin.sha256.clone();
+    prefix.shared_clean_stop = Some(pin);
+    spec.prefix_contract = insert(
+        &mut f.files,
+        "/provision/prefix.json",
+        serde_json::to_vec(&prefix).unwrap(),
+    );
+    let mut c = config(&p);
+    c["profiles"][0]["apps"][0]["runner"]["mounts"][1] =
+        toml::Value::String(format!("{}:/games/wow:rw", p.game_data));
+    spec.config = insert(
+        &mut f.files,
+        "/provision/wolf.toml",
+        toml::to_string(&c).unwrap().into_bytes(),
+    );
+    let mut image: ImageContract =
+        serde_json::from_slice(&f.files["/provision/image.json"].bytes).unwrap();
+    image.image = p.image.clone();
+    image.image_id = p.image.clone();
+    spec.image_contract = insert(
+        &mut f.files,
+        "/provision/image.json",
+        serde_json::to_vec(&image).unwrap(),
+    );
+    insert(
+        &mut f.files,
+        "/provision/spec.json",
+        serde_json::to_vec(&spec).unwrap(),
+    );
+    (
+        SharedFiles {
+            inner: f,
+            prefix_id: wolf_isolated::EXISTING_PREFIX_ID,
+            game_id: wolf_isolated::EXISTING_GAME_ID,
+            private_prefix: true,
+            boot_override: None,
+        },
+        p,
+        spec,
+    )
+}
+fn rewrite_prefix(f: &mut SharedFiles, s: &mut Spec, change: impl FnOnce(&mut PrefixContract)) {
+    let mut p: PrefixContract =
+        serde_json::from_slice(&f.inner.files["/provision/prefix.json"].bytes).unwrap();
+    change(&mut p);
+    s.prefix_contract = insert(
+        &mut f.inner.files,
+        "/provision/prefix.json",
+        serde_json::to_vec(&p).unwrap(),
+    );
+    insert(
+        &mut f.inner.files,
+        "/provision/spec.json",
+        serde_json::to_vec(s).unwrap(),
+    );
+}
+#[test]
+fn shared_existing_prepare_requires_real_private_owner_and_typed_receipt() {
+    let (mut f, p, _) = shared_fixture();
+    assert!(wolf_isolated::validate(&p).is_empty());
+    assert!(prepare(&mut f, "/provision/profile.json", "/provision/spec.json").is_ok());
+    f.private_prefix = false;
+    assert!(prepare(&mut f, "/provision/profile.json", "/provision/spec.json").is_err());
+    for variant in 0..10 {
+        let (mut f, _, mut spec) = shared_fixture();
+        match variant {
+            0 => {
+                f.inner
+                    .files
+                    .get_mut("/provision/actual-stop.json")
+                    .unwrap()
+                    .uid = 1000;
+            }
+            1 => {
+                f.inner.files.remove("/provision/actual-stop.json");
+            }
+            2 => {
+                f.inner
+                    .files
+                    .get_mut("/provision/actual-stop.json")
+                    .unwrap()
+                    .bytes
+                    .push(b' ');
+            }
+            3 => {
+                f.prefix_id.1 += 1;
+            }
+            4 => {
+                f.game_id.1 += 1;
+            }
+            5 => {
+                f.inner.known_live = true;
+            }
+            6 => rewrite_prefix(&mut f, &mut spec, |p| {
+                p.mode = wolf_isolated::PrefixMode::MigratedPrivate
+            }),
+            7 => rewrite_prefix(&mut f, &mut spec, |p| p.shared_clean_stop = None),
+            8 => rewrite_prefix(&mut f, &mut spec, |p| p.original_processes.clear()),
+            _ => rewrite_prefix(&mut f, &mut spec, |p| {
+                p.migration_receipt_sha256 = "c".repeat(64)
+            }),
+        }
+        assert!(
+            prepare(&mut f, "/provision/profile.json", "/provision/spec.json").is_err(),
+            "variant {variant}"
+        );
+    }
+}
+#[test]
+fn shared_boundary_rechecks_retained_receipt_boot_identity_and_no_effect_on_failure() {
+    for variant in 0..8 {
+        let (mut f, _, _) = shared_fixture();
+        let p = prepare(&mut f, "/provision/profile.json", "/provision/spec.json").unwrap();
+        assert!(p.revalidate_shared_existing(&mut f).is_ok());
+        match variant {
+            0 => {
+                f.inner.files.remove("/provision/actual-stop.json");
+            }
+            1 => {
+                f.inner
+                    .files
+                    .get_mut("/provision/actual-stop.json")
+                    .unwrap()
+                    .uid = 1000;
+            }
+            2 => {
+                f.prefix_id.1 += 1;
+            }
+            3 => {
+                f.game_id.1 += 1;
+            }
+            4 => {
+                f.private_prefix = false;
+            }
+            5 => {
+                f.inner.known_live = true;
+            }
+            6 => {
+                f.boot_override = Some("foreign-boot".into());
+            }
+            _ => {
+                f.inner
+                    .files
+                    .get_mut("/provision/actual-stop.json")
+                    .unwrap()
+                    .bytes
+                    .push(b' ');
+            }
+        }
+        // Actual production pre-spawn checker; no mock creation/spawn acknowledgement.
+        assert!(p.revalidate_shared_existing(&mut f).is_err());
+    }
+}
+fn shared_inspection(id: &str) -> serde_json::Value {
+    let mut d = valid_inspection(id, "running");
+    d["Image"] = json!(wolf_isolated::LOCAL_WOW_IMAGE_ID);
+    d["Mounts"][0]["Source"] = json!(wolf_isolated::EXISTING_PREFIX);
+    d["Mounts"][1]["Source"] = json!(wolf_isolated::EXISTING_GAME);
+    d["Mounts"][1]["RW"] = json!(true);
+    d["HostConfig"]["Binds"][0] = json!(format!(
+        "{}:/home/retro/prefix:rw",
+        wolf_isolated::EXISTING_PREFIX
+    ));
+    d["HostConfig"]["Binds"][1] = json!(format!("{}:/games/wow:rw", wolf_isolated::EXISTING_GAME));
+    d
+}
+#[test]
+fn shared_rw_actual_inspection_rejects_ro_foreign_mounts_and_wrong_local_id() {
+    let (mut f, _, _) = shared_fixture();
+    let p = prepare(&mut f, "/provision/profile.json", "/provision/spec.json").unwrap();
+    let id = "a".repeat(64);
+    let d = shared_inspection(&id);
+    assert!(wolf_isolated::supervisor::decode_inspection(&d, &id, p.inspection_policy()).is_ok());
+    for variant in 0..5 {
+        let mut bad = d.clone();
+        match variant {
+            0 => bad["Mounts"][1]["RW"] = json!(false),
+            1 => {
+                bad["HostConfig"]["Binds"][1] =
+                    json!(format!("{}:/games/wow:ro", wolf_isolated::EXISTING_GAME))
+            }
+            2 => bad["Mounts"][0]["Source"] = json!("/foreign/prefix"),
+            3 => bad["Image"] = json!(format!("sha256:{}", "b".repeat(64))),
+            _ => bad["HostConfig"]["Binds"][0] = json!("/foreign/prefix:/home/retro/prefix:rw"),
+        }
+        assert!(
+            wolf_isolated::supervisor::decode_inspection(&bad, &id, p.inspection_policy()).is_err()
+        );
+    }
+    let mut c: toml::Value =
+        toml::from_str(std::str::from_utf8(&f.inner.files["/provision/wolf.toml"].bytes).unwrap())
+            .unwrap();
+    c["profiles"][0]["apps"][0]["runner"]["mounts"][1] =
+        toml::Value::String(format!("{}:/games/wow:ro", wolf_isolated::EXISTING_GAME));
+    let image: ImageContract =
+        serde_json::from_slice(&f.inner.files["/provision/image.json"].bytes).unwrap();
+    let (_, profile, _) = shared_fixture();
+    assert!(validate_config(&profile, &c, &image).is_err());
+}
+#[test]
+fn explicit_modes_do_not_relax_migrated_ro_registry_defaults() {
+    let (_, p, _, _) = fixture();
+    assert_eq!(p.prefix.mode, wolf_isolated::PrefixMode::MigratedPrivate);
+    assert_eq!(p.game_access, wolf_isolated::GameAccess::ReadOnly);
+    assert_eq!(p.image_kind, wolf_isolated::ImageKind::RegistryDigest);
+    let (_, p, _) = shared_fixture();
+    let value = serde_json::to_value(p).unwrap();
+    for field in [
+        "prefix-mode",
+        "game-access",
+        "image-kind",
+        "path",
+        "devino",
+        "image",
+    ] {
+        let mut bad = value.clone();
+        match field {
+            "prefix-mode" => bad["prefix"]["mode"] = json!("unknown"),
+            "game-access" => bad["game_access"] = json!("allow-rw"),
+            "image-kind" => bad["image_kind"] = json!("tag"),
+            "path" => bad["prefix"]["working"] = json!("/foreign/prefix"),
+            "devino" => bad["prefix"]["source_ino"] = json!(1),
+            _ => bad["image"] = json!("mwow:latest"),
+        }
+        assert!(wolf_isolated::parse(&serde_json::to_vec(&bad).unwrap())
+            .map(|p| !wolf_isolated::validate(&p).is_empty())
+            .unwrap_or(true));
+    }
+    let mut legacy = value;
+    legacy["prefix"]["mode"] = json!("migrated-private");
+    assert!(!wolf_isolated::validate(
+        &wolf_isolated::parse(&serde_json::to_vec(&legacy).unwrap()).unwrap()
+    )
+    .is_empty());
+}
+
+#[test]
+fn shared_receipt_valid_hash_cannot_retag_foreign_epoch_profile_paths_or_processes() {
+    for variant in 0..7 {
+        let (mut f, _, mut s) = shared_fixture();
+        let mut prefix: PrefixContract =
+            serde_json::from_slice(&f.inner.files["/provision/prefix.json"].bytes).unwrap();
+        let mut r: SharedCleanStopReceipt =
+            serde_json::from_slice(&f.inner.files["/provision/actual-stop.json"].bytes).unwrap();
+        match variant {
+            0 => r.boot_id = "old-boot".into(),
+            1 => r.profile_sha256 = "b".repeat(64),
+            2 => r.prefix_path = "/foreign/prefix".into(),
+            3 => r.prefix_ino += 1,
+            4 => r.game_ino += 1,
+            5 => r.original_processes.clear(),
+            _ => r.original_processes[0].start += 1,
+        }
+        let pin = insert(
+            &mut f.inner.files,
+            "/provision/actual-stop.json",
+            serde_json::to_vec(&r).unwrap(),
+        );
+        prefix.shared_clean_stop = Some(pin.clone());
+        prefix.clean_stop_receipt_sha256 = pin.sha256;
+        s.prefix_contract = insert(
+            &mut f.inner.files,
+            "/provision/prefix.json",
+            serde_json::to_vec(&prefix).unwrap(),
+        );
+        insert(
+            &mut f.inner.files,
+            "/provision/spec.json",
+            serde_json::to_vec(&s).unwrap(),
+        );
+        assert!(prepare(&mut f, "/provision/profile.json", "/provision/spec.json").is_err());
+    }
+}
+#[test]
+fn typed_local_image_requires_root_pinned_contract_exact_image_id() {
+    let (mut f, _, mut s) = shared_fixture();
+    let mut image: ImageContract =
+        serde_json::from_slice(&f.inner.files["/provision/image.json"].bytes).unwrap();
+    image.image_id = format!("sha256:{}", "b".repeat(64));
+    s.image_contract = insert(
+        &mut f.inner.files,
+        "/provision/image.json",
+        serde_json::to_vec(&image).unwrap(),
+    );
+    insert(
+        &mut f.inner.files,
+        "/provision/spec.json",
+        serde_json::to_vec(&s).unwrap(),
+    );
+    assert!(prepare(&mut f, "/provision/profile.json", "/provision/spec.json").is_err());
 }

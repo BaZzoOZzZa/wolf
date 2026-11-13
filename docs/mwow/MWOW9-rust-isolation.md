@@ -374,3 +374,63 @@ fixture bytes remain unchanged. The final unfiltered chain binds actual Cargo ex
 source/log/binary hashes; prior filtered Claude output is historical and is not a final PASS receipt.
 Read-only deployment checklist: author storage analysis/deployment-readiness-7b8/report.md (458words).
 No e1 source/build/lib, game/prefix, daemon/user/udev/service or provisioning change in this correction.
+
+
+## Shared existing prefix/game source increment (not provisioning or launch)
+
+Explicit user no-copy policy adds `prefix.mode=shared-existing-exclusive`,
+`game_access=existing-wow-rw`, `image_kind=local-image-id`. Omitted values preserve
+migrated-private/read-only/registry-digest defaults. The new example is deliberately
+**NOT provisioned**: artifact hashes/paths and real root contracts/receipts must
+come from separate reviewed actions. It is not an eligibility receipt.
+
+The shared mode is fixed to desktop UID1000/remote UID2001, exact prefix
+`/run/media/bazzoozza/Games/lutris/battlenet` dev2049/ino16646146 and game
+`/run/media/bazzoozza/Games/World of Warcraft` dev2049/ino25952257. Both source
+and working prefix are the same canonical directory. No clone/reflink/overlay.
+The exact local image configuration ID is pinned, not misrepresented as a registry
+manifest digest; root ImageContract and actual inspection.Image must agree.
+
+Shared PrefixContract.mode must agree and contains `shared_clean_stop: FilePin`.
+That root-owned bounded file is an actual operator clean-stop record with schema1,
+profile hash, current boot, exact paths/devinos and exact nonempty bounded original
+PID/starttime identities. Its SHA must equal clean_stop_receipt_sha256; migration
+hash is empty. Receipt parsing proves root provenance/binding, not that this tool
+performed a stop. Missing/replaced/unprivileged/stale/mismatched records refuse.
+Prefix must actually be remote-owned with private0700 permissions, not an ACL-only
+exception to Wine ownership. Both game mount strings and actual inspect Mounts/Binds
+must use the selected fixed access role; no arbitrary RW escape. Ancestor overlap,
+mandatory topology, Unknown retention and native sole-creator checks remain.
+
+prepare validates these facts. NativeIo::spawn revalidates retained shared receipt,
+boot, owner/private permissions, canonical devinos and original-process absence
+AFTER domain/devino leases are held and BEFORE active-config publication or child
+spawn. Migrated mode checker is a no-op. This is trusted-operator concurrency, not
+protection against hostile root or simultaneous uncooperative manual Wine launch;
+guest still takes the real prefix flock. It cannot establish unobserved process
+absence globally, and no new runtime/game scan is introduced.
+
+### Next permission request (proposal only, not executed)
+
+1. Review this source/software checkpoint. Then separately approve source-bound
+UID2001/groups/private state/runtime/cert/artifact/udev provisioning and private
+Pulse service configuration. No current source command applies these.
+2. Current prefix remains UID1000/mode0755: launch MUST refuse today. Before a READY
+trial, explicitly choose reversible existing-prefix ownership/private-mode changes
+with complete prior owner/mode/ACL inventory and rollback. ACL-only is insufficient
+for pinned Wine ownership. If original ownership must remain, real idmapped mounts
+need another source/permission review; no guard bypass is provided. Game RW access
+requires its own narrow permission plan. No copy/migration is implied.
+3. Root clean-closes the one existing WoW/Bnet only at the approved ready boundary,
+records current-boot exact process identities and root-owned bound receipt, then
+revalidates node ACL/FD exclusion, guest Winecaps0/NNP versus root-helper capabilities,
+private compositor/Pulse and native lifecycle. Existing shared writable game/prefix
+are **not filesystem-isolated**. No start, game/prefix modification, device access,
+container, provisioning or physical-isolation claim belongs to this source step.
+
+Tests appended to runtime.rs exercise actual prepare/revalidation/inspect decoders
+using primitive metadata/file fixtures. No real prefix or daemon is accessed.
+Original test bodies/assertions remain; only migrated PrefixContract fixture gains
+explicit default fields for source compatibility. Software execution awaits the
+separate CPU slot; adapter call ordering is source proof, not a real child-spawn
+or physical lifecycle test.

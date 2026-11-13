@@ -441,6 +441,8 @@ impl Io for NativeIo {
         crate::epoch::Store::new(&self.dir, self.uid).publish(j)
     }
     fn spawn(&mut self, p: &Prepared) -> Result<ChildId, SpawnError> {
+        p.revalidate_shared_existing(&mut NativeSource)
+            .map_err(|_| SpawnError::NoChild)?;
         let config = labeled_config(p, &self.key).map_err(|_| SpawnError::NoChild)?;
         atomic_write(&self.dir, "active-config.toml", config.as_bytes())
             .map_err(|_| SpawnError::NoChild)?;

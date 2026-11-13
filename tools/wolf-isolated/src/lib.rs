@@ -18,9 +18,50 @@ pub struct Artifact {
     pub path: String,
     pub sha256: String,
 }
+pub const LOCAL_WOW_IMAGE_ID: &str =
+    "sha256:84719e0af05e1ee4720e1d6605aed0bf9c3d55d7ebf24e159aee355580632505";
+pub const EXISTING_PREFIX: &str = "/run/media/bazzoozza/Games/lutris/battlenet";
+pub const EXISTING_GAME: &str = "/run/media/bazzoozza/Games/World of Warcraft";
+pub const EXISTING_PREFIX_ID: (u64, u64) = (2049, 16646146);
+pub const EXISTING_GAME_ID: (u64, u64) = (2049, 25952257);
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrefixMode {
+    #[default]
+    MigratedPrivate,
+    SharedExistingExclusive,
+}
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GameAccess {
+    #[default]
+    ReadOnly,
+    ExistingWowRw,
+}
+impl GameAccess {
+    pub(crate) fn writable(self) -> bool {
+        self == Self::ExistingWowRw
+    }
+    pub(crate) fn mount_mode(self) -> &'static str {
+        if self.writable() {
+            "rw"
+        } else {
+            "ro"
+        }
+    }
+}
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImageKind {
+    #[default]
+    RegistryDigest,
+    LocalImageId,
+}
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Prefix {
+    #[serde(default)]
+    pub mode: PrefixMode,
     pub source: String,
     pub wine_arch: String,
     pub source_dev: u64,
@@ -41,6 +82,10 @@ pub struct Profile {
     pub runtime: String,
     pub prefix: Prefix,
     pub game_data: String,
+    #[serde(default)]
+    pub game_access: GameAccess,
+    #[serde(default)]
+    pub image_kind: ImageKind,
     pub image: String,
     pub capabilities: Vec<String>,
     pub allow_mknod: bool,
@@ -171,15 +216,33 @@ pub fn validate(p: &Profile) -> Vec<String> {
     if paths.iter().any(|s| !bounded_path(s)) {
         e.push("invalid bounded absolute path".into());
     }
-    if !within(&p.prefix.working, &p.remote_home)
-        || p.prefix.working == p.remote_home
+    let prefix_ok = match p.prefix.mode {
+        PrefixMode::MigratedPrivate => {
+            within(&p.prefix.working, &p.remote_home)
+                && p.prefix.working != p.remote_home
+                && !within(&p.prefix.working, &p.prefix.source)
+                && !within(&p.prefix.source, &p.prefix.working)
+        }
+        PrefixMode::SharedExistingExclusive => {
+            p.remote_uid == 2001
+                && p.desktop_uid == 1000
+                && p.prefix.source == EXISTING_PREFIX
+                && p.prefix.working == EXISTING_PREFIX
+                && p.game_data == EXISTING_GAME
+                && (p.prefix.source_dev, p.prefix.source_ino) == EXISTING_PREFIX_ID
+        }
+    };
+    if !prefix_ok
         || within(&p.remote_home, &p.desktop_home)
         || within(&p.desktop_home, &p.remote_home)
-        || within(&p.prefix.working, &p.prefix.source)
-        || within(&p.prefix.source, &p.prefix.working)
         || p.runtime != format!("/run/user/{}", p.remote_uid)
     {
         e.push("prefix/home/runtime separation required".into());
+    }
+    if p.game_access == GameAccess::ExistingWowRw
+        && (p.prefix.mode != PrefixMode::SharedExistingExclusive || p.game_data != EXISTING_GAME)
+    {
+        e.push("existing WoW write role requires exact shared-existing profile".into());
     }
     // Fixed mount roles, never caller-provided arbitrary host mount tables.
     for s in [&p.prefix.working, &p.game_data, &p.remote_home] {
@@ -198,9 +261,13 @@ pub fn validate(p: &Profile) -> Vec<String> {
     {
         e.push("game-data must be a separate read-only tree, not desktop home/prefix".into());
     }
-    let image = p.image.split_once("@sha256:");
-    if !matches!(image, Some((name,digest)) if !name.is_empty() && name.len()<=256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"./_:-".contains(&b)) && hex(digest))
-    {
+    let image_ok = match p.image_kind {
+        ImageKind::RegistryDigest => {
+            matches!(p.image.split_once("@sha256:"), Some((name,digest)) if !name.is_empty() && name.len()<=256 && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"./_:-".contains(&b)) && hex(digest))
+        }
+        ImageKind::LocalImageId => p.image == LOCAL_WOW_IMAGE_ID,
+    };
+    if !image_ok {
         e.push("immutable image digest required".into());
     }
     let roles: BTreeSet<_> = p.artifacts.iter().map(|a| a.role.as_str()).collect();
@@ -365,7 +432,7 @@ fn proposal(p: &Profile) -> Proposal {
     ];
     for (source, target, ro) in [
         (&p.prefix.working, "/home/wolf/prefix", false),
-        (&p.game_data, "/games/wow", true),
+        (&p.game_data, "/games/wow", !p.game_access.writable()),
     ] {
         argv.push("--mount".into());
         argv.push(format!(

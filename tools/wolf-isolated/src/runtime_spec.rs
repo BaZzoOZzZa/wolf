@@ -41,6 +41,10 @@ pub struct ImageContract {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrefixContract {
+    #[serde(default)]
+    pub mode: crate::PrefixMode,
+    #[serde(default)]
+    pub shared_clean_stop: Option<FilePin>,
     pub profile_sha256: String,
     pub source_dev: u64,
     pub source_ino: u64,
@@ -50,6 +54,46 @@ pub struct PrefixContract {
     pub migration_receipt_sha256: String,
     pub boot_id: String,
     pub original_processes: Vec<crate::runtime::ChildId>,
+}
+/// Root-pinned operator receipt; this parser does not perform a clean stop.
+#[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCleanStopReceipt {
+    pub schema: u32,
+    pub profile_sha256: String,
+    pub boot_id: String,
+    pub prefix_path: String,
+    pub prefix_dev: u64,
+    pub prefix_ino: u64,
+    pub game_path: String,
+    pub game_dev: u64,
+    pub game_ino: u64,
+    pub original_processes: Vec<crate::runtime::ChildId>,
+}
+struct SharedBoundary {
+    pin: FilePin,
+    receipt: SharedCleanStopReceipt,
+    uid: u32,
+}
+impl SharedBoundary {
+    fn revalidate<S: Source>(&self, source: &mut S) -> Result<(), String> {
+        let actual: SharedCleanStopReceipt =
+            serde_json::from_slice(&pinned(source, &self.pin, 32768)?).map_err(|_| fail())?;
+        if actual != self.receipt
+            || source.boot_id()? != actual.boot_id
+            || source.private_dir(crate::EXISTING_PREFIX, self.uid)? != crate::EXISTING_PREFIX_ID
+            || source.directory_identity(crate::EXISTING_PREFIX)? != crate::EXISTING_PREFIX_ID
+            || source.directory_identity(crate::EXISTING_GAME)? != crate::EXISTING_GAME_ID
+        {
+            return Err(fail());
+        }
+        for process in &actual.original_processes {
+            if source.process_live(process)? {
+                return Err(fail());
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Clone)]
 pub struct Record {
@@ -72,6 +116,7 @@ pub trait Source {
 }
 // Fields are crate-private: the executable can only construct this through prepare().
 pub struct Prepared {
+    shared_boundary: Option<SharedBoundary>,
     pub(crate) spec: Spec,
     pub(crate) config: toml::Value,
     pub(crate) wolf: String,
@@ -89,6 +134,13 @@ pub struct Prepared {
     pub(crate) inspection: crate::inspection::Policy,
 }
 impl Prepared {
+    /// Called after outer leases and before any child/config publication; no-op for migrated mode.
+    pub fn revalidate_shared_existing<S: Source>(&self, source: &mut S) -> Result<(), String> {
+        if let Some(boundary) = &self.shared_boundary {
+            boundary.revalidate(source)?;
+        }
+        Ok(())
+    }
     pub fn inspection_policy(&self) -> &crate::inspection::Policy {
         &self.inspection
     }
@@ -180,7 +232,8 @@ pub fn prepare<S: Source>(
         serde_json::from_slice(&pinned(s, &spec.image_contract, 32768)?).map_err(|_| fail())?;
     let prefix: PrefixContract =
         serde_json::from_slice(&pinned(s, &spec.prefix_contract, 32768)?).map_err(|_| fail())?;
-    if image.image != p.image
+    if (p.image_kind == crate::ImageKind::LocalImageId && p.image != image.image_id)
+        || image.image != p.image
         || image.native_revision != E1
         || image
             .image_id
@@ -291,10 +344,45 @@ pub fn prepare<S: Source>(
         || prefix.source_ino != p.prefix.source_ino
         || working != (prefix.working_dev, prefix.working_ino)
         || !hex(&prefix.clean_stop_receipt_sha256)
-        || !hex(&prefix.migration_receipt_sha256)
+        || prefix.mode != p.prefix.mode
+        || (p.prefix.mode == crate::PrefixMode::MigratedPrivate
+            && (!hex(&prefix.migration_receipt_sha256) || prefix.shared_clean_stop.is_some()))
     {
         return Err(fail());
     }
+    let shared_boundary = if p.prefix.mode == crate::PrefixMode::SharedExistingExclusive {
+        let pin = prefix.shared_clean_stop.clone().ok_or_else(fail)?;
+        let receipt: SharedCleanStopReceipt =
+            serde_json::from_slice(&pinned(s, &pin, 32768)?).map_err(|_| fail())?;
+        if receipt.schema != 1
+            || receipt.profile_sha256 != digest(&pb)
+            || receipt.boot_id != prefix.boot_id
+            || receipt.prefix_path != crate::EXISTING_PREFIX
+            || (receipt.prefix_dev, receipt.prefix_ino) != crate::EXISTING_PREFIX_ID
+            || receipt.game_path != crate::EXISTING_GAME
+            || (receipt.game_dev, receipt.game_ino) != crate::EXISTING_GAME_ID
+            || receipt.original_processes != prefix.original_processes
+            || receipt.original_processes.is_empty()
+            || receipt.original_processes.iter().enumerate().any(|(i, x)| {
+                receipt.original_processes[..i]
+                    .iter()
+                    .any(|y| x.pid == y.pid)
+            })
+            || prefix.clean_stop_receipt_sha256 != pin.sha256
+            || !prefix.migration_receipt_sha256.is_empty()
+        {
+            return Err(fail());
+        }
+        let boundary = SharedBoundary {
+            pin,
+            receipt,
+            uid: p.remote_uid,
+        };
+        boundary.revalidate(s)?;
+        Some(boundary)
+    } else {
+        None
+    };
     s.socket(&format!("{}/pulse-socket", p.runtime), Some(p.remote_uid))?;
     s.socket(&spec.docker_socket, None)?;
     s.device(&p.render_node, p.render_gid)?;
@@ -364,6 +452,7 @@ pub fn prepare<S: Source>(
         &image.image_id,
     );
     Ok(Prepared {
+        shared_boundary,
         wolf: p
             .artifacts
             .iter()
@@ -497,7 +586,7 @@ pub fn validate_config(p: &Profile, c: &toml::Value, i: &ImageContract) -> Resul
     arr(runner, "ports", 0)?;
     let expected_mounts = [
         format!("{}:/home/retro/prefix:rw", p.prefix.working),
-        format!("{}:/games/wow:ro", p.game_data),
+        format!("{}:/games/wow:{}", p.game_data, p.game_access.mount_mode()),
     ];
     let mounts = arr(runner, "mounts", 2)?;
     if mounts

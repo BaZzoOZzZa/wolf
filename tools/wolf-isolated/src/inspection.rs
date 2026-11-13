@@ -7,6 +7,7 @@ pub struct Policy {
     pub(crate) state: String,
     pub(crate) prefix: String,
     pub(crate) game: String,
+    game_writable: bool,
     pub(crate) helper: String,
     pub(crate) gpu: Vec<String>,
     pub(crate) rules: Vec<String>,
@@ -27,6 +28,7 @@ impl Policy {
             state: state.into(),
             prefix: p.prefix.working.clone(),
             game: p.game_data.clone(),
+            game_writable: p.game_access.writable(),
             helper: helper.into(),
             gpu,
             rules,
@@ -174,7 +176,7 @@ impl Policy {
         }
         let expected: BTreeMap<String, (String, bool)> = BTreeMap::from([
             ("/home/retro/prefix".into(), (self.prefix.clone(), true)),
-            ("/games/wow".into(), (self.game.clone(), false)),
+            ("/games/wow".into(), (self.game.clone(), self.game_writable)),
             (
                 "/home/retro".into(),
                 (format!("{}/client/WoW", self.state), true),
