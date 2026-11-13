@@ -307,9 +307,7 @@ fn get_with_limit(
     let mut stream = connect(&mut connector, &mut budget)?;
     let request = format!("GET {path} HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     write_request(&mut stream, &mut budget, request.as_bytes())?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .map_err(|_| Error::Fault)?;
+    // The response ends at Connection: close EOF; keep the HTTP request alive until then.
     let b = read_response(&mut stream, &mut budget, 256 * 1024)?;
     let split = b
         .windows(4)
@@ -686,7 +684,7 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
         &p.spec.docker_socket,
         &format!("/v1.40/images/{}/json", escape(&p.image_id)),
     )
-    .map_err(|_| err())?;
+    .map_err(|_| "prelaunch stage=docker-image-get".to_owned())?;
     if image["Id"] != p.image_id
         || (p.image_kind == crate::ImageKind::RegistryDigest
             && !image["RepoDigests"]
@@ -694,7 +692,7 @@ pub fn command(action: &str, profile_path: &str, spec_path: &str) -> Result<View
                 .is_some_and(|a| a.iter().any(|d| d.as_str() == Some(p.image_ref.as_str()))))
         || image["Config"]["Entrypoint"] != json!(["/opt/wolf/approved-entrypoint"])
     {
-        return Err(err());
+        return Err("prelaunch stage=docker-image-identity".to_owned());
     }
     let key = Key {
         boot: boot()?,
