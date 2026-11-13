@@ -143,8 +143,8 @@ bool write_to_disk(pkey_ptr pkey, std::string_view pkey_filename, x509_ptr x509,
 }
 
 bool cert_exists(std::string_view pkey_filename, std::string_view cert_filename) {
-  std::fstream pkey_fs(pkey_filename.data());
-  std::fstream cert_fs(cert_filename.data());
+  std::ifstream pkey_fs(pkey_filename.data());
+  std::ifstream cert_fs(cert_filename.data());
   return pkey_fs.good() && cert_fs.good();
 }
 
