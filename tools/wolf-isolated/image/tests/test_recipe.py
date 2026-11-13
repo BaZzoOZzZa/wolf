@@ -7,6 +7,13 @@ IMAGE = Path(__file__).resolve().parents[1]
 
 
 class Recipe(unittest.TestCase):
+    def test_bounded_parallel_downloads_in_options(self):
+        recipe = (IMAGE / 'Dockerfile').read_text()
+        options = recipe.split("'[options]'", 1)[1].split("'[core]'", 1)[0]
+        self.assertEqual(options.count("'ParallelDownloads = 5'"), 1)
+        self.assertEqual(recipe.count('ParallelDownloads'), 1)
+        self.assertNotIn('DisableDownloadTimeout', recipe)
+
     def test_oci_and_package_evidence(self):
         raw = (IMAGE / 'evidence/base-amd64-manifest.json').read_bytes()
         digest = 'sha256:' + hashlib.sha256(raw).hexdigest()

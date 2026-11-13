@@ -4,7 +4,7 @@ FROM --platform=linux/amd64 docker.io/library/archlinux@sha256:fcee73ea1b96e2362
 COPY package-db.sha256 packages.requested /opt/wolf/
 # Full upgrade in one frozen snapshot, with signatures and exact database bytes.
 # No host Gamescope, no alternate Wine package, no host package/cache mutation.
-RUN printf '%s\n' '[options]' 'Architecture = x86_64' \
+RUN printf '%s\n' '[options]' 'Architecture = x86_64' 'ParallelDownloads = 5' \
       'SigLevel = Required DatabaseOptional' 'LocalFileSigLevel = Required' \
       '[core]' 'Server = https://archive.archlinux.org/repos/2026/11/12/core/os/$arch' \
       '[extra]' 'Server = https://archive.archlinux.org/repos/2026/11/12/extra/os/$arch' \
