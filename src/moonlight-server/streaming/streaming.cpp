@@ -179,15 +179,16 @@ void start_audio_producer(const sessions::RunScope &run_scope,
   if (!run_scope)
     return;
   const auto session_id = run_scope.id();
-  auto pipeline = fmt::format("pulsesrc device=\"{sink_name}\" server=\"{server_name}\" ! "                           //
+  // MVP: send clocked silence per user request while real audio capture is disabled.
+  (void)sink_name;
+  (void)server_name;
+  auto pipeline = fmt::format("audiotestsrc is-live=true wave=silence ! "                                             //
                               "audio/x-raw, channels={channels}, channel-mask=(bitmask){channel_mask}, rate=48000 ! " //
                               "queue leaky=downstream max-size-buffers=3 ! "                                          //
                               "interpipesink name=\"{session_id}_audio\" sync=true async=false max-buffers=3",
                               fmt::arg("session_id", run_scope.resource_key()),
                               fmt::arg("channels", channel_count),
-                              fmt::arg("channel_mask", channel_mask),
-                              fmt::arg("sink_name", sink_name),
-                              fmt::arg("server_name", server_name));
+                              fmt::arg("channel_mask", channel_mask));
   logs::log(logs::debug, "[GSTREAMER] Starting audio producer: {}", pipeline);
 
   run_pipeline(pipeline, [=](auto pipeline) {
