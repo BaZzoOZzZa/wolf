@@ -1,0 +1,15 @@
+python=3.14.10-1
+gamescope=3.17.0-1
+xorg-xwayland=24.1.15-1
+mesa=1:26.2.6-1
+vulkan-intel=1:26.2.6-1
+vulkan-radeon=1:26.2.6-1
+libpulse=17.0+r134+g77d25a1e6-2
+gnutls=3.8.13-3
+lib32-glibc=2.44+r50+g1848099f063e-1
+lib32-mesa=1:26.2.6-1
+lib32-vulkan-intel=1:26.2.6-1
+lib32-vulkan-radeon=1:26.2.6-1
+lib32-libpulse=17.0+r98+gb096704c0-1
+lib32-gnutls=3.8.13-3
+lib32-vulkan-icd-loader=1.4.363.0-1

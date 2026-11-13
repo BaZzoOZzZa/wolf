@@ -1,0 +1,133 @@
+{
+  "snapshot": "2026/11/12",
+  "databases": {
+    "core": {
+      "url": "https://archive.archlinux.org/repos/2026/11/12/core/os/x86_64/core.db",
+      "sha256": "dbc77947eec0a897d9c8c3c59885e2259d7885ca4d6732b8f566b8ca6e3ead03"
+    },
+    "extra": {
+      "url": "https://archive.archlinux.org/repos/2026/11/12/extra/os/x86_64/extra.db",
+      "sha256": "856d34d1d90d83df62d14854fd6d2c2c5a39e72c560a55f660a29546832ebd87"
+    },
+    "multilib": {
+      "url": "https://archive.archlinux.org/repos/2026/11/12/multilib/os/x86_64/multilib.db",
+      "sha256": "6197ffad53f8bc924abc260a80bbb30a5a1580a27dcda511f9bb569327f6ab0a"
+    }
+  },
+  "selected_packages": {
+    "glibc": {
+      "repo": "core",
+      "version": "2.44+r50+g1848099f063e-1",
+      "sha256": "e8e4d50d45cb2bd21c9f7eabacc6a01bd5eb93dbd476f3f44d44038fc1eba417",
+      "filename": "glibc-2.44+r50+g1848099f063e-1-x86_64.pkg.tar.zst"
+    },
+    "gnutls": {
+      "repo": "core",
+      "version": "3.8.13-3",
+      "sha256": "a61d5d908aa83ad2ed6ddffda70ae2ddb5a81852dddcbf68ec42c1744e8a8ee9",
+      "filename": "gnutls-3.8.13-3-x86_64.pkg.tar.zst"
+    },
+    "lib32-glibc": {
+      "repo": "core",
+      "version": "2.44+r50+g1848099f063e-1",
+      "sha256": "a977f9a6a405ab85e594aa9f1230a0b7dddfc33e3de5f2cb66931c92a48931d8",
+      "filename": "lib32-glibc-2.44+r50+g1848099f063e-1-x86_64.pkg.tar.zst"
+    },
+    "libgcc": {
+      "repo": "core",
+      "version": "16.2.1+r23+gd564253eb6c8-1",
+      "sha256": "7367dad49fc3229bde804816d412ab77306d433b1f92e4126b8b3ba3502c67d6",
+      "filename": "libgcc-16.2.1+r23+gd564253eb6c8-1-x86_64.pkg.tar.zst"
+    },
+    "libstdc++": {
+      "repo": "core",
+      "version": "16.2.1+r23+gd564253eb6c8-1",
+      "sha256": "15dc6bd2f3a2ee17fcd79a14325e9e0037722a592b2bdc55e1665d92112eaa51",
+      "filename": "libstdc++-16.2.1+r23+gd564253eb6c8-1-x86_64.pkg.tar.zst"
+    },
+    "python": {
+      "repo": "core",
+      "version": "3.14.10-1",
+      "sha256": "1e40927a3a91c0684e2dfe390eea5368d02cbc43371d6ac220e18dafbf6ec2a6",
+      "filename": "python-3.14.10-1-x86_64.pkg.tar.zst"
+    },
+    "util-linux": {
+      "repo": "core",
+      "version": "2.42.4-1",
+      "sha256": "95b7096bf4b45274645f6bb96f5b5508af6ea80e5fccba29244abaa53a341962",
+      "filename": "util-linux-2.42.4-1-x86_64.pkg.tar.zst"
+    },
+    "gamescope": {
+      "repo": "extra",
+      "version": "3.17.0-1",
+      "sha256": "baebc51f044112cacb6fd200b9879ec5d3588fb97821526043601607bc8ce047",
+      "filename": "gamescope-3.17.0-1-x86_64.pkg.tar.zst"
+    },
+    "libpulse": {
+      "repo": "extra",
+      "version": "17.0+r134+g77d25a1e6-2",
+      "sha256": "7b994b72565823ea2732a41fd1e47355d9e247bf47749a7cc9a7245a306c13c7",
+      "filename": "libpulse-17.0+r134+g77d25a1e6-2-x86_64.pkg.tar.zst"
+    },
+    "mesa": {
+      "repo": "extra",
+      "version": "1:26.2.6-1",
+      "sha256": "cedbefed1c882ae72c51fb617c4094ea93b31ec1a594395ac188e7d1ce6c486b",
+      "filename": "mesa-1:26.2.6-1-x86_64.pkg.tar.zst"
+    },
+    "vulkan-intel": {
+      "repo": "extra",
+      "version": "1:26.2.6-1",
+      "sha256": "db1fd78dd3089d941a49eeea9f9e3e611893a14d35adf5fb1d76741054fe88e5",
+      "filename": "vulkan-intel-1:26.2.6-1-x86_64.pkg.tar.zst"
+    },
+    "vulkan-radeon": {
+      "repo": "extra",
+      "version": "1:26.2.6-1",
+      "sha256": "c15bd51101ab3be9084e758a3693609993c810a68f07f01826dbbf3a8591acbc",
+      "filename": "vulkan-radeon-1:26.2.6-1-x86_64.pkg.tar.zst"
+    },
+    "xorg-xwayland": {
+      "repo": "extra",
+      "version": "24.1.15-1",
+      "sha256": "0a8be13f25f64f22ed110f4890e907cfceb34009aeab5b0fd316b6a92ab15a7f",
+      "filename": "xorg-xwayland-24.1.15-1-x86_64.pkg.tar.zst"
+    },
+    "lib32-gnutls": {
+      "repo": "multilib",
+      "version": "3.8.13-3",
+      "sha256": "551f78f088f2605bba38c6a85fe7d2b047dea8a099f27249dec64fa5d4e3242f",
+      "filename": "lib32-gnutls-3.8.13-3-x86_64.pkg.tar.zst"
+    },
+    "lib32-libpulse": {
+      "repo": "multilib",
+      "version": "17.0+r98+gb096704c0-1",
+      "sha256": "19cfdb64bd3b19cbad427279d46dfd9682f21e17e9ed27e0657552c3a122713e",
+      "filename": "lib32-libpulse-17.0+r98+gb096704c0-1-x86_64.pkg.tar.zst"
+    },
+    "lib32-mesa": {
+      "repo": "multilib",
+      "version": "1:26.2.6-1",
+      "sha256": "805ccdd37b52a8539b4a858911b74fb0b32cae02f127665ca3e1f329a891ba28",
+      "filename": "lib32-mesa-1:26.2.6-1-x86_64.pkg.tar.zst"
+    },
+    "lib32-vulkan-icd-loader": {
+      "repo": "multilib",
+      "version": "1.4.363.0-1",
+      "sha256": "5f614547d9052ad414f0d3d352bcba6f55222d73207264ac348f9fb42fb5e4bf",
+      "filename": "lib32-vulkan-icd-loader-1.4.363.0-1-x86_64.pkg.tar.zst"
+    },
+    "lib32-vulkan-intel": {
+      "repo": "multilib",
+      "version": "1:26.2.6-1",
+      "sha256": "7864c20b0f4539eee8344ddfed8aae3806b365e0af5c0c5e785c49762ecc5f49",
+      "filename": "lib32-vulkan-intel-1:26.2.6-1-x86_64.pkg.tar.zst"
+    },
+    "lib32-vulkan-radeon": {
+      "repo": "multilib",
+      "version": "1:26.2.6-1",
+      "sha256": "f8df6f8e414c5a146336404633fb061c7f37d600a372bf87be81d100deac9776",
+      "filename": "lib32-vulkan-radeon-1:26.2.6-1-x86_64.pkg.tar.zst"
+    }
+  }
+}
